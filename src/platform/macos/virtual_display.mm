@@ -391,7 +391,16 @@ namespace platf::macos_virtual_display {
       int width = 0;  ///< As requested.
       int height = 0;
       double refresh = 0;
-      std::size_t pixel_width = 0;  ///< As created, which is what gets captured.
+      ///< Target Retina mode when explicit scaling is configured, or default 2x fallback.
+      bool hidpi = false;
+      bool explicit_scale = false;
+      std::size_t default_mode_width = 0;
+      std::size_t default_mode_height = 0;
+      std::size_t default_pixel_width = 0;
+      std::size_t default_pixel_height = 0;
+      std::size_t mode_width = 0;  ///< Logical width in points.
+      std::size_t mode_height = 0;
+      std::size_t pixel_width = 0;  ///< Active backing pixels, which get captured.
       std::size_t pixel_height = 0;
       bool exclusive = false;  ///< The exclusive layout is in effect: only Vibepollo's displays stay on.
       std::vector<CGDirectDisplayID> turned_off;  ///< Physical displays to turn back on.
@@ -585,14 +594,22 @@ namespace platf::macos_virtual_display {
       make_main(display.id);
     }
 
-    // With HiDPI, macOS defaults to the standard-density variant of the mode, so pick the exact pixel size.
-    void select_mode(const CGDirectDisplayID id, const size_t pixel_width, const size_t pixel_height) {
+    // With HiDPI, macOS exposes both 1x and 2x variants at the same backing pixel size, so match
+    // both logical point dimensions and backing pixel dimensions first.
+    void select_mode(const CGDirectDisplayID id, const size_t mode_width, const size_t mode_height, const size_t pixel_width, const size_t pixel_height) {
       NSDictionary *options = @{(__bridge NSString *) kCGDisplayShowDuplicateLowResolutionModes: @YES};
       CGDisplayModeRef chosen = nullptr;
       wait_until([&]() {
         const CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, (__bridge CFDictionaryRef) options);
         if (!modes) {
           return false;
+        }
+        for (CFIndex i = 0; i < CFArrayGetCount(modes) && !chosen; ++i) {
+          const auto mode = (CGDisplayModeRef) CFArrayGetValueAtIndex(modes, i);
+          if (CGDisplayModeGetWidth(mode) == mode_width && CGDisplayModeGetHeight(mode) == mode_height &&
+              CGDisplayModeGetPixelWidth(mode) == pixel_width && CGDisplayModeGetPixelHeight(mode) == pixel_height) {
+            chosen = CGDisplayModeRetain(mode);
+          }
         }
         for (CFIndex i = 0; i < CFArrayGetCount(modes) && !chosen; ++i) {
           const auto mode = (CGDisplayModeRef) CFArrayGetValueAtIndex(modes, i);
@@ -612,9 +629,49 @@ namespace platf::macos_virtual_display {
       CGDisplayConfigRef config;
       if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
         CGConfigureDisplayWithDisplayMode(config, id, chosen, nullptr);
-        CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
+        CGCompleteDisplayConfiguration(config, kCGConfigurePermanently);
       }
       CGDisplayModeRelease(chosen);
+    }
+
+    unsigned int round_even(const double value) {
+      return static_cast<unsigned int>(std::max(1L, std::lround(value / 2.0))) * 2u;
+    }
+
+    void sync_recorded_mode(virtual_display_t &display) {
+      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
+      if (!cur) {
+        return;
+      }
+      display.mode_width = CGDisplayModeGetWidth(cur);
+      display.mode_height = CGDisplayModeGetHeight(cur);
+      display.pixel_width = CGDisplayModeGetPixelWidth(cur);
+      display.pixel_height = CGDisplayModeGetPixelHeight(cur);
+      CGDisplayModeRelease(cur);
+    }
+
+    void ensure_retina_mode(virtual_display_t &display) {
+      if (!display.hidpi || !is_active(display.id)) {
+        sync_recorded_mode(display);
+        return;
+      }
+      if (display.explicit_scale) {
+        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height);
+        sync_recorded_mode(display);
+        return;
+      }
+      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
+      const bool already_retina = cur &&
+                                  CGDisplayModeGetWidth(cur) >= 800 &&
+                                  CGDisplayModeGetPixelWidth(cur) == CGDisplayModeGetWidth(cur) * 2 &&
+                                  CGDisplayModeGetPixelHeight(cur) == CGDisplayModeGetHeight(cur) * 2;
+      if (cur) {
+        CGDisplayModeRelease(cur);
+      }
+      if (!already_retina) {
+        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height);
+      }
+      sync_recorded_mode(display);
     }
 
     /**
@@ -642,22 +699,34 @@ namespace platf::macos_virtual_display {
       platf::wake_displays();
       const saved_modes_t other_modes;
 
-      const bool hidpi = use_hidpi(width, height);
+      const int configured_scale = config::video.dd.virtual_display_scale_percent;
+      const bool hidpi = configured_scale == 0 ? (width > 1920 || height > 1200) : use_hidpi(width, height);
       // HiDPI modes are sized in points; their backing store, which is what gets captured, is 2x.
       const auto size = macos_display_policy::virtual_display_size(width, height, hidpi);
-      const unsigned int mode_width = size.width;
-      const unsigned int mode_height = size.height;
-      const unsigned int pixel_width = size.pixel_width;
-      const unsigned int pixel_height = size.pixel_height;
+      const unsigned int max_pixel_width = size.pixel_width;
+      const unsigned int max_pixel_height = size.pixel_height;
+
+      unsigned int target_mode_width = size.width;
+      unsigned int target_mode_height = size.height;
+      unsigned int target_pixel_width = max_pixel_width;
+      unsigned int target_pixel_height = max_pixel_height;
+      const bool explicit_scale = hidpi && configured_scale >= 150;
+      if (hidpi && configured_scale >= 200) {
+        const double factor = configured_scale / 100.0;
+        target_mode_width = std::clamp(round_even(max_pixel_width / factor), 800u, std::max(800u, max_pixel_width / 2));
+        target_mode_height = std::clamp(round_even(static_cast<double>(target_mode_width) * max_pixel_height / max_pixel_width), 600u, std::max(600u, max_pixel_height / 2));
+        target_pixel_width = target_mode_width * 2;
+        target_pixel_height = target_mode_height * 2;
+      }
 
       CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
       descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
       descriptor.name = name;
-      descriptor.maxPixelsWide = pixel_width;
-      descriptor.maxPixelsHigh = pixel_height;
+      descriptor.maxPixelsWide = max_pixel_width;
+      descriptor.maxPixelsHigh = max_pixel_height;
       // Only informs macOS's defaults: a Retina or a standard pixel density to match the mode.
       const double ppi = hidpi ? 220.0 : 110.0;
-      descriptor.sizeInMillimeters = CGSizeMake(pixel_width / ppi * 25.4, pixel_height / ppi * 25.4);
+      descriptor.sizeInMillimeters = CGSizeMake(max_pixel_width / ppi * 25.4, max_pixel_height / ppi * 25.4);
       descriptor.vendorID = vendor_id;
       descriptor.productID = product_id;
       descriptor.serialNum = serial;
@@ -681,16 +750,56 @@ namespace platf::macos_virtual_display {
 
       CGVirtualDisplaySettings *settings = [[settings_class alloc] init];
       settings.hiDPI = hidpi ? 1 : 0;
-      CGVirtualDisplayMode *mode = make_hdr ?
-                                     [[mode_class alloc] initWithWidth:mode_width height:mode_height refreshRate:refresh transferFunction:hdr_transfer_function] :
-                                     [[mode_class alloc] initWithWidth:mode_width height:mode_height refreshRate:refresh];
-      settings.modes = @[mode];
+      NSMutableArray *modes = [NSMutableArray array];
+      std::vector<std::pair<unsigned int, unsigned int>> added_dims;
+      const auto add_mode = [&](const unsigned int w, const unsigned int h) {
+        if (w == 0 || h == 0 || w > max_pixel_width || h > max_pixel_height) {
+          return;
+        }
+        if (std::find(added_dims.begin(), added_dims.end(), std::pair {w, h}) != added_dims.end()) {
+          return;
+        }
+        added_dims.emplace_back(w, h);
+        CGVirtualDisplayMode *m = make_hdr ?
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh transferFunction:hdr_transfer_function] :
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh];
+        if (m) {
+          [modes addObject:m];
+        }
+      };
+
+      if (hidpi) {
+        add_mode(max_pixel_width, max_pixel_height);
+        add_mode(size.width, size.height);
+        add_mode(target_pixel_width, target_pixel_height);
+        add_mode(target_mode_width, target_mode_height);
+        // Expose Retina HiDPI scaling steps ("More Space" <-> "Larger Text") in System Settings > Displays
+        constexpr double scale_factors[] = {2.15, 2.25, 2.3888889, 2.50, 2.6875, 3.00};
+        for (const double factor : scale_factors) {
+          const unsigned int lw = round_even(max_pixel_width / factor);
+          const unsigned int lh = round_even(static_cast<double>(lw) * max_pixel_height / max_pixel_width);
+          if (lw >= 800 && lh >= 600 && lw * 2 <= max_pixel_width && lh * 2 <= max_pixel_height) {
+            add_mode(lw * 2, lh * 2);
+            add_mode(lw, lh);
+          }
+        }
+      } else {
+        add_mode(size.width, size.height);
+      }
+
+      settings.modes = modes;
       if (![result->display applySettings:settings]) {
-        BOOST_LOG(error) << "Virtual display: macOS rejected "sv << mode_width << 'x' << mode_height << '@' << refresh << "Hz"sv;
+        BOOST_LOG(error) << "Virtual display: macOS rejected "sv << target_mode_width << 'x' << target_mode_height << '@' << refresh << "Hz"sv;
         return nullptr;
       }
       result->id = result->display.displayID;
       result->hdr = make_hdr;
+      result->hidpi = hidpi;
+      result->explicit_scale = explicit_scale;
+      result->default_mode_width = target_mode_width;
+      result->default_mode_height = target_mode_height;
+      result->default_pixel_width = target_pixel_width;
+      result->default_pixel_height = target_pixel_height;
 
       if (!wait_until([id = result->id]() {
             return is_active(id);
@@ -700,14 +809,11 @@ namespace platf::macos_virtual_display {
         return nullptr;
       }
 
-      if (hidpi) {
-        select_mode(result->id, pixel_width, pixel_height);
-      }
-      std::tie(result->pixel_width, result->pixel_height) = current_pixels(result->id);
+      ensure_retina_mode(*result);
       other_modes.restore(1s);
-      BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << pixel_width << 'x' << pixel_height << '@' << refresh << "Hz"sv
+      BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << result->pixel_width << 'x' << result->pixel_height << '@' << refresh << "Hz"sv
                       << (make_hdr ? " HDR"sv : ""sv)
-                      << (hidpi ? " (Retina, looks like "s + std::to_string(mode_width) + 'x' + std::to_string(mode_height) + ')' : ""s)
+                      << (hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
                       << ", display id "sv << result->id;
       return result;
     }
@@ -724,8 +830,13 @@ namespace platf::macos_virtual_display {
       result->height = config.height;
       result->refresh = refresh;
       apply_layout(*result);
+      // Turning off physical displays activates macOS's single-display profile, which may default
+      // back to 1x non-Retina; re-verify and enforce Retina HiDPI after layout settles.
+      ensure_retina_mode(*result);
       if (!result->turned_off.empty()) {
-        BOOST_LOG(info) << "Virtual display: physical displays turned off"sv;
+        BOOST_LOG(info) << "Virtual display: physical displays turned off (active mode: looks like "sv
+                        << result->mode_width << 'x' << result->mode_height << ", pixels "sv
+                        << result->pixel_width << 'x' << result->pixel_height << ')';
       }
       return result;
     }
@@ -1136,11 +1247,23 @@ namespace platf::macos_virtual_display {
 
     /// Put a display of Vibepollo's back in the mode it was made with, if macOS picked another.
     void keep_created_mode(const virtual_display_t &display) {
-      if (display.pixel_width == 0 || !is_active(display.id) || current_pixels(display.id) == std::pair {display.pixel_width, display.pixel_height}) {
+      if (display.pixel_width == 0 || !is_active(display.id)) {
         return;
       }
-      BOOST_LOG(info) << "Virtual display: macOS changed display "sv << display.id << "'s mode; putting back "sv << display.pixel_width << 'x' << display.pixel_height;
-      select_mode(display.id, display.pixel_width, display.pixel_height);
+      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
+      const bool matches = cur &&
+                           CGDisplayModeGetWidth(cur) == display.mode_width &&
+                           CGDisplayModeGetHeight(cur) == display.mode_height &&
+                           CGDisplayModeGetPixelWidth(cur) == display.pixel_width &&
+                           CGDisplayModeGetPixelHeight(cur) == display.pixel_height;
+      if (cur) {
+        CGDisplayModeRelease(cur);
+      }
+      if (matches) {
+        return;
+      }
+      BOOST_LOG(info) << "Virtual display: macOS changed display "sv << display.id << "'s mode; putting back "sv << display.mode_width << 'x' << display.mode_height << " ("sv << display.pixel_width << 'x' << display.pixel_height << ')';
+      select_mode(display.id, display.mode_width, display.mode_height, display.pixel_width, display.pixel_height);
     }
 
     std::pair<std::vector<CGDirectDisplayID>, bool> exclusive_keep_on(const CGDirectDisplayID stream_display, const std::vector<CGDirectDisplayID> &candidates) {
@@ -1226,14 +1349,20 @@ namespace platf::macos_virtual_display {
         if (current) {
           if (displays_changed) {
             keep_created_mode(*current);
+          } else if (is_active(current->id)) {
+            sync_recorded_mode(*current);
           }
         }
       }
-      if (displays_changed) {
+      {
         std::lock_guard lock {remote_mutex};
-        for (const auto &[_, remote] : remote_displays) {
+        for (auto &[_, remote] : remote_displays) {
           if (remote.display) {
-            keep_created_mode(*remote.display);
+            if (displays_changed) {
+              keep_created_mode(*remote.display);
+            } else if (is_active(remote.display->id)) {
+              sync_recorded_mode(*remote.display);
+            }
           }
         }
       }

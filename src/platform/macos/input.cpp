@@ -485,7 +485,7 @@ const KeyCodeMap kKeyCodesMap[] = {
   // Maps a point in the stream's touch port to a global screen point on the display it belongs to.
   CGPoint stream_location(macos_input_t *macos_input, const touch_port_t &touch_port, const float x, const float y) {
     const auto display = pointer_display(macos_input, touch_port);
-    const auto scaling = display == macos_input->display ? macos_input->displayScaling : display_scaling(display);
+    const auto scaling = display_scaling(display);
 
     // in order to get the correct mouse location for capturing display , we need to add the display bounds to the location
     const CGRect display_bounds = CGDisplayBounds(display);
