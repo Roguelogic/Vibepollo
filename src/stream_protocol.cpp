@@ -1,6 +1,7 @@
 #include "stream_protocol.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 
 namespace stream {
@@ -102,18 +103,32 @@ namespace stream {
     if (slice_size == 0) {
       return {};
     }
-    std::string joined;
-    joined.reserve(data1.size() + data2.size());
-    joined.append(data1);
-    joined.append(data2);
+    const std::size_t total_in = data1.size() + data2.size();
+    if (total_in == 0) {
+      return {};
+    }
 
-    const auto slices = (joined.size() + slice_size - 1) / slice_size;
-    std::vector<std::uint8_t> result;
-    result.reserve(joined.size() + slices * insert_size);
-    for (std::size_t offset = 0; offset < joined.size(); offset += slice_size) {
-      result.insert(result.end(), insert_size, 0);
-      const auto count = std::min<std::size_t>(slice_size, joined.size() - offset);
-      result.insert(result.end(), joined.begin() + offset, joined.begin() + offset + count);
+    const std::size_t slices = (total_in + slice_size - 1) / slice_size;
+    std::vector<std::uint8_t> result(total_in + slices * insert_size, 0);
+    std::uint8_t *dst = result.data();
+
+    std::size_t in_pos = 0;
+    while (in_pos < total_in) {
+      dst += insert_size;
+      std::size_t rem = std::min<std::size_t>(slice_size, total_in - in_pos);
+      if (in_pos < data1.size()) {
+        const std::size_t n1 = std::min<std::size_t>(rem, data1.size() - in_pos);
+        std::memcpy(dst, data1.data() + in_pos, n1);
+        dst += n1;
+        in_pos += n1;
+        rem -= n1;
+      }
+      if (rem > 0) {
+        const std::size_t pos2 = in_pos - data1.size();
+        std::memcpy(dst, data2.data() + pos2, rem);
+        dst += rem;
+        in_pos += rem;
+      }
     }
     return result;
   }

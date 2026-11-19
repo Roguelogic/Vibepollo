@@ -1416,6 +1416,10 @@ namespace video {
       return false;
     }
 
+    bool set_bitrate(int bitrate_kbps) override {
+      return device && device->set_bitrate(bitrate_kbps);
+    }
+
     platf::vt_encoded_frame encode_frame(uint64_t frame_index) {
       if (!device) {
         return {};
@@ -5905,20 +5909,22 @@ namespace video {
             capture_timestamp = converted.frame_timestamp;
             host_processing_timestamp = converted.host_processing_timestamp;
             frame_timestamp = capture_timestamp;
-            if (!encode_frame_timestamp) {
-              encode_frame_timestamp = *frame_timestamp;
-            }
+            if (frame_timestamp) {
+              if (!encode_frame_timestamp) {
+                encode_frame_timestamp = *frame_timestamp;
+              }
 
-            const auto time_diff = (*frame_timestamp > *encode_frame_timestamp)
-              ? (*frame_timestamp - *encode_frame_timestamp)
-              : (*encode_frame_timestamp - *frame_timestamp);
-            if (time_diff < frame_variation_threshold) {
-              *frame_timestamp = *encode_frame_timestamp;
-            } else {
-              *encode_frame_timestamp = *frame_timestamp;
-            }
+              const auto time_diff = (*frame_timestamp > *encode_frame_timestamp)
+                ? (*frame_timestamp - *encode_frame_timestamp)
+                : (*encode_frame_timestamp - *frame_timestamp);
+              if (time_diff < frame_variation_threshold) {
+                *frame_timestamp = *encode_frame_timestamp;
+              } else {
+                *encode_frame_timestamp = *frame_timestamp;
+              }
 
-            *encode_frame_timestamp += encode_frame_threshold;
+              *encode_frame_timestamp += encode_frame_threshold;
+            }
           } else {
             frame_timestamp.reset();
             host_processing_timestamp.reset();
@@ -5927,6 +5933,11 @@ namespace video {
         } else if (!images->running()) {
           break;
         } else {
+          if (images->peek()) {
+            // A fresh frame arrived right as the minimum-FPS wait expired; pop it on the
+            // next iteration instead of blocking the encoder on a duplicate frame.
+            continue;
+          }
           ++loop_stats.pop_timeouts;
           placeholder_input = bootstrap_state.current_input_placeholder;
         }

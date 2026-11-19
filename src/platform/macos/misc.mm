@@ -9,9 +9,11 @@
 #endif
 
 // standard includes
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <mutex>
@@ -30,8 +32,11 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <net/if_dl.h>
+#include <poll.h>
 #include <pwd.h>
 #include <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <ServiceManagement/ServiceManagement.h>
@@ -659,6 +664,26 @@ namespace platf {
 
     // https://github.com/apple/darwin-libpthread/blob/main/include/sys/qos.h
     pthread_set_qos_class_self_np(mac_priority, 0);
+
+    if (priority == thread_priority_e::critical) {
+      mach_timebase_info_data_t tb {};
+      if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0) {
+        const auto ns_to_abs = [&](std::uint64_t ns) -> std::uint32_t {
+          return static_cast<std::uint32_t>((ns * tb.denom) / tb.numer);
+        };
+        thread_time_constraint_policy_data_t policy {};
+        policy.period = ns_to_abs(8'333'333);       // 120 Hz cadence (8.33 ms)
+        policy.computation = ns_to_abs(2'000'000);  // 2.0 ms nominal compute budget
+        policy.constraint = ns_to_abs(4'000'000);   // 4.0 ms scheduling constraint
+        policy.preemptible = TRUE;
+        thread_policy_set(
+          mach_thread_self(),
+          THREAD_TIME_CONSTRAINT_POLICY,
+          reinterpret_cast<thread_policy_t>(&policy),
+          THREAD_TIME_CONSTRAINT_POLICY_COUNT
+        );
+      }
+    }
   }
 
   void set_thread_name(std::string_view name) {
@@ -752,9 +777,151 @@ namespace platf {
     return saddr_v6;
   }
 
+  extern "C" {
+    struct msghdr_x {
+      void *msg_name;
+      socklen_t msg_namelen;
+      struct iovec *msg_iov;
+      int msg_iovlen;
+      void *msg_control;
+      socklen_t msg_controllen;
+      int msg_flags;
+      size_t msg_datalen;
+    };
+
+    ssize_t sendmsg_x(int s, const struct msghdr_x *msgp, u_int cnt, int flags);
+  }
+
   bool send_batch(batched_send_info_t &send_info) {
-    // Fall back to unbatched send calls
-    return false;
+    if (send_info.block_count == 0) {
+      return true;
+    }
+
+    auto sockfd = (int) send_info.native_socket;
+
+    struct sockaddr_in taddr_v4 = {};
+    struct sockaddr_in6 taddr_v6 = {};
+    void *msg_name = nullptr;
+    socklen_t msg_namelen = 0;
+    if (send_info.target_address.is_v6()) {
+      taddr_v6 = to_sockaddr(send_info.target_address.to_v6(), send_info.target_port);
+      msg_name = &taddr_v6;
+      msg_namelen = sizeof(taddr_v6);
+    } else {
+      taddr_v4 = to_sockaddr(send_info.target_address.to_v4(), send_info.target_port);
+      msg_name = &taddr_v4;
+      msg_namelen = sizeof(taddr_v4);
+    }
+
+    union {
+      char buf[std::max(CMSG_SPACE(sizeof(struct in_pktinfo)), CMSG_SPACE(sizeof(struct in6_pktinfo)))];
+      struct cmsghdr alignment;
+    } cmbuf {};
+
+    socklen_t cmbuflen = 0;
+    {
+      struct msghdr cmsg_template = {};
+      cmsg_template.msg_control = cmbuf.buf;
+      cmsg_template.msg_controllen = sizeof(cmbuf.buf);
+      auto pktinfo_cm = CMSG_FIRSTHDR(&cmsg_template);
+      if (send_info.source_address.is_v6()) {
+        struct in6_pktinfo pktInfo {};
+        struct sockaddr_in6 saddr_v6 = to_sockaddr(send_info.source_address.to_v6(), 0);
+        pktInfo.ipi6_addr = saddr_v6.sin6_addr;
+        pktInfo.ipi6_ifindex = 0;
+
+        cmbuflen += CMSG_SPACE(sizeof(pktInfo));
+        pktinfo_cm->cmsg_level = IPPROTO_IPV6;
+        pktinfo_cm->cmsg_type = IPV6_PKTINFO;
+        pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
+        memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
+      } else {
+        struct in_pktinfo pktInfo {};
+        struct sockaddr_in saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
+        pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
+        pktInfo.ipi_ifindex = 0;
+
+        cmbuflen += CMSG_SPACE(sizeof(pktInfo));
+        pktinfo_cm->cmsg_level = IPPROTO_IP;
+        pktinfo_cm->cmsg_type = IP_PKTINFO;
+        pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
+        memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
+      }
+    }
+
+    constexpr size_t MAX_CHUNK = 64;
+    std::array<struct msghdr_x, MAX_CHUNK> msgs {};
+    std::array<struct iovec, MAX_CHUNK * 2> iovs {};
+
+    size_t blocks_sent = 0;
+    while (blocks_sent < send_info.block_count) {
+      if (send_info.send_cancelled && send_info.send_cancelled()) {
+        send_info.allow_fallback = (blocks_sent == 0);
+        return false;
+      }
+
+      const size_t chunk = std::min(send_info.block_count - blocks_sent, MAX_CHUNK);
+      size_t iov_idx = 0;
+      for (size_t i = 0; i < chunk; ++i) {
+        const size_t block_idx = send_info.block_offset + blocks_sent + i;
+        auto &m = msgs[i];
+        m = {};
+        m.msg_name = msg_name;
+        m.msg_namelen = msg_namelen;
+        m.msg_iov = &iovs[iov_idx];
+        m.msg_iovlen = send_info.headers ? 2 : 1;
+        m.msg_control = cmbuf.buf;
+        m.msg_controllen = cmbuflen;
+
+        if (send_info.headers) {
+          iovs[iov_idx].iov_base = (void *) &send_info.headers[block_idx * send_info.header_size];
+          iovs[iov_idx].iov_len = send_info.header_size;
+          ++iov_idx;
+        }
+        auto payload_desc = send_info.buffer_for_payload_offset(static_cast<ptrdiff_t>(block_idx * send_info.payload_size));
+        iovs[iov_idx].iov_base = (void *) payload_desc.buffer;
+        iovs[iov_idx].iov_len = send_info.payload_size;
+        ++iov_idx;
+      }
+
+      const ssize_t sent = sendmsg_x(sockfd, msgs.data(), static_cast<u_int>(chunk), 0);
+      if (sent < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          if (send_info.send_cancelled && send_info.send_cancelled()) {
+            send_info.allow_fallback = false;
+            return false;
+          }
+          struct pollfd pfd {};
+          pfd.fd = sockfd;
+          pfd.events = POLLOUT;
+          const int pr = poll(&pfd, 1, 10);
+          if (pr < 0 && errno != EINTR) {
+            BOOST_LOG(warning) << "poll() failed: "sv << errno;
+            send_info.allow_fallback = false;
+            return false;
+          }
+          continue;
+        }
+        if (blocks_sent == 0 && (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)) {
+          send_info.allow_fallback = true;
+          return false;
+        }
+        BOOST_LOG(warning) << "sendmsg_x() failed: "sv << errno;
+        send_info.allow_fallback = false;
+        return false;
+      }
+      if (sent == 0) {
+        send_info.allow_fallback = (blocks_sent == 0);
+        return false;
+      }
+
+      blocks_sent += static_cast<size_t>(sent);
+    }
+
+    return true;
   }
 
   bool send(send_info_t &send_info) {
@@ -977,13 +1144,40 @@ namespace platf {
 
   class macos_high_precision_timer: public high_precision_timer {
   public:
+    macos_high_precision_timer() {
+      mach_timebase_info(&tb_);
+    }
+
     void sleep_for(const std::chrono::nanoseconds &duration) override {
-      std::this_thread::sleep_for(duration);
+      if (duration <= 0ns) {
+        return;
+      }
+      if (tb_.numer == 0) {
+        std::this_thread::sleep_for(duration);
+        return;
+      }
+      const auto due = std::chrono::steady_clock::now() + duration;
+      constexpr auto spin_margin = 25us;
+      if (duration > spin_margin) {
+        const auto sleep_ns = static_cast<std::uint64_t>((duration - spin_margin).count());
+        const std::uint64_t deadline = mach_absolute_time() + (sleep_ns * tb_.denom) / tb_.numer;
+        mach_wait_until(deadline);
+      }
+      while (std::chrono::steady_clock::now() < due) {
+#if defined(__aarch64__) || defined(__arm64__)
+        asm volatile("yield");
+#else
+        std::this_thread::yield();
+#endif
+      }
     }
 
     operator bool() override {
       return true;
     }
+
+  private:
+    mach_timebase_info_data_t tb_ {};
   };
 
   std::unique_ptr<high_precision_timer> create_high_precision_timer() {

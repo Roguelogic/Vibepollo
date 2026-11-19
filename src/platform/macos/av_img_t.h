@@ -28,22 +28,24 @@ namespace platf {
 
   struct av_pixel_buf_t {
     CVPixelBufferRef buf;
+    bool locked = false;
 
     // Constructor
-    explicit av_pixel_buf_t(CMSampleBufferRef sb):
-        buf(
-          CMSampleBufferGetImageBuffer(sb)
-        ) {
-      CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+    explicit av_pixel_buf_t(CMSampleBufferRef sb, bool lock_cpu = true):
+        buf(CMSampleBufferGetImageBuffer(sb)),
+        locked(buf != nullptr && lock_cpu) {
+      if (locked) {
+        CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+      }
     }
 
     [[nodiscard]] uint8_t *data() const {
-      return static_cast<uint8_t *>(CVPixelBufferGetBaseAddress(buf));
+      return locked && buf != nullptr ? static_cast<uint8_t *>(CVPixelBufferGetBaseAddress(buf)) : nullptr;
     }
 
     // Destructor
     ~av_pixel_buf_t() {
-      if (buf != nullptr) {
+      if (locked && buf != nullptr) {
         CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
       }
     }

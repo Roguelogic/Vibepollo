@@ -253,7 +253,7 @@ namespace audio {
 
     // Encoding takes place on this thread
     platf::set_thread_name("audio::encode");
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     if (config.use_ac3 || config.use_eac3) {
       const auto codec_id = config.use_eac3 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_AC3;

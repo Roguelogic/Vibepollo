@@ -101,6 +101,7 @@ namespace thread_pool_util {
   public:
     void _main() {
       platf::set_thread_name("TaskPool::worker");
+      platf::adjust_thread_priority(platf::thread_priority_e::critical);
       while (_continue.load(std::memory_order_acquire)) {
         if (auto task = this->pop()) {
           (*task)->run();

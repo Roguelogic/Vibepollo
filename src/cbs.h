@@ -4,6 +4,11 @@
  */
 #pragma once
 
+// standard includes
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
 // local includes
 #include "utility.h"
 
@@ -36,4 +41,10 @@ namespace cbs {
    * @return True if the SPS->VUI is present in the active SPS of the packet, false otherwise.
    */
   bool validate_sps(const AVPacket *packet, int codec_id);
+
+  /**
+   * @brief Patch raw Annex-B parameter sets (VPS/SPS/PPS for HEVC, SPS/PPS for H.264)
+   *        with low-latency VUI bitstream restriction flags while preserving colorimetry.
+   */
+  std::vector<std::uint8_t> patch_parameter_sets_low_latency(std::string_view annexb_parameter_sets, bool hevc);
 }  // namespace cbs

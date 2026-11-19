@@ -30,9 +30,11 @@ namespace platf::vt {
   /**
    * @brief Decide whether to request low-latency rate control before standard rate control.
    *
-   * A session without low-latency rate control is always tried next, so encoders that reject
-   * it still get a session. FFmpeg only enabled it for HEVC on Apple silicon, so HEVC on Intel
-   * goes straight to standard rate control.
+   * On Apple Silicon (AVE), `EnableLowLatencyRateControl` throttles HEVC encode throughput at
+   * high Retina resolutions (e.g. ~17-23.5ms/frame at 2752x2064 on M4), whereas standard rate
+   * control with `RealTime=true`, `AllowFrameReordering=false`, and a 1s `DataRateLimits` window
+   * sustains 120fps (~7.0ms/frame) with zero dropped frames. Low-latency rate control is
+   * therefore requested only for H.264.
    *
    * @param codec CoreMedia codec type of the session.
    * @param arm64 Whether the host is Apple silicon.

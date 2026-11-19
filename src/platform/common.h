@@ -712,6 +712,10 @@ namespace platf {
   struct vt_encode_device_t: encode_device_t {
     virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
     virtual vt_encoded_frame encode_frame(uint64_t frame_index, bool force_idr) = 0;
+    virtual bool set_bitrate(int bitrate_kbps) {
+      (void) bitrate_kbps;
+      return false;
+    }
   };
 
   struct amf_encode_device_t: encode_device_t {

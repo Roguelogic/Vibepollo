@@ -247,4 +247,75 @@ namespace cbs {
 
     return ((CodedBitstreamH265Context *) ctx->priv_data)->active_sps->vui_parameters_present_flag;
   }
+
+  std::vector<std::uint8_t> patch_parameter_sets_low_latency(std::string_view annexb_parameter_sets, bool hevc) {
+    if (annexb_parameter_sets.empty()) {
+      return {};
+    }
+
+    const AVCodecID codec_id = hevc ? AV_CODEC_ID_H265 : AV_CODEC_ID_H264;
+    cbs::ctx_t ctx;
+    if (ff_cbs_init(&ctx, codec_id, nullptr) < 0) {
+      return {};
+    }
+
+    AVPacket pkt {};
+    pkt.data = const_cast<std::uint8_t *>(reinterpret_cast<const std::uint8_t *>(annexb_parameter_sets.data()));
+    pkt.size = static_cast<int>(annexb_parameter_sets.size());
+
+    cbs::frag_t frag;
+    if (ff_cbs_read_packet(ctx.get(), &frag, &pkt) < 0) {
+      return {};
+    }
+
+    bool patched = false;
+    for (int i = 0; i < frag.nb_units; ++i) {
+      auto &unit = frag.units[i];
+      if (!unit.content) {
+        continue;
+      }
+      if (hevc) {
+        if (unit.type == HEVC_NAL_VPS) {
+          auto *vps = static_cast<H265RawVPS *>(unit.content);
+          vps->profile_tier_level.general_profile_compatibility_flag[4] = 1;
+          patched = true;
+        } else if (unit.type == HEVC_NAL_SPS) {
+          auto *sps = static_cast<H265RawSPS *>(unit.content);
+          sps->profile_tier_level.general_profile_compatibility_flag[4] = 1;
+          sps->vui_parameters_present_flag = 1;
+          auto &vui = sps->vui;
+          vui.bitstream_restriction_flag = 1;
+          vui.tiles_fixed_structure_flag = 0;
+          vui.motion_vectors_over_pic_boundaries_flag = 1;
+          vui.restricted_ref_pic_lists_flag = 1;
+          vui.min_spatial_segmentation_idc = 0;
+          vui.max_bytes_per_pic_denom = 0;
+          vui.max_bits_per_min_cu_denom = 0;
+          vui.log2_max_mv_length_horizontal = 15;
+          vui.log2_max_mv_length_vertical = 15;
+          patched = true;
+        }
+      } else if (unit.type == H264_NAL_SPS) {
+        auto *sps = static_cast<H264RawSPS *>(unit.content);
+        sps->vui_parameters_present_flag = 1;
+        auto &vui = sps->vui;
+        vui.low_delay_hrd_flag = 1 - vui.fixed_frame_rate_flag;
+        vui.bitstream_restriction_flag = 1;
+        vui.motion_vectors_over_pic_boundaries_flag = 1;
+        vui.max_bytes_per_pic_denom = 0;
+        vui.max_bits_per_mb_denom = 0;
+        vui.log2_max_mv_length_horizontal = 16;
+        vui.log2_max_mv_length_vertical = 16;
+        vui.max_num_reorder_frames = 0;
+        vui.max_dec_frame_buffering = sps->max_num_ref_frames > 0 ? sps->max_num_ref_frames : 1;
+        patched = true;
+      }
+    }
+
+    if (!patched || ff_cbs_write_fragment_data(ctx.get(), &frag) < 0 || !frag.data || frag.data_size == 0) {
+      return {};
+    }
+
+    return std::vector<std::uint8_t>(frag.data, frag.data + frag.data_size);
+  }
 }  // namespace cbs

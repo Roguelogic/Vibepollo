@@ -20,6 +20,7 @@
 #include <VideoToolbox/VideoToolbox.h>
 
 // local includes
+#include "src/cbs.h"
 #include "src/logging.h"
 #include "src/platform/macos/av_img_t.h"
 #include "src/platform/macos/vt_encoder.h"
@@ -70,10 +71,14 @@ namespace {
       if (try_low_latency && !low_latency) {
         BOOST_LOG(info) << "VideoToolbox low-latency rate control is unavailable; using standard rate control"sv;
       }
+      is_low_latency = low_latency;
       BOOST_LOG(info) << "VideoToolbox session uses "sv << (low_latency ? "low-latency"sv : "standard"sv) << " rate control"sv;
 
       set_property(kVTCompressionPropertyKey_RealTime, config::video.vt.vt_realtime ? kCFBooleanTrue : kCFBooleanFalse, "RealTime"sv);
       set_property(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "AllowFrameReordering"sv);
+      set_property(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "PrioritizeEncodingSpeedOverQuality"sv);
+      set_property(kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse, "MaximizePowerEfficiency"sv);
+      set_int_property(CFSTR("SpatialAdaptiveQPLevel"), 0, "SpatialAdaptiveQPLevel"sv);
       if (codec == kCMVideoCodecType_H264) {
         // Low-latency H.264 sessions mark pictures as long-term references by default; some
         // client hardware decoders mishandle that and freeze, so keep to short-term references.
@@ -121,6 +126,20 @@ namespace {
       return true;
     }
 
+    bool set_bitrate(int requested_kbps) {
+      if (!session || requested_kbps <= 0) {
+        return false;
+      }
+      const int bitrate_kbps = config::video.max_bitrate > 0 ? std::min(requested_kbps, config::video.max_bitrate) : requested_kbps;
+      if (!set_int_property(kVTCompressionPropertyKey_AverageBitRate, bitrate_kbps * 1000, "AverageBitRate"sv)) {
+        return false;
+      }
+      if (!is_low_latency) {
+        set_data_rate_limit(bitrate_kbps * 1000 / 8);
+      }
+      return true;
+    }
+
     /**
      * @brief Encode one frame, blocking until the encoded output is available.
      *
@@ -148,6 +167,7 @@ namespace {
         ready = false;
         failed = false;
         annexb.clear();
+        annexb.reserve(annexb_reserve_bytes);
       }
 
       CFDictionaryRef frame_options = nullptr;
@@ -183,6 +203,7 @@ namespace {
       }
 
       frame_size_logger.collect_and_log(annexb.size() / 1000.);
+      annexb_reserve_bytes = std::clamp<std::size_t>(std::max(annexb_reserve_bytes, annexb.size()), 256 * 1024, 2 * 1024 * 1024);
 
       platf::vt_encoded_frame result;
       result.data = std::move(annexb);
@@ -220,13 +241,20 @@ namespace {
         // New parameter sets on a non-IDR frame would never reach the client, which only
         // receives them prepended to IDR frames.
         CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample_buffer);
-        if (!sync && self->last_format && format != self->last_format) {
-          BOOST_LOG(warning) << "VideoToolbox format description changed without a keyframe, forcing IDR"sv;
-          self->need_idr = true;
+        if (format != self->last_format) {
+          if (!sync && self->last_format) {
+            BOOST_LOG(warning) << "VideoToolbox format description changed without a keyframe, forcing IDR"sv;
+            self->need_idr = true;
+          }
+          self->last_format = format;
+          self->cached_parameter_sets = build_patched_parameter_sets(format);
         }
-        self->last_format = format;
 
-        if (!platf::vt::append_annexb(sample_buffer, sync, self->annexb)) {
+        const bool use_cached_ps = sync && !self->cached_parameter_sets.empty();
+        if (use_cached_ps) {
+          self->annexb.insert(self->annexb.end(), self->cached_parameter_sets.begin(), self->cached_parameter_sets.end());
+        }
+        if (!platf::vt::append_annexb(sample_buffer, sync && !use_cached_ps, self->annexb)) {
           self->annexb.clear();
           break;
         }
@@ -327,10 +355,47 @@ namespace {
       set_property(kVTCompressionPropertyKey_YCbCrMatrix, matrix, "YCbCrMatrix"sv);
     }
 
+    static std::vector<uint8_t> build_patched_parameter_sets(CMFormatDescriptionRef format) {
+      if (!format) {
+        return {};
+      }
+      constexpr uint8_t start_code[] = {0, 0, 0, 1};
+      const bool hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC;
+      size_t count = 0;
+      const uint8_t *ps0 = nullptr;
+      size_t ps0_size = 0;
+      const auto status = hevc ?
+                            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, 0, &ps0, &ps0_size, &count, nullptr) :
+                            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &ps0, &ps0_size, &count, nullptr);
+      if (status != noErr || count == 0) {
+        return {};
+      }
+      std::vector<uint8_t> raw;
+      raw.reserve(128);
+      for (size_t i = 0; i < count; ++i) {
+        const uint8_t *ps = nullptr;
+        size_t ps_size = 0;
+        const auto st = hevc ?
+                          CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, i, &ps, &ps_size, nullptr, nullptr) :
+                          CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, &ps, &ps_size, nullptr, nullptr);
+        if (st != noErr || !ps_size) {
+          return {};
+        }
+        raw.insert(raw.end(), std::begin(start_code), std::end(start_code));
+        raw.insert(raw.end(), ps, ps + ps_size);
+      }
+      auto patched = cbs::patch_parameter_sets_low_latency(
+        std::string_view {reinterpret_cast<const char *>(raw.data()), raw.size()},
+        hevc
+      );
+      return patched.empty() ? raw : patched;
+    }
+
     VTCompressionSessionRef session = nullptr;
     int width = 0;
     int height = 0;
     int framerate = 60;
+    bool is_low_latency = false;
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -338,10 +403,12 @@ namespace {
     bool failed = false;
     bool idr_out = false;
     bool need_idr = false;
+    std::size_t annexb_reserve_bytes = 256 * 1024;
     std::vector<uint8_t> annexb;
     logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "VideoToolbox: encoded frame sizes in kB", ""};  ///< Periodic encoded frame size statistics.
     // Pointer identity only, never dereferenced; used to notice mid-stream parameter set changes
     CMFormatDescriptionRef last_format = nullptr;
+    std::vector<uint8_t> cached_parameter_sets;
   };
 
   /**
@@ -405,6 +472,10 @@ namespace {
         return {};
       }
       return session->encode(pixel_buffer->buf, frame_index, force_idr);
+    }
+
+    bool set_bitrate(int bitrate_kbps) override {
+      return session && session->set_bitrate(bitrate_kbps);
     }
 
   private:
@@ -523,7 +594,10 @@ namespace platf::vt {
   }
 
   bool try_low_latency(CMVideoCodecType codec, bool arm64) {
-    return codec == kCMVideoCodecType_H264 || arm64;
+    if (arm64) {
+      return false;
+    }
+    return codec == kCMVideoCodecType_H264;
   }
 
   CFStringRef h264_entropy_mode(int coder) {

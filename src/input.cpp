@@ -300,7 +300,11 @@ namespace input {
     std::uint64_t observed_touch_port_event_generation {};
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
+#ifdef __APPLE__
+    bool mouse_left_button_delay = false;
+#else
     bool mouse_left_button_delay = true;
+#endif
 
     input::touch_port_t touch_port;
 
@@ -822,7 +826,9 @@ namespace input {
       return;
     }
 
+#ifndef __APPLE__
     input->mouse_left_button_delay = true;
+#endif
 
     float x = util::endian::big(packet->x);
     float y = util::endian::big(packet->y);
@@ -2083,140 +2089,139 @@ namespace input {
     // repeats, so cancellation and map replacement remain serialized.
     refresh_input_geometry(input);
 
-    // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    queued_input_packet_t entry;
-    PNV_INPUT_HEADER payload;
+    for (int drain_turn = 0; drain_turn < 16; ++drain_turn) {
+      // 'entry' backs the 'payload' pointer, so they must remain in scope together
+      queued_input_packet_t entry;
+      PNV_INPUT_HEADER payload;
 
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      // Lock the input queue while batching, but release it before sending
+      // the input to the OS. This avoids potentially lengthy lock contention
+      // in the control stream thread while input is being processed by the OS.
+      {
+        std::lock_guard<std::mutex> lg(input->input_queue_lock);
 
-      // If all entries have already been processed, nothing to do
-      if (input->input_queue.empty()) {
-        input->input_queue_task_scheduled.store(false, std::memory_order_release);
-        return;
-      }
-
-      // Pop off the first entry, which we will send
-      entry = std::move(input->input_queue.front());
-      payload = (PNV_INPUT_HEADER) entry.data.data();
-      input->input_queue.pop_front();
-
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (!entry.data.empty() && i != input->input_queue.end()) {
-        const auto &batchable_entry = *i;
-        // Empty entries are ordered Guide neutralization after revocation.
-        if (batchable_entry.data.empty()) {
-          break;
+        // If all entries have already been processed, nothing to do
+        if (input->input_queue.empty()) {
+          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+          return;
         }
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data.data();
 
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
-        }
-      }
-    }
+        // Pop off the first entry, which we will send
+        entry = std::move(input->input_queue.front());
+        payload = (PNV_INPUT_HEADER) entry.data.data();
+        input->input_queue.pop_front();
 
-    if (entry.data.empty()) {
-      // Keep the consumed press latch until key-up. Native HOME and Back timer
-      // state belong to the controller and survive retiring only this binding.
-      for (auto &gamepad : input->gamepads) {
-        if (gamepad.guide_key_down) {
-          gamepad.guide_key_down = false;
-          send_gamepad_state(gamepad);
-        }
-      }
-    } else {
-      // Print the final input packet
-      input::print((void *) payload);
-
-      // Send the batched input to the OS
-      switch (util::endian::little(payload->magic)) {
-        case MOUSE_MOVE_REL_MAGIC_GEN5:
-          passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
-          break;
-        case MOUSE_MOVE_ABS_MAGIC:
-          passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
-          break;
-        case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
-        case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
-          passthrough(input, (PNV_MOUSE_BUTTON_PACKET) payload);
-          break;
-        case SCROLL_MAGIC_GEN5:
-          passthrough(input, (PNV_SCROLL_PACKET) payload);
-          break;
-        case SS_HSCROLL_MAGIC:
-          passthrough(input, (PSS_HSCROLL_PACKET) payload);
-          break;
-        case KEY_DOWN_EVENT_MAGIC:
-        case KEY_UP_EVENT_MAGIC: {
-          const auto permission_state = input->guide_permission_state.load(std::memory_order_acquire);
-          const bool guide_press_allowed = entry.guide_press_allowed &&
-                                           (permission_state & 1) != 0 &&
-                                           entry.guide_permission_state == permission_state;
-          passthrough(input, (PNV_KEYBOARD_PACKET) payload, guide_press_allowed);
-          break;
-        }
-        case UTF8_TEXT_EVENT_MAGIC:
-          passthrough((PNV_UNICODE_PACKET) payload);
-          break;
-        case MULTI_CONTROLLER_MAGIC_GEN5:
-          passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
-          break;
-        case SS_TOUCH_MAGIC:
-          passthrough(input, (PSS_TOUCH_PACKET) payload);
-          break;
-        case SS_PEN_MAGIC:
-          passthrough(input, (PSS_PEN_PACKET) payload);
-          break;
-        case controller_speaker_pcm::binding_magic:
-          if (config::input.controller) {
-            input->speaker_bindings.bind(entry.data, [&](std::uint16_t slot) {
-              return slot < input->gamepads.size() && input->gamepads[slot].id < 0;
-            });
+        // Try to batch with remaining items on the queue
+        auto i = input->input_queue.begin();
+        while (!entry.data.empty() && i != input->input_queue.end()) {
+          const auto &batchable_entry = *i;
+          // Empty entries are ordered Guide neutralization after revocation.
+          if (batchable_entry.data.empty()) {
+            break;
           }
-          break;
-        case SS_CONTROLLER_ARRIVAL_MAGIC:
-          passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
-          break;
-        case SS_CONTROLLER_TOUCH_MAGIC:
-          passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
-          break;
-        case SS_CONTROLLER_MOTION_MAGIC:
-          passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
-          break;
-        case SS_CONTROLLER_BATTERY_MAGIC:
-          passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
-          break;
-        case SS_STEAM_CONTROLLER_ATTRIBUTES_MAGIC:
-          passthrough(input, (PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET) payload);
-          break;
+          auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data.data();
+
+          auto batch_result = batch(payload, batchable_payload);
+          if (batch_result == batch_result_e::terminate_batch) {
+            // Stop batching
+            break;
+          } else if (batch_result == batch_result_e::batched) {
+            // Erase this entry since it was batched
+            i = input->input_queue.erase(i);
+          } else {
+            // We couldn't batch this entry, but try to batch later entries.
+            i++;
+          }
+        }
+      }
+
+      if (entry.data.empty()) {
+        // Keep the consumed press latch until key-up. Native HOME and Back timer
+        // state belong to the controller and survive retiring only this binding.
+        for (auto &gamepad : input->gamepads) {
+          if (gamepad.guide_key_down) {
+            gamepad.guide_key_down = false;
+            send_gamepad_state(gamepad);
+          }
+        }
+      } else {
+        // Print the final input packet
+        input::print((void *) payload);
+
+        // Send the batched input to the OS
+        switch (util::endian::little(payload->magic)) {
+          case MOUSE_MOVE_REL_MAGIC_GEN5:
+            passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
+            break;
+          case MOUSE_MOVE_ABS_MAGIC:
+            passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
+            break;
+          case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+          case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
+            passthrough(input, (PNV_MOUSE_BUTTON_PACKET) payload);
+            break;
+          case SCROLL_MAGIC_GEN5:
+            passthrough(input, (PNV_SCROLL_PACKET) payload);
+            break;
+          case SS_HSCROLL_MAGIC:
+            passthrough(input, (PSS_HSCROLL_PACKET) payload);
+            break;
+          case KEY_DOWN_EVENT_MAGIC:
+          case KEY_UP_EVENT_MAGIC: {
+            const auto permission_state = input->guide_permission_state.load(std::memory_order_acquire);
+            const bool guide_press_allowed = entry.guide_press_allowed &&
+                                             (permission_state & 1) != 0 &&
+                                             entry.guide_permission_state == permission_state;
+            passthrough(input, (PNV_KEYBOARD_PACKET) payload, guide_press_allowed);
+            break;
+          }
+          case UTF8_TEXT_EVENT_MAGIC:
+            passthrough((PNV_UNICODE_PACKET) payload);
+            break;
+          case MULTI_CONTROLLER_MAGIC_GEN5:
+            passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
+            break;
+          case SS_TOUCH_MAGIC:
+            passthrough(input, (PSS_TOUCH_PACKET) payload);
+            break;
+          case SS_PEN_MAGIC:
+            passthrough(input, (PSS_PEN_PACKET) payload);
+            break;
+          case controller_speaker_pcm::binding_magic:
+            if (config::input.controller) {
+              input->speaker_bindings.bind(entry.data, [&](std::uint16_t slot) {
+                return slot < input->gamepads.size() && input->gamepads[slot].id < 0;
+              });
+            }
+            break;
+          case SS_CONTROLLER_ARRIVAL_MAGIC:
+            passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
+            break;
+          case SS_CONTROLLER_TOUCH_MAGIC:
+            passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
+            break;
+          case SS_CONTROLLER_MOTION_MAGIC:
+            passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
+            break;
+          case SS_CONTROLLER_BATTERY_MAGIC:
+            passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
+            break;
+          case SS_STEAM_CONTROLLER_ATTRIBUTES_MAGIC:
+            passthrough(input, (PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET) payload);
+            break;
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lg(input->input_queue_lock);
+        if (input->input_queue.empty()) {
+          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+          return;
+        }
       }
     }
 
-    bool schedule_next = false;
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      if (!input->input_queue.empty()) {
-        schedule_next = true;
-      } else {
-        input->input_queue_task_scheduled.store(false, std::memory_order_release);
-      }
-    }
-    if (schedule_next) {
-      task_pool.push(passthrough_next_message, std::move(input));
-    }
+    task_pool.push(passthrough_next_message, std::move(input));
   }
 
   void update_guide_button_permissions(const std::shared_ptr<input_t> &input, const crypto::PERM &permission) {

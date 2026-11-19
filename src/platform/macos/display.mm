@@ -3,6 +3,7 @@
  * @brief Definitions for display capture on macOS.
  */
 // standard includes
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -105,9 +106,55 @@ namespace platf {
     bool hdr = false;
     double headroom = 1.0;  ///< The display's EDR headroom, while hdr.
     std::pair<std::size_t, std::size_t> captured_pixels;  ///< The display's mode when capture was set up.
+    std::atomic<bool> lock_cpu_pixels {false};
+    std::atomic<bool> need_bootstrap_sample {true};
+    std::mutex latest_sample_mutex;
+    CMSampleBufferRef latest_sample = nullptr;
 
     ~av_display_t() override {
+      if (latest_sample) {
+        CFRelease(latest_sample);
+      }
       [av_capture release];
+    }
+
+    static void populate_captured_img(av_img_t *av_img, CMSampleBufferRef sampleBuffer, bool lock_cpu) {
+      const auto host_processing_timestamp = std::chrono::steady_clock::now();
+      auto frame_timestamp = host_processing_timestamp;
+      const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+      if (CMTIME_IS_NUMERIC(pts)) {
+        const CMTime now_cm = CMClockGetTime(CMClockGetHostTimeClock());
+        const double age_sec = CMTimeGetSeconds(CMTimeSubtract(now_cm, pts));
+        if (age_sec >= 0.0 && age_sec < 1.0) {
+          frame_timestamp = host_processing_timestamp - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(age_sec));
+        }
+      }
+
+      auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
+      auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf, lock_cpu);
+
+      auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
+        av_img->sample_buffer,
+        av_img->pixel_buffer,
+        av_img->data
+      );
+
+      av_img->sample_buffer = std::move(new_sample_buffer);
+      av_img->pixel_buffer = std::move(new_pixel_buffer);
+      av_img->data = av_img->pixel_buffer->data();
+
+      auto *pb = av_img->pixel_buffer->buf;
+      av_img->width = (int) CVPixelBufferGetWidth(pb);
+      av_img->height = (int) CVPixelBufferGetHeight(pb);
+      const size_t bpr = CVPixelBufferIsPlanar(pb) ?
+                           CVPixelBufferGetBytesPerRowOfPlane(pb, 0) :
+                           CVPixelBufferGetBytesPerRow(pb);
+      av_img->row_pitch = (int) bpr;
+      av_img->pixel_pitch = av_img->width > 0 ? av_img->row_pitch / av_img->width : 0;
+      av_img->frame_timestamp = frame_timestamp;
+      av_img->host_processing_timestamp = host_processing_timestamp;
+
+      old_data_retainer = nullptr;
     }
 
     bool is_hdr() override {
@@ -154,8 +201,14 @@ namespace platf {
           return false;
         }
 
-        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
-        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
+        if (need_bootstrap_sample.load(std::memory_order_relaxed) &&
+            need_bootstrap_sample.exchange(false, std::memory_order_relaxed)) {
+          std::lock_guard sample_lock {latest_sample_mutex};
+          if (latest_sample) {
+            CFRelease(latest_sample);
+          }
+          latest_sample = (CMSampleBufferRef) CFRetain(sampleBuffer);
+        }
 
         std::shared_ptr<img_t> img_out;
         if (!pull_free_image_cb(img_out)) {
@@ -165,23 +218,7 @@ namespace platf {
           return false;
         }
         auto av_img = std::static_pointer_cast<av_img_t>(img_out);
-
-        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
-          av_img->sample_buffer,
-          av_img->pixel_buffer,
-          img_out->data
-        );
-
-        av_img->sample_buffer = new_sample_buffer;
-        av_img->pixel_buffer = new_pixel_buffer;
-        img_out->data = new_pixel_buffer->data();
-
-        img_out->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
-        img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
-        img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img_out->pixel_pitch = img_out->row_pitch / img_out->width;
-
-        old_data_retainer = nullptr;
+        populate_captured_img(av_img.get(), sampleBuffer, lock_cpu_pixels.load(std::memory_order_relaxed));
 
         if (!push_captured_image_cb(std::move(img_out), true)) {
           // got interrupt signal
@@ -291,10 +328,12 @@ namespace platf {
 
     std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
       if (pix_fmt == pix_fmt_e::yuv420p) {
+        lock_cpu_pixels.store(true, std::memory_order_relaxed);
         av_capture.pixelFormat = kCVPixelFormatType_32BGRA;
 
         return std::make_unique<avcodec_encode_device_t>();
       } else if (pix_fmt == pix_fmt_e::nv12 || pix_fmt == pix_fmt_e::p010) {
+        lock_cpu_pixels.store(false, std::memory_order_relaxed);
         auto device = std::make_unique<nv12_zero_device>();
 
         device->init(static_cast<void *>(av_capture), pix_fmt, setResolution, setPixelFormat);
@@ -307,6 +346,7 @@ namespace platf {
     }
 
     std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
+      lock_cpu_pixels.store(false, std::memory_order_relaxed);
       auto *capture = av_capture;
       return vt::make_encode_device(
         pix_fmt,
@@ -327,6 +367,33 @@ namespace platf {
         return 1;
       }
 
+      const bool lock_cpu = lock_cpu_pixels.load(std::memory_order_relaxed);
+      {
+        CMSampleBufferRef cached = nullptr;
+        {
+          std::lock_guard sample_lock {latest_sample_mutex};
+          if (latest_sample) {
+            CVImageBufferRef pb = CMSampleBufferGetImageBuffer(latest_sample);
+            if (pb &&
+                CVPixelBufferGetPixelFormatType(pb) == av_capture.pixelFormat &&
+                (int) CVPixelBufferGetWidth(pb) == av_capture.frameWidth &&
+                (int) CVPixelBufferGetHeight(pb) == av_capture.frameHeight) {
+              cached = latest_sample;
+              latest_sample = nullptr;
+            } else {
+              CFRelease(latest_sample);
+              latest_sample = nullptr;
+            }
+          }
+        }
+        if (cached) {
+          populate_captured_img(static_cast<av_img_t *>(img), cached, lock_cpu);
+          CFRelease(cached);
+          return 0;
+        }
+        need_bootstrap_sample.store(true, std::memory_order_relaxed);
+      }
+
       auto state = std::make_shared<capture_state_t>();
       FrameCallbackBlock on_frame = [^bool(CMSampleBufferRef sampleBuffer) {
         std::lock_guard lock {state->mutex};
@@ -334,27 +401,7 @@ namespace platf {
           return false;
         }
 
-        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
-        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
-
-        auto av_img = (av_img_t *) img;
-
-        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
-          av_img->sample_buffer,
-          av_img->pixel_buffer,
-          img->data
-        );
-
-        av_img->sample_buffer = new_sample_buffer;
-        av_img->pixel_buffer = new_pixel_buffer;
-        img->data = new_pixel_buffer->data();
-
-        img->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
-        img->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
-        img->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img->pixel_pitch = img->row_pitch / img->width;
-
-        old_data_retainer = nullptr;
+        populate_captured_img(static_cast<av_img_t *>(img), sampleBuffer, lock_cpu);
 
         state->delivered = true;
         // returning false here stops capture backend
@@ -558,6 +605,7 @@ namespace platf {
     wake_displays();
 
     auto display = std::make_shared<av_display_t>();
+    display->lock_cpu_pixels.store(hwdevice_type == platf::mem_type_e::system, std::memory_order_relaxed);
 
     // Default to main display
     display->display_id = CGMainDisplayID();
@@ -602,13 +650,20 @@ namespace platf {
     }
 
     // AVCaptureScreenInput delivers no frames from virtual displays, nor HDR; ScreenCaptureKit does.
-    if (remote_monitor || macos_virtual_display::active_display_id() == display->display_id || display->hdr) {
+    if (remote_monitor || macos_virtual_display::active_display_id() == display->display_id || display->hdr || hwdevice_type == platf::mem_type_e::videotoolbox) {
       SCVideo *capture = [[SCVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
       capture.hdr = display->hdr;
-      // The sync encode path only encodes delivered frames, so enforce the minimum frame rate here
-      // (the same default as video.cpp: a fifth of the stream's rate, at least 10 fps).
-      const double minimum_fps = config::video.minimum_fps_target > 0 ? config::video.minimum_fps_target : std::max(config.framerate / 5.0, 10.0);
-      capture.keepaliveInterval = CMTimeMakeWithSeconds(1.0 / minimum_fps, 1000000);
+      if (hwdevice_type == platf::mem_type_e::videotoolbox) {
+        // Async PARALLEL_ENCODING enforces minimum_fps_target in encode_run() and only wraps
+        // IOSurface handles in the callback, so deliver directly on sampleQueue without a
+        // duplicate keepalive timer.
+        capture.directDelivery = YES;
+      } else {
+        // The sync encode path only encodes delivered frames, so enforce the minimum frame rate here
+        // (the same default as video.cpp: a fifth of the stream's rate, at least 10 fps).
+        const double minimum_fps = config::video.minimum_fps_target > 0 ? config::video.minimum_fps_target : std::max(config.framerate / 5.0, 10.0);
+        capture.keepaliveInterval = CMTimeMakeWithSeconds(1.0 / minimum_fps, 1000000);
+      }
       display->av_capture = capture;
     } else {
       display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
@@ -625,6 +680,18 @@ namespace platf {
     // We also need set env_width and env_height for absolute mouse coordinates
     display->env_width = display->width;
     display->env_height = display->height;
+
+    if (hwdevice_type == platf::mem_type_e::videotoolbox) {
+      // Pre-configure capture pixel format and output dimensions before captureThread starts SCStream;
+      // otherwise async PARALLEL_ENCODING starts SCStream in 32BGRA SDR before make_vt_encode_device runs.
+      const auto colorspace = video::colorspace_from_client_config(config, display->hdr);
+      display->av_capture.pixelFormat = colorspace.bit_depth == 10 ?
+                                          kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
+                                          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+      if (config.width > 0 && config.height > 0) {
+        [display->av_capture setFrameWidth:config.width frameHeight:config.height];
+      }
+    }
     // Where the display sits on the desktop, in points.
     const CGRect bounds = CGDisplayBounds(display->display_id);
     display->offset_x = static_cast<int>(bounds.origin.x);

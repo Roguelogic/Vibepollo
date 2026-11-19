@@ -91,6 +91,12 @@ namespace platf::macos_virtual_display {
   /// Whether a display is one of the Remote Monitor displays.
   bool is_remote_display(std::uint32_t display_id);
 
+  /// Fast lock-free check for whether any Remote Monitor display currently exists.
+  bool has_remote_displays();
+
+  /// Monotonic counter incremented whenever macOS reports a display configuration change.
+  std::uint64_t display_state_generation();
+
   /// Whether a display is one of Vibepollo's virtual displays, made as an HDR display.
   bool is_hdr_display(std::uint32_t display_id);
   /** @} */
