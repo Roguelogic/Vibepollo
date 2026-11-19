@@ -7,9 +7,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <thread>
 
 // platform includes
@@ -59,7 +61,31 @@ namespace platf {
     int scroll_lines_per_detent {DEFAULT_SCROLL_LINES_PER_DETENT};
     bool mouse_down[3] {};  // mouse button status
     std::chrono::steady_clock::steady_clock::time_point last_mouse_event[3][2];  // timestamp of last mouse events
+
+    // continuous trackpad scroll & 120Hz momentum inertia state
+    std::mutex scroll_mutex;
+    std::condition_variable scroll_cv;
+    std::thread scroll_thread;
+    bool scroll_stopping {};
+    bool scroll_in_gesture {};
+    bool scroll_began_posted {};
+    bool scroll_in_momentum {};
+    bool scroll_momentum_first_tick {};
+    double scroll_accum_x {};
+    double scroll_accum_y {};
+    double scroll_vx {};  ///< Pixels/sec horizontal velocity
+    double scroll_vy {};  ///< Pixels/sec vertical velocity
+    double scroll_mom_rem_x {};
+    double scroll_mom_rem_y {};
+    CGPoint scroll_momentum_anchor {};
+    bool scroll_has_momentum_anchor {};
+    std::chrono::steady_clock::time_point scroll_last_event {};
+    std::chrono::steady_clock::time_point scroll_last_x_event {};
+    std::chrono::steady_clock::time_point scroll_last_y_event {};
+    std::chrono::steady_clock::time_point scroll_last_mom_tick {};
   };
+
+  void cancel_scroll_momentum(macos_input_t *macos_input);
 
   // Input coordinates are based on the display's points, not its pixels (Retina is 2 pixels per point).
   CGFloat display_scaling(const CGDirectDisplayID display) {
@@ -361,6 +387,7 @@ const KeyCodeMap kKeyCodesMap[] = {
           macos_input->kb_flags &= ~modifier_flags.generic;
         }
       } else {
+        cancel_scroll_momentum(macos_input);
         macos_input->kb_flags |= modifier_flags.generic | modifier_flags.device;
       }
 
@@ -421,6 +448,20 @@ const KeyCodeMap kKeyCodesMap[] = {
 
     const auto macos_input = static_cast<macos_input_t *>(input.get());
     const auto event = macos_input->mouse_event;
+
+    {
+      std::unique_lock lock(macos_input->scroll_mutex);
+      if (macos_input->scroll_in_momentum) {
+        if (!macos_input->scroll_has_momentum_anchor) {
+          macos_input->scroll_momentum_anchor = CGPointMake(raw_location.x, raw_location.y);
+          macos_input->scroll_has_momentum_anchor = true;
+        } else if (std::hypot(raw_location.x - macos_input->scroll_momentum_anchor.x,
+                              raw_location.y - macos_input->scroll_momentum_anchor.y) > 28.0) {
+          lock.unlock();
+          cancel_scroll_momentum(macos_input);
+        }
+      }
+    }
 
     // Keep the pointer on the streamed display, or on a Remote Monitor display, which someone is
     // also watching.
@@ -509,6 +550,9 @@ const KeyCodeMap kKeyCodesMap[] = {
     CGEventType event;
 
     const auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (!release) {
+      cancel_scroll_momentum(macos_input);
+    }
 
     switch (button) {
       case 1:
@@ -570,16 +614,20 @@ const KeyCodeMap kKeyCodesMap[] = {
     return std::max(1, static_cast<int>(std::ceil(1.0 + scroll_scale * lines_per_scroll_scale)));
   }
 
-  int scroll_pixels(const macos_input_t *macos_input, const int high_res_distance) {
+  double scroll_pixels_exact(const macos_input_t *macos_input, const int high_res_distance) {
     const auto source_pixels_per_line = CGEventSourceGetPixelsPerLine(macos_input->source);
-    const auto pixels_per_line = source_pixels_per_line > 0 ? static_cast<int>(source_pixels_per_line + 0.5) : 10;
-    const auto scaled_pixels = static_cast<int64_t>(high_res_distance) * std::max(1, pixels_per_line) * std::max(1, macos_input->scroll_lines_per_detent);
-
-    return static_cast<int>(scaled_pixels / WHEEL_DELTA);
+    const auto pixels_per_line = source_pixels_per_line > 0 ? static_cast<double>(source_pixels_per_line) : 10.0;
+    return static_cast<double>(high_res_distance) * std::max(1.0, pixels_per_line) * std::max(1, macos_input->scroll_lines_per_detent) / static_cast<double>(WHEEL_DELTA);
   }
 
-  void post_scroll(macos_input_t *macos_input, const int wheelY, const int wheelX) {
-    if (wheelY == 0 && wheelX == 0) {
+  void post_scroll_event_raw(
+    macos_input_t *macos_input,
+    const int wheelY,
+    const int wheelX,
+    const uint32_t scroll_phase,
+    const uint32_t momentum_phase
+  ) {
+    if (wheelY == 0 && wheelX == 0 && scroll_phase == 0 && momentum_phase == 0) {
       return;
     }
 
@@ -589,8 +637,272 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+    if (scroll_phase != 0) {
+      CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scroll_phase);
+    }
+    if (momentum_phase != 0) {
+      CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, momentum_phase);
+    }
+    // Momentum coasting events carry empty modifier flags so pressing Cmd after a flick
+    // never triggers accidental Cmd+Scroll zoom in browsers/editors.
+    CGEventSetFlags(event, momentum_phase != 0 ? 0 : macos_input->kb_flags);
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
+  }
+
+  void cancel_scroll_momentum(macos_input_t *macos_input) {
+    bool emit_end = false;
+    {
+      std::lock_guard lock(macos_input->scroll_mutex);
+      if (macos_input->scroll_in_momentum) {
+        macos_input->scroll_in_momentum = false;
+        macos_input->scroll_has_momentum_anchor = false;
+        macos_input->scroll_vx = 0;
+        macos_input->scroll_vy = 0;
+        macos_input->scroll_mom_rem_x = 0;
+        macos_input->scroll_mom_rem_y = 0;
+        emit_end = !macos_input->scroll_momentum_first_tick;
+      }
+    }
+    if (emit_end) {
+      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+    }
+  }
+
+  void update_axis_velocity(
+    double &vel,
+    std::chrono::steady_clock::time_point &last_axis_time,
+    const std::chrono::steady_clock::time_point now,
+    const double delta_px,
+    const bool first_in_gesture
+  ) {
+    if (delta_px == 0.0) {
+      return;
+    }
+    if (first_in_gesture || last_axis_time.time_since_epoch().count() == 0) {
+      vel = std::clamp(delta_px / 0.014 * 0.5, -6000.0, 6000.0);
+      last_axis_time = now;
+      return;
+    }
+    const double dt = std::chrono::duration<double>(now - last_axis_time).count();
+    last_axis_time = now;
+    if (dt > 0.065) {
+      vel = std::clamp(delta_px / 0.016 * 0.35, -6000.0, 6000.0);
+      return;
+    }
+    const double inst_v = std::clamp(delta_px / std::max(dt, 0.005), -6000.0, 6000.0);
+    if (vel * inst_v < 0.0) {
+      vel = inst_v;
+    } else {
+      vel = 0.60 * inst_v + 0.40 * vel;
+    }
+  }
+
+  void continuous_scroll_delta(macos_input_t *macos_input, const double delta_y_px, const double delta_x_px) {
+    if (delta_y_px == 0.0 && delta_x_px == 0.0) {
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    bool emit_momentum_end = false;
+    uint32_t phase = kCGScrollPhaseChanged;
+    int step_y = 0;
+    int step_x = 0;
+
+    {
+      std::lock_guard lock(macos_input->scroll_mutex);
+      if (macos_input->scroll_in_momentum) {
+        macos_input->scroll_in_momentum = false;
+        macos_input->scroll_has_momentum_anchor = false;
+        emit_momentum_end = !macos_input->scroll_momentum_first_tick;
+      }
+
+      const bool starting = !macos_input->scroll_in_gesture;
+      if (starting) {
+        macos_input->scroll_in_gesture = true;
+        macos_input->scroll_began_posted = false;
+        macos_input->scroll_accum_x = 0;
+        macos_input->scroll_accum_y = 0;
+        macos_input->scroll_vx = 0;
+        macos_input->scroll_vy = 0;
+        macos_input->scroll_last_x_event = {};
+        macos_input->scroll_last_y_event = {};
+      }
+
+      macos_input->scroll_last_event = now;
+      update_axis_velocity(macos_input->scroll_vy, macos_input->scroll_last_y_event, now, delta_y_px, starting);
+      update_axis_velocity(macos_input->scroll_vx, macos_input->scroll_last_x_event, now, delta_x_px, starting);
+
+      macos_input->scroll_accum_y += delta_y_px;
+      macos_input->scroll_accum_x += delta_x_px;
+      step_y = static_cast<int>(std::trunc(macos_input->scroll_accum_y));
+      step_x = static_cast<int>(std::trunc(macos_input->scroll_accum_x));
+      macos_input->scroll_accum_y -= step_y;
+      macos_input->scroll_accum_x -= step_x;
+
+      if (step_y != 0 || step_x != 0) {
+        if (!macos_input->scroll_began_posted) {
+          phase = kCGScrollPhaseBegan;
+          macos_input->scroll_began_posted = true;
+        } else {
+          phase = kCGScrollPhaseChanged;
+        }
+      }
+      macos_input->scroll_cv.notify_one();
+    }
+
+    if (emit_momentum_end) {
+      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+    }
+    if (step_y != 0 || step_x != 0) {
+      post_scroll_event_raw(macos_input, step_y, step_x, phase, 0);
+    }
+  }
+
+  void finish_continuous_scroll_gesture(macos_input_t *macos_input) {
+    const auto now = std::chrono::steady_clock::now();
+    bool emit_gesture_end = false;
+    {
+      std::lock_guard lock(macos_input->scroll_mutex);
+      if (!macos_input->scroll_in_gesture) {
+        return;
+      }
+      macos_input->scroll_in_gesture = false;
+      emit_gesture_end = macos_input->scroll_began_posted;
+
+      if (macos_input->scroll_last_y_event.time_since_epoch().count() == 0 ||
+          now - macos_input->scroll_last_y_event > 75ms) {
+        macos_input->scroll_vy = 0;
+      }
+      if (macos_input->scroll_last_x_event.time_since_epoch().count() == 0 ||
+          now - macos_input->scroll_last_x_event > 75ms) {
+        macos_input->scroll_vx = 0;
+      }
+
+      if (emit_gesture_end && std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) >= 110.0) {
+        macos_input->scroll_in_momentum = true;
+        macos_input->scroll_momentum_first_tick = true;
+        macos_input->scroll_has_momentum_anchor = false;
+        macos_input->scroll_mom_rem_x = 0;
+        macos_input->scroll_mom_rem_y = 0;
+        macos_input->scroll_last_mom_tick = now;
+        macos_input->scroll_cv.notify_one();
+      } else {
+        macos_input->scroll_vx = 0;
+        macos_input->scroll_vy = 0;
+      }
+    }
+    if (emit_gesture_end) {
+      post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0);
+    }
+  }
+
+  void run_scroll_momentum_worker(macos_input_t *macos_input) {
+    constexpr auto gesture_idle_timeout = 38ms;
+    constexpr auto momentum_tick_interval = 8333us;  // 120Hz
+
+    for (;;) {
+      bool do_gesture_end = false;
+      bool do_mom_tick = false;
+      bool do_mom_end = false;
+      uint32_t mom_phase = 0;
+      int step_y = 0;
+      int step_x = 0;
+
+      {
+        std::unique_lock lock(macos_input->scroll_mutex);
+        macos_input->scroll_cv.wait(lock, [&]() {
+          return macos_input->scroll_stopping || macos_input->scroll_in_gesture || macos_input->scroll_in_momentum;
+        });
+        if (macos_input->scroll_stopping) {
+          return;
+        }
+
+        if (macos_input->scroll_in_gesture) {
+          const auto deadline = macos_input->scroll_last_event + gesture_idle_timeout;
+          if (macos_input->scroll_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (macos_input->scroll_stopping) {
+              return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (macos_input->scroll_in_gesture && now >= macos_input->scroll_last_event + gesture_idle_timeout) {
+              macos_input->scroll_in_gesture = false;
+              do_gesture_end = macos_input->scroll_began_posted;
+
+              if (macos_input->scroll_last_y_event.time_since_epoch().count() == 0 ||
+                  now - macos_input->scroll_last_y_event > 75ms) {
+                macos_input->scroll_vy = 0;
+              }
+              if (macos_input->scroll_last_x_event.time_since_epoch().count() == 0 ||
+                  now - macos_input->scroll_last_x_event > 75ms) {
+                macos_input->scroll_vx = 0;
+              }
+
+              if (do_gesture_end && std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) >= 110.0) {
+                macos_input->scroll_in_momentum = true;
+                macos_input->scroll_momentum_first_tick = true;
+                macos_input->scroll_has_momentum_anchor = false;
+                macos_input->scroll_mom_rem_x = 0;
+                macos_input->scroll_mom_rem_y = 0;
+                macos_input->scroll_last_mom_tick = now;
+              } else {
+                macos_input->scroll_vx = 0;
+                macos_input->scroll_vy = 0;
+              }
+            }
+          }
+        } else if (macos_input->scroll_in_momentum) {
+          macos_input->scroll_cv.wait_for(lock, momentum_tick_interval);
+          if (macos_input->scroll_stopping) {
+            return;
+          }
+          if (macos_input->scroll_in_momentum) {
+            const auto now = std::chrono::steady_clock::now();
+            const double dt = std::clamp(std::chrono::duration<double>(now - macos_input->scroll_last_mom_tick).count(), 0.004, 0.050);
+            macos_input->scroll_last_mom_tick = now;
+
+            // Apple UIScrollViewDecelerationRateNormal (0.998/ms = exp(-2.0 * dt))
+            const double decay = std::exp(-2.0 * dt);
+            macos_input->scroll_vx *= decay;
+            macos_input->scroll_vy *= decay;
+
+            if (std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) < 18.0) {
+              macos_input->scroll_in_momentum = false;
+              macos_input->scroll_has_momentum_anchor = false;
+              macos_input->scroll_vx = 0;
+              macos_input->scroll_vy = 0;
+              do_mom_end = !macos_input->scroll_momentum_first_tick;
+            } else {
+              macos_input->scroll_mom_rem_x += macos_input->scroll_vx * dt;
+              macos_input->scroll_mom_rem_y += macos_input->scroll_vy * dt;
+              step_x = static_cast<int>(std::trunc(macos_input->scroll_mom_rem_x));
+              step_y = static_cast<int>(std::trunc(macos_input->scroll_mom_rem_y));
+              macos_input->scroll_mom_rem_x -= step_x;
+              macos_input->scroll_mom_rem_y -= step_y;
+              if (step_x != 0 || step_y != 0) {
+                mom_phase = macos_input->scroll_momentum_first_tick ? kCGMomentumScrollPhaseBegin : kCGMomentumScrollPhaseContinue;
+                macos_input->scroll_momentum_first_tick = false;
+                do_mom_tick = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (do_gesture_end) {
+        post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0);
+      }
+      if (do_mom_tick) {
+        post_scroll_event_raw(macos_input, step_y, step_x, 0, mom_phase);
+      }
+      if (do_mom_end) {
+        post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+      }
+    }
+  }
+
+  void post_scroll(macos_input_t *macos_input, const int wheelY, const int wheelX) {
+    post_scroll_event_raw(macos_input, wheelY, wheelX, 0, 0);
   }
 
   void post_scroll(input_t &input, const int wheelY, const int wheelX) {
@@ -598,11 +910,35 @@ const KeyCodeMap kKeyCodesMap[] = {
   }
 
   void scroll(input_t &input, const int high_res_distance) {
-    post_scroll(input, scroll_pixels(static_cast<macos_input_t *>(input.get()), high_res_distance), 0);
+    auto *macos_input = static_cast<macos_input_t *>(input.get());
+    const double exact_px = scroll_pixels_exact(macos_input, high_res_distance);
+    bool treat_as_continuous = (high_res_distance % WHEEL_DELTA) != 0;
+    if (!treat_as_continuous) {
+      std::lock_guard lock(macos_input->scroll_mutex);
+      treat_as_continuous = macos_input->scroll_in_gesture;
+    }
+    if (treat_as_continuous) {
+      continuous_scroll_delta(macos_input, exact_px, 0.0);
+    } else {
+      cancel_scroll_momentum(macos_input);
+      post_scroll(macos_input, static_cast<int>(std::lround(exact_px)), 0);
+    }
   }
 
   void hscroll(input_t &input, int high_res_distance) {
-    post_scroll(input, 0, scroll_pixels(static_cast<macos_input_t *>(input.get()), high_res_distance));
+    auto *macos_input = static_cast<macos_input_t *>(input.get());
+    const double exact_px = scroll_pixels_exact(macos_input, high_res_distance);
+    bool treat_as_continuous = (high_res_distance % WHEEL_DELTA) != 0;
+    if (!treat_as_continuous) {
+      std::lock_guard lock(macos_input->scroll_mutex);
+      treat_as_continuous = macos_input->scroll_in_gesture;
+    }
+    if (treat_as_continuous) {
+      continuous_scroll_delta(macos_input, 0.0, exact_px);
+    } else {
+      cancel_scroll_momentum(macos_input);
+      post_scroll(macos_input, 0, static_cast<int>(std::lround(exact_px)));
+    }
   }
 
   /**
@@ -804,13 +1140,13 @@ const KeyCodeMap kKeyCodesMap[] = {
       post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, location, tap_count);
     }
 
-    // Scrolls by the whole pixels gathered so far and keeps the fraction for the next event.
+    // Scrolls by the accumulated touch delta and feeds the continuous momentum tracker.
     void scroll_by_remainder() {
-      const auto whole_x = std::trunc(scroll_remainder_x);
-      const auto whole_y = std::trunc(scroll_remainder_y);
-      scroll_remainder_x -= whole_x;
-      scroll_remainder_y -= whole_y;
-      post_scroll(macos_input, static_cast<int>(whole_y), static_cast<int>(whole_x));
+      const double dx = scroll_remainder_x;
+      const double dy = scroll_remainder_y;
+      scroll_remainder_x = 0;
+      scroll_remainder_y = 0;
+      continuous_scroll_delta(macos_input, dy, dx);
     }
 
     void touch_release() {
@@ -1038,6 +1374,9 @@ const KeyCodeMap kKeyCodesMap[] = {
           }
         }
         if (touch_points.empty()) {
+          if (touch_scrolling) {
+            finish_continuous_scroll_gesture(macos_input);
+          }
           touch_scrolling = false;
         }
         break;
@@ -1155,6 +1494,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_input->mouse_down[1] = false;
     macos_input->mouse_down[2] = false;
 
+    macos_input->scroll_thread = std::thread(run_scroll_momentum_worker, macos_input);
+
     BOOST_LOG(debug) << "macOS scroll speed: com.apple.scrollwheel.scaling="sv << macos_input->scrollwheel_scaling << ", lines per detent="sv << macos_input->scroll_lines_per_detent << ", pixels per line="sv << CGEventSourceGetPixelsPerLine(macos_input->source);
     BOOST_LOG(debug) << "Display "sv << macos_input->display << ", pixel dimension: " << CGDisplayPixelsWide(macos_input->display) << "x"sv << CGDisplayPixelsHigh(macos_input->display);
 
@@ -1162,7 +1503,16 @@ const KeyCodeMap kKeyCodesMap[] = {
   }
 
   void freeInput(void *p) {
-    const auto *input = static_cast<macos_input_t *>(p);
+    auto *input = static_cast<macos_input_t *>(p);
+
+    {
+      std::lock_guard lock(input->scroll_mutex);
+      input->scroll_stopping = true;
+      input->scroll_cv.notify_all();
+    }
+    if (input->scroll_thread.joinable()) {
+      input->scroll_thread.join();
+    }
 
     CFRelease(input->source);
     CFRelease(input->keyboard_source);
