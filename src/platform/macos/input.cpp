@@ -55,6 +55,7 @@ namespace platf {
     // keyboard related stuff
     CGEventSourceRef keyboard_source {};
     CGEventFlags kb_flags {};
+    std::chrono::steady_clock::time_point capslock_down_time {};
 
     // mouse related stuff
     CGEventRef mouse_event {};  // mouse event source
@@ -88,6 +89,8 @@ namespace platf {
     double scroll_mom_rem_y {};
     CGPoint scroll_momentum_anchor {};
     bool scroll_has_momentum_anchor {};
+    bool scroll_has_target_loc {};
+    CGPoint scroll_target_loc {};
     std::chrono::steady_clock::time_point scroll_last_event {};
     std::chrono::steady_clock::time_point scroll_last_x_event {};
     std::chrono::steady_clock::time_point scroll_last_y_event {};
@@ -372,7 +375,62 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
   }
 
+  // Triggers macOS's global input source switch (Control+Space, Symbolic Hotkey 60) at the HID tap
+  // so iPad Magic Keyboard's 한/영 (Caps Lock) and Globe (0xFF) keys reliably toggle ABC <-> Korean.
+  void toggle_input_source(macos_input_t *macos_input) {
+    const CGEventFlags saved_flags = macos_input->kb_flags;
+    const CGEventFlags ctrl_flags = saved_flags | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
+
+    if (CGEventRef ctrl_down = CGEventCreateKeyboardEvent(macos_input->keyboard_source, kVK_Control, true)) {
+      CGEventSetFlags(ctrl_down, ctrl_flags);
+      CGEventPost(kCGHIDEventTap, ctrl_down);
+      CFRelease(ctrl_down);
+    }
+    if (CGEventRef space_down = CGEventCreateKeyboardEvent(macos_input->keyboard_source, kVK_Space, true)) {
+      CGEventSetFlags(space_down, ctrl_flags);
+      CGEventPost(kCGHIDEventTap, space_down);
+      CFRelease(space_down);
+    }
+    if (CGEventRef space_up = CGEventCreateKeyboardEvent(macos_input->keyboard_source, kVK_Space, false)) {
+      CGEventSetFlags(space_up, ctrl_flags);
+      CGEventPost(kCGHIDEventTap, space_up);
+      CFRelease(space_up);
+    }
+    if (CGEventRef ctrl_up = CGEventCreateKeyboardEvent(macos_input->keyboard_source, kVK_Control, false)) {
+      CGEventSetFlags(ctrl_up, saved_flags);
+      CGEventPost(kCGHIDEventTap, ctrl_up);
+      CFRelease(ctrl_up);
+    }
+  }
+
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
+    auto macos_input = ((macos_input_t *) input.get());
+
+    // Globe / Language key (0xFF in VoidLink/Moonlight-iOS) or VK_HANGUL (0x15)
+    if (modcode == 0xFF || modcode == 0x15) {
+      if (!release) {
+        toggle_input_source(macos_input);
+      }
+      return;
+    }
+
+    // Caps Lock / 한영 key (0x14) without Shift: toggle input source (Shift+CapsLock keeps real CapsLock)
+    if (modcode == 0x14 && (macos_input->kb_flags & kCGEventFlagMaskShift) == 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (!release) {
+        macos_input->capslock_down_time = now;
+        toggle_input_source(macos_input);
+      } else {
+        // Also handle hardware-latched CapsLock on iPadOS where alternate presses emit only key-up
+        if (macos_input->capslock_down_time.time_since_epoch().count() != 0 &&
+            (now - macos_input->capslock_down_time) > 350ms) {
+          toggle_input_source(macos_input);
+        }
+        macos_input->capslock_down_time = {};
+      }
+      return;
+    }
+
     auto key = keysym(modcode);
 
     BOOST_LOG(debug) << "got keycode: 0x"sv << std::hex << modcode << ", translated to: 0x" << std::hex << key << ", release:" << release;
@@ -381,7 +439,6 @@ const KeyCodeMap kKeyCodesMap[] = {
       return;
     }
 
-    auto macos_input = ((macos_input_t *) input.get());
     CGEventRef event = nullptr;
     modifier_flags_t modifier_flags;
 
@@ -642,7 +699,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     const int wheelY,
     const int wheelX,
     const uint32_t scroll_phase,
-    const uint32_t momentum_phase
+    const uint32_t momentum_phase,
+    const CGPoint *target_loc = nullptr
   ) {
     if (wheelY == 0 && wheelX == 0 && scroll_phase == 0 && momentum_phase == 0) {
       return;
@@ -653,6 +711,9 @@ const KeyCodeMap kKeyCodesMap[] = {
       return;
     }
 
+    if (target_loc) {
+      CGEventSetLocation(event, *target_loc);
+    }
     CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
     if (scroll_phase != 0) {
       CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scroll_phase);
@@ -669,6 +730,8 @@ const KeyCodeMap kKeyCodesMap[] = {
 
   void cancel_scroll_momentum(macos_input_t *macos_input) {
     bool emit_end = false;
+    bool has_loc = false;
+    CGPoint loc {};
     {
       std::lock_guard lock(macos_input->scroll_mutex);
       if (macos_input->scroll_in_momentum) {
@@ -683,11 +746,13 @@ const KeyCodeMap kKeyCodesMap[] = {
         macos_input->scroll_mom_emitted_y = 0;
         macos_input->scroll_mom_rem_x = 0;
         macos_input->scroll_mom_rem_y = 0;
+        has_loc = macos_input->scroll_has_target_loc;
+        loc = macos_input->scroll_target_loc;
         emit_end = !macos_input->scroll_momentum_first_tick;
       }
     }
     if (emit_end) {
-      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd, has_loc ? &loc : nullptr);
     }
   }
 
@@ -760,13 +825,15 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
   }
 
-  void continuous_scroll_delta(macos_input_t *macos_input, const double delta_y_px, const double delta_x_px) {
+  void continuous_scroll_delta(macos_input_t *macos_input, const double delta_y_px, const double delta_x_px, const CGPoint *target_loc = nullptr) {
     if (delta_y_px == 0.0 && delta_x_px == 0.0) {
       return;
     }
 
     const auto now = std::chrono::steady_clock::now();
     bool emit_momentum_end = false;
+    bool prev_has_loc = false;
+    CGPoint prev_loc {};
     uint32_t phase = kCGScrollPhaseChanged;
     int step_y = 0;
     int step_x = 0;
@@ -776,6 +843,8 @@ const KeyCodeMap kKeyCodesMap[] = {
       if (macos_input->scroll_in_momentum) {
         macos_input->scroll_in_momentum = false;
         macos_input->scroll_has_momentum_anchor = false;
+        prev_has_loc = macos_input->scroll_has_target_loc;
+        prev_loc = macos_input->scroll_target_loc;
         emit_momentum_end = !macos_input->scroll_momentum_first_tick;
       }
 
@@ -789,6 +858,10 @@ const KeyCodeMap kKeyCodesMap[] = {
         macos_input->scroll_vy = 0;
         macos_input->scroll_last_x_event = {};
         macos_input->scroll_last_y_event = {};
+      }
+      macos_input->scroll_has_target_loc = (target_loc != nullptr);
+      if (target_loc) {
+        macos_input->scroll_target_loc = *target_loc;
       }
 
       macos_input->scroll_last_event = now;
@@ -814,16 +887,18 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     if (emit_momentum_end) {
-      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+      post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd, prev_has_loc ? &prev_loc : nullptr);
     }
     if (step_y != 0 || step_x != 0) {
-      post_scroll_event_raw(macos_input, step_y, step_x, phase, 0);
+      post_scroll_event_raw(macos_input, step_y, step_x, phase, 0, target_loc);
     }
   }
 
   void finish_continuous_scroll_gesture(macos_input_t *macos_input) {
     const auto now = std::chrono::steady_clock::now();
     bool emit_gesture_end = false;
+    bool has_loc = false;
+    CGPoint loc {};
     {
       std::lock_guard lock(macos_input->scroll_mutex);
       if (!macos_input->scroll_in_gesture) {
@@ -831,6 +906,8 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
       macos_input->scroll_in_gesture = false;
       emit_gesture_end = macos_input->scroll_began_posted;
+      has_loc = macos_input->scroll_has_target_loc;
+      loc = macos_input->scroll_target_loc;
 
       if (macos_input->scroll_last_y_event.time_since_epoch().count() == 0 ||
           now - macos_input->scroll_last_y_event > 75ms) {
@@ -849,7 +926,7 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
     }
     if (emit_gesture_end) {
-      post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0);
+      post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0, has_loc ? &loc : nullptr);
     }
   }
 
@@ -861,6 +938,8 @@ const KeyCodeMap kKeyCodesMap[] = {
       bool do_gesture_end = false;
       bool do_mom_tick = false;
       bool do_mom_end = false;
+      bool has_loc = false;
+      CGPoint loc {};
       uint32_t mom_phase = 0;
       int step_y = 0;
       int step_x = 0;
@@ -873,6 +952,8 @@ const KeyCodeMap kKeyCodesMap[] = {
         if (macos_input->scroll_stopping) {
           return;
         }
+        has_loc = macos_input->scroll_has_target_loc;
+        loc = macos_input->scroll_target_loc;
 
         if (macos_input->scroll_in_gesture) {
           const auto deadline = macos_input->scroll_last_event + gesture_idle_timeout;
@@ -968,13 +1049,13 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
 
       if (do_gesture_end) {
-        post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0);
+        post_scroll_event_raw(macos_input, 0, 0, kCGScrollPhaseEnded, 0, has_loc ? &loc : nullptr);
       }
       if (do_mom_tick) {
-        post_scroll_event_raw(macos_input, step_y, step_x, 0, mom_phase);
+        post_scroll_event_raw(macos_input, step_y, step_x, 0, mom_phase, has_loc ? &loc : nullptr);
       }
       if (do_mom_end) {
-        post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
+        post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd, has_loc ? &loc : nullptr);
       }
     }
   }
@@ -1171,12 +1252,28 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
 
       post_event(event);
-      // See post_mouse(): keeps the cursor where the event was posted.
-      CGWarpMouseCursorPosition(location);
+      if (pen != nullptr) {
+        // Keep cursor synced for stylus hover/drawing; finger touch must not teleport the mouse cursor.
+        CGWarpMouseCursorPosition(location);
+        macos_input->last_cursor_loc = {location.x, location.y};
+        macos_input->has_cursor_loc = true;
+      }
       last_location = location;
       have_location = true;
-      macos_input->last_cursor_loc = {location.x, location.y};
-      macos_input->has_cursor_loc = true;
+    }
+
+    CGPoint current_cursor_point() const {
+      if (const auto snap = CGEventCreate(macos_input->source)) {
+        const auto pt = CGEventGetLocation(snap);
+        CFRelease(snap);
+        return pt;
+      }
+      return CGPointMake(macos_input->last_cursor_loc.x, macos_input->last_cursor_loc.y);
+    }
+
+    void restore_cursor_point(const CGPoint &pt) const {
+      CGWarpMouseCursorPosition(pt);
+      CGAssociateMouseAndMouseCursorPosition(true);
     }
 
     void post_proximity(const bool enter) const {
@@ -1216,8 +1313,10 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     void touch_right_click(const CGPoint &location) {
+      const auto saved_cursor = current_cursor_point();
       post_mouse_event(kCGEventRightMouseDown, kCGMouseButtonRight, location, 1);
       post_mouse_event(kCGEventRightMouseUp, kCGMouseButtonRight, location, 1);
+      restore_cursor_point(saved_cursor);
     }
 
     void touch_click(const CGPoint &location) {
@@ -1228,25 +1327,27 @@ const KeyCodeMap kKeyCodesMap[] = {
       last_tap = location;
       last_tap_time = now;
 
+      const auto saved_cursor = current_cursor_point();
       post_mouse_event(kCGEventLeftMouseDown, kCGMouseButtonLeft, location, tap_count);
       post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, location, tap_count);
+      restore_cursor_point(saved_cursor);
     }
 
-    // Scrolls by the accumulated touch delta and feeds the continuous momentum tracker.
-    // Direct screen touch deltas are in screen coordinates (-y when dragging finger up), opposite
-    // to wheel coordinates, so flip only when macOS's own natural-scroll inverter is active.
+    // Scrolls by the accumulated touch delta and feeds the continuous momentum tracker
+    // targeted at touch_scroll_origin without moving the system mouse cursor.
     void scroll_by_remainder() {
       const double sign = macos_natural_scrolling_enabled() ? -1.0 : 1.0;
       const double dx = scroll_remainder_x * sign;
       const double dy = scroll_remainder_y * sign;
       scroll_remainder_x = 0;
       scroll_remainder_y = 0;
-      continuous_scroll_delta(macos_input, dy, dx);
+      continuous_scroll_delta(macos_input, dy, dx, &touch_scroll_origin);
     }
 
     void touch_release() {
       if (touch_dragging) {
         post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, last_location, 1);
+        restore_cursor_point(saved_drag_cursor);
       }
       touch_dragging = false;
       touch_points.clear();
@@ -1256,6 +1357,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_input_t *macos_input;
     CGPoint last_location {};
     bool have_location {};
+    CGPoint touch_scroll_origin {};
+    CGPoint saved_drag_cursor {};
 
     bool pen_in_proximity {};
     int pen_pointer {POINTER_PEN};
@@ -1386,15 +1489,17 @@ const KeyCodeMap kKeyCodesMap[] = {
           // The first finger was waiting to become a click or drag; it is a scroll now.
           if (touch_dragging) {
             post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, last_location, 1);
+            restore_cursor_point(saved_drag_cursor);
             touch_dragging = false;
           }
           touch_scrolling = true;
           two_finger_tap = touch_points.size() == 2;
           two_finger_down_time = std::chrono::steady_clock::now();
         } else {
+          cancel_scroll_momentum(macos_input);
+          touch_scroll_origin = location;
           touch_scrolling = false;
           two_finger_tap = false;
-          post_mouse_event(kCGEventMouseMoved, kCGMouseButtonLeft, location, 0);
         }
         break;
       case LI_TOUCH_EVENT_MOVE: {
@@ -1427,6 +1532,7 @@ const KeyCodeMap kKeyCodesMap[] = {
         } else if (touch_points.size() == 1 && std::hypot(location.x - point->second.start.x, location.y - point->second.start.y) > TOUCH_SLOP) {
           if (std::chrono::steady_clock::now() - point->second.down_time >= LONG_PRESS) {
             // Held still, then moved: press at the start of the touch and drag from there.
+            saved_drag_cursor = current_cursor_point();
             post_mouse_event(kCGEventLeftMouseDown, kCGMouseButtonLeft, point->second.start, 1);
             touch_dragging = true;
             post_mouse_event(kCGEventLeftMouseDragged, kCGMouseButtonLeft, location, 1);
@@ -1459,6 +1565,7 @@ const KeyCodeMap kKeyCodesMap[] = {
         touch_points.erase(point);
         if (touch_dragging) {
           post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, location, 1);
+          restore_cursor_point(saved_drag_cursor);
           touch_dragging = false;
         } else if (single) {
           // A finger held still and lifted is a right-click, like a long press on an iPad.
