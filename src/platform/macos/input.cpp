@@ -75,14 +75,17 @@ namespace platf {
     double scroll_accum_y {};
     double scroll_vx {};  ///< Pixels/sec horizontal velocity
     double scroll_vy {};  ///< Pixels/sec vertical velocity
-    double scroll_mom_rem_x {};
-    double scroll_mom_rem_y {};
+    double scroll_mom_duration {};
+    double scroll_mom_total_x {};
+    double scroll_mom_total_y {};
+    double scroll_mom_emitted_x {};
+    double scroll_mom_emitted_y {};
     CGPoint scroll_momentum_anchor {};
     bool scroll_has_momentum_anchor {};
     std::chrono::steady_clock::time_point scroll_last_event {};
     std::chrono::steady_clock::time_point scroll_last_x_event {};
     std::chrono::steady_clock::time_point scroll_last_y_event {};
-    std::chrono::steady_clock::time_point scroll_last_mom_tick {};
+    std::chrono::steady_clock::time_point scroll_mom_start_time {};
   };
 
   void cancel_scroll_momentum(macos_input_t *macos_input);
@@ -659,14 +662,39 @@ const KeyCodeMap kKeyCodesMap[] = {
         macos_input->scroll_has_momentum_anchor = false;
         macos_input->scroll_vx = 0;
         macos_input->scroll_vy = 0;
-        macos_input->scroll_mom_rem_x = 0;
-        macos_input->scroll_mom_rem_y = 0;
+        macos_input->scroll_mom_duration = 0;
+        macos_input->scroll_mom_total_x = 0;
+        macos_input->scroll_mom_total_y = 0;
+        macos_input->scroll_mom_emitted_x = 0;
+        macos_input->scroll_mom_emitted_y = 0;
         emit_end = !macos_input->scroll_momentum_first_tick;
       }
     }
     if (emit_end) {
       post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
     }
+  }
+
+  // Matches AppKit's _NSScrollingMomentumCalculator (MacBook Force Touch trackpad physics):
+  // duration T = 0.063 * cbrt(|v0|), total distance D = v0 * T / 4, position(t) = D * (1 - (1 - t/T)^4).
+  bool start_macbook_momentum_locked(macos_input_t *macos_input, const std::chrono::steady_clock::time_point now) {
+    const double speed = std::hypot(macos_input->scroll_vx, macos_input->scroll_vy);
+    if (speed < 80.0) {
+      macos_input->scroll_vx = 0;
+      macos_input->scroll_vy = 0;
+      return false;
+    }
+    const double duration = 0.063 * std::cbrt(speed);
+    macos_input->scroll_in_momentum = true;
+    macos_input->scroll_momentum_first_tick = true;
+    macos_input->scroll_has_momentum_anchor = false;
+    macos_input->scroll_mom_duration = duration;
+    macos_input->scroll_mom_total_x = macos_input->scroll_vx * duration * 0.25;
+    macos_input->scroll_mom_total_y = macos_input->scroll_vy * duration * 0.25;
+    macos_input->scroll_mom_emitted_x = 0.0;
+    macos_input->scroll_mom_emitted_y = 0.0;
+    macos_input->scroll_mom_start_time = now;
+    return true;
   }
 
   void update_axis_velocity(
@@ -680,21 +708,21 @@ const KeyCodeMap kKeyCodesMap[] = {
       return;
     }
     if (first_in_gesture || last_axis_time.time_since_epoch().count() == 0) {
-      vel = std::clamp(delta_px / 0.014 * 0.5, -6000.0, 6000.0);
+      vel = std::clamp(delta_px / 0.012 * 0.65, -8000.0, 8000.0);
       last_axis_time = now;
       return;
     }
     const double dt = std::chrono::duration<double>(now - last_axis_time).count();
     last_axis_time = now;
     if (dt > 0.065) {
-      vel = std::clamp(delta_px / 0.016 * 0.35, -6000.0, 6000.0);
+      vel = std::clamp(delta_px / 0.016 * 0.40, -8000.0, 8000.0);
       return;
     }
-    const double inst_v = std::clamp(delta_px / std::max(dt, 0.005), -6000.0, 6000.0);
+    const double inst_v = std::clamp(delta_px / std::max(dt, 0.005), -8000.0, 8000.0);
     if (vel * inst_v < 0.0) {
       vel = inst_v;
     } else {
-      vel = 0.60 * inst_v + 0.40 * vel;
+      vel = 0.70 * inst_v + 0.30 * vel;
     }
   }
 
@@ -779,13 +807,7 @@ const KeyCodeMap kKeyCodesMap[] = {
         macos_input->scroll_vx = 0;
       }
 
-      if (emit_gesture_end && std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) >= 110.0) {
-        macos_input->scroll_in_momentum = true;
-        macos_input->scroll_momentum_first_tick = true;
-        macos_input->scroll_has_momentum_anchor = false;
-        macos_input->scroll_mom_rem_x = 0;
-        macos_input->scroll_mom_rem_y = 0;
-        macos_input->scroll_last_mom_tick = now;
+      if (emit_gesture_end && start_macbook_momentum_locked(macos_input, now)) {
         macos_input->scroll_cv.notify_one();
       } else {
         macos_input->scroll_vx = 0;
@@ -798,7 +820,7 @@ const KeyCodeMap kKeyCodesMap[] = {
   }
 
   void run_scroll_momentum_worker(macos_input_t *macos_input) {
-    constexpr auto gesture_idle_timeout = 38ms;
+    constexpr auto gesture_idle_timeout = 26ms;
     constexpr auto momentum_tick_interval = 8333us;  // 120Hz
 
     for (;;) {
@@ -830,22 +852,15 @@ const KeyCodeMap kKeyCodesMap[] = {
               do_gesture_end = macos_input->scroll_began_posted;
 
               if (macos_input->scroll_last_y_event.time_since_epoch().count() == 0 ||
-                  now - macos_input->scroll_last_y_event > 75ms) {
+                  now - macos_input->scroll_last_y_event > 65ms) {
                 macos_input->scroll_vy = 0;
               }
               if (macos_input->scroll_last_x_event.time_since_epoch().count() == 0 ||
-                  now - macos_input->scroll_last_x_event > 75ms) {
+                  now - macos_input->scroll_last_x_event > 65ms) {
                 macos_input->scroll_vx = 0;
               }
 
-              if (do_gesture_end && std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) >= 110.0) {
-                macos_input->scroll_in_momentum = true;
-                macos_input->scroll_momentum_first_tick = true;
-                macos_input->scroll_has_momentum_anchor = false;
-                macos_input->scroll_mom_rem_x = 0;
-                macos_input->scroll_mom_rem_y = 0;
-                macos_input->scroll_last_mom_tick = now;
-              } else {
+              if (!do_gesture_end || !start_macbook_momentum_locked(macos_input, now)) {
                 macos_input->scroll_vx = 0;
                 macos_input->scroll_vy = 0;
               }
@@ -858,32 +873,32 @@ const KeyCodeMap kKeyCodesMap[] = {
           }
           if (macos_input->scroll_in_momentum) {
             const auto now = std::chrono::steady_clock::now();
-            const double dt = std::clamp(std::chrono::duration<double>(now - macos_input->scroll_last_mom_tick).count(), 0.004, 0.050);
-            macos_input->scroll_last_mom_tick = now;
+            const double elapsed = std::chrono::duration<double>(now - macos_input->scroll_mom_start_time).count();
+            const double duration = std::max(0.001, macos_input->scroll_mom_duration);
+            const double t_norm = std::clamp(elapsed / duration, 0.0, 1.0);
+            const double u = 1.0 - t_norm;
+            // Exact quartic curve of AppKit's _NSScrollingMomentumCalculator: 1 - (1 - t/T)^4
+            const double progress = 1.0 - (u * u * u * u);
 
-            // Apple UIScrollViewDecelerationRateNormal (0.998/ms = exp(-2.0 * dt))
-            const double decay = std::exp(-2.0 * dt);
-            macos_input->scroll_vx *= decay;
-            macos_input->scroll_vy *= decay;
+            const double target_x = macos_input->scroll_mom_total_x * progress;
+            const double target_y = macos_input->scroll_mom_total_y * progress;
+            step_x = static_cast<int>(std::lround(target_x - macos_input->scroll_mom_emitted_x));
+            step_y = static_cast<int>(std::lround(target_y - macos_input->scroll_mom_emitted_y));
+            macos_input->scroll_mom_emitted_x += step_x;
+            macos_input->scroll_mom_emitted_y += step_y;
 
-            if (std::hypot(macos_input->scroll_vx, macos_input->scroll_vy) < 18.0) {
+            if (step_x != 0 || step_y != 0) {
+              mom_phase = macos_input->scroll_momentum_first_tick ? kCGMomentumScrollPhaseBegin : kCGMomentumScrollPhaseContinue;
+              macos_input->scroll_momentum_first_tick = false;
+              do_mom_tick = true;
+            }
+
+            if (t_norm >= 1.0) {
               macos_input->scroll_in_momentum = false;
               macos_input->scroll_has_momentum_anchor = false;
               macos_input->scroll_vx = 0;
               macos_input->scroll_vy = 0;
               do_mom_end = !macos_input->scroll_momentum_first_tick;
-            } else {
-              macos_input->scroll_mom_rem_x += macos_input->scroll_vx * dt;
-              macos_input->scroll_mom_rem_y += macos_input->scroll_vy * dt;
-              step_x = static_cast<int>(std::trunc(macos_input->scroll_mom_rem_x));
-              step_y = static_cast<int>(std::trunc(macos_input->scroll_mom_rem_y));
-              macos_input->scroll_mom_rem_x -= step_x;
-              macos_input->scroll_mom_rem_y -= step_y;
-              if (step_x != 0 || step_y != 0) {
-                mom_phase = macos_input->scroll_momentum_first_tick ? kCGMomentumScrollPhaseBegin : kCGMomentumScrollPhaseContinue;
-                macos_input->scroll_momentum_first_tick = false;
-                do_mom_tick = true;
-              }
             }
           }
         }
@@ -899,6 +914,15 @@ const KeyCodeMap kKeyCodesMap[] = {
         post_scroll_event_raw(macos_input, 0, 0, 0, kCGMomentumScrollPhaseEnd);
       }
     }
+  }
+
+  // macOS flips continuous HID scroll events when com.apple.swipescrolldirection is false (0),
+  // whereas iPadOS Magic Keyboard already sends Natural-Scrolling deltas. Compensate so the
+  // remote Magic Keyboard always matches native iPadOS / MacBook Natural Scrolling direction.
+  bool macos_natural_scrolling_enabled() {
+    Boolean exists = false;
+    const Boolean natural = CFPreferencesGetAppBooleanValue(CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication, &exists);
+    return exists ? (natural != 0) : true;
   }
 
   void post_scroll(macos_input_t *macos_input, const int wheelY, const int wheelX) {
@@ -918,7 +942,8 @@ const KeyCodeMap kKeyCodesMap[] = {
       treat_as_continuous = macos_input->scroll_in_gesture;
     }
     if (treat_as_continuous) {
-      continuous_scroll_delta(macos_input, exact_px, 0.0);
+      const double sign = macos_natural_scrolling_enabled() ? 1.0 : -1.0;
+      continuous_scroll_delta(macos_input, exact_px * sign, 0.0);
     } else {
       cancel_scroll_momentum(macos_input);
       post_scroll(macos_input, static_cast<int>(std::lround(exact_px)), 0);
@@ -934,7 +959,9 @@ const KeyCodeMap kKeyCodesMap[] = {
       treat_as_continuous = macos_input->scroll_in_gesture;
     }
     if (treat_as_continuous) {
-      continuous_scroll_delta(macos_input, 0.0, exact_px);
+      // VoidLink already negates horizontal continuous scroll (-translationDeltaX) relative to vertical.
+      const double sign = macos_natural_scrolling_enabled() ? -1.0 : 1.0;
+      continuous_scroll_delta(macos_input, 0.0, exact_px * sign);
     } else {
       cancel_scroll_momentum(macos_input);
       post_scroll(macos_input, 0, static_cast<int>(std::lround(exact_px)));
@@ -1142,8 +1169,9 @@ const KeyCodeMap kKeyCodesMap[] = {
 
     // Scrolls by the accumulated touch delta and feeds the continuous momentum tracker.
     void scroll_by_remainder() {
-      const double dx = scroll_remainder_x;
-      const double dy = scroll_remainder_y;
+      const double sign = macos_natural_scrolling_enabled() ? 1.0 : -1.0;
+      const double dx = scroll_remainder_x * sign;
+      const double dy = scroll_remainder_y * sign;
       scroll_remainder_x = 0;
       scroll_remainder_y = 0;
       continuous_scroll_delta(macos_input, dy, dx);
