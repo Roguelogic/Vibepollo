@@ -528,6 +528,10 @@ namespace confighttp {
           continue;
         }
 
+        if (key == "macos_scroll_inertia") {
+          continue;
+        }
+
         if (key == "session_history_enabled") {
           return false;
         }

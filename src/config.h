@@ -355,6 +355,7 @@ namespace config {
 
     bool high_resolution_scrolling;
     bool native_pen_touch;
+    std::string macos_scroll_inertia;
 
     bool enable_input_only_mode;
     bool forward_rumble;

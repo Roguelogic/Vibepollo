@@ -72,6 +72,7 @@ export const clientOverrideableKeys = new Set([
   'mouse',
   'high_resolution_scrolling',
   'native_pen_touch',
+  'macos_scroll_inertia',
   'keybindings',
   'ds5_inputtino_randomize_mac',
   'proton_dualsense_compatibility',
@@ -906,7 +907,16 @@ export const settingsCategories: SettingsCategory[] = [
           boolean('ds4_back_as_touchpad_click', { platform: ['windows', 'linux'] }),
           boolean('always_send_scancodes', { platform: 'windows' }),
           boolean('high_resolution_scrolling'),
-          boolean('native_pen_touch', { platform: 'windows' }),
+          select(
+            'macos_scroll_inertia',
+            [
+              option('macos', 'config.macos_scroll_inertia_macos'),
+              option('ipados', 'config.macos_scroll_inertia_ipados'),
+              option('disabled', 'config.macos_scroll_inertia_disabled'),
+            ],
+            { platform: 'macos' },
+          ),
+          boolean('native_pen_touch', { platform: ['windows', 'macos'] }),
         ],
       },
       {
@@ -1232,6 +1242,7 @@ export const settingsDefaults: Record<string, unknown> = {
   ds4_back_as_touchpad_click: true,
   always_send_scancodes: true,
   high_resolution_scrolling: true,
+  macos_scroll_inertia: 'macos',
   native_pen_touch: true,
   key_repeat_delay: 500,
   key_repeat_frequency: 24.9,
