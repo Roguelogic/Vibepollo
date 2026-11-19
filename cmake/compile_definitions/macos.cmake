@@ -80,6 +80,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.mm"
         "${CMAKE_SOURCE_DIR}/third-party/TPCircularBuffer/TPCircularBuffer.c"
         "${CMAKE_SOURCE_DIR}/third-party/TPCircularBuffer/TPCircularBuffer.h"
         ${APPLE_PLIST_FILE})

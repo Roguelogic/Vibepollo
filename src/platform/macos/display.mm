@@ -27,6 +27,7 @@
 #include "src/platform/macos/nv12_zero_device.h"
 #include "src/platform/macos/sc_video.h"
 #include "src/platform/macos/virtual_display.h"
+#include "src/platform/macos/vt_encoder.h"
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 #define AVMediaType AVMediaType_FFmpeg
@@ -305,6 +306,19 @@ namespace platf {
       }
     }
 
+    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
+      auto *capture = av_capture;
+      return vt::make_encode_device(
+        pix_fmt,
+        [capture](int width, int height) {
+          [capture setFrameWidth:width frameHeight:height];
+        },
+        [capture](int pixel_format) {
+          capture.pixelFormat = pixel_format;
+        }
+      );
+    }
+
     int dummy_img(img_t *img) override {
       if (!platf::is_screen_capture_allowed()) {
         // If we don't have the screen capture permission, this function will hang
@@ -450,6 +464,18 @@ namespace platf {
       }
       BOOST_LOG(error) << "Unsupported Pixel Format."sv;
       return nullptr;
+    }
+
+    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
+      return vt::make_encode_device(
+        pix_fmt,
+        [this](int frame_width, int frame_height) {
+          this->set_format(this->pixel_format, frame_width, frame_height);
+        },
+        [this](int format) {
+          this->set_format(static_cast<OSType>(format), this->width, this->height);
+        }
+      );
     }
 
   private:

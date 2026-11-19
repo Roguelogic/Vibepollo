@@ -703,6 +703,17 @@ namespace platf {
     nvenc::nvenc_base *nvenc = nullptr;
   };
 
+  struct vt_encoded_frame {
+    std::vector<uint8_t> data;
+    uint64_t frame_index = 0;
+    bool idr = false;
+  };
+
+  struct vt_encode_device_t: encode_device_t {
+    virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
+    virtual vt_encoded_frame encode_frame(uint64_t frame_index, bool force_idr) = 0;
+  };
+
   struct amf_encode_device_t: encode_device_t {
     // Set only by the AMF runtime/component boundary; D3D/capture preparation
     // failures must never authorize an implementation fallback.
@@ -843,6 +854,10 @@ namespace platf {
     }
 
     virtual std::unique_ptr<amf_encode_device_t> make_amf_encode_device(pix_fmt_e pix_fmt) {
+      return nullptr;
+    }
+
+    virtual std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) {
       return nullptr;
     }
 

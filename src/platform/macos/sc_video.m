@@ -10,31 +10,39 @@
 
 /**
  * @brief One capture: a stream feeding a frame callback until the callback returns false.
- * @details ScreenCaptureKit only sends an image when the screen changes, and can go silent on a
- *          static desktop. New images are delivered as soon as they arrive, for the lowest
- *          latency; if nothing new arrives within the keepalive interval, the last one is re-sent.
- *          That matches the async encode path's minimum frame rate: the encoder only runs on
- *          delivered frames, and keyframe requests need a frame to encode. Repeating on a fixed
- *          clock instead would queue new images behind repeats in a busy hardware encoder.
- *          Frames, keepalive ticks, and finishing all run on one serial queue.
+ * @details ScreenCaptureKit delivers frames on sampleQueue, which stores the latest frame and
+ *          merges a dispatch source on deliveryQueue without blocking SCStream's surface pool.
  */
 @interface SCVideoCapture: NSObject <SCStreamOutput, SCStreamDelegate>
 @property (nonatomic, weak) SCVideo *owner;
 @property (nonatomic, strong) SCStream *stream;
 @property (nonatomic, copy) FrameCallbackBlock callback;
 @property (nonatomic, strong) dispatch_semaphore_t signal;
+@property (nonatomic, strong) dispatch_queue_t sampleQueue;
 @property (nonatomic, strong) dispatch_queue_t queue;
+- (void)setupFrameSource;
 - (void)startKeepaliveEvery:(CMTime)interval;
 - (void)finish;
 - (void)stopWithError:(NSError *)error;
 @end
 
 @implementation SCVideoCapture {
-  CMSampleBufferRef _lastFrame;  ///< Last buffer with an image, re-sent when nothing new arrives.
+  CMSampleBufferRef _latestFrame;
+  CMSampleBufferRef _keepaliveFrame;
+  dispatch_source_t _frameSource;
   dispatch_source_t _keepalive;
   uint64_t _keepalivePeriod;
   uint64_t _lastDelivery;
   BOOL _finished;
+}
+
+- (void)setupFrameSource {
+  _frameSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, self.queue);
+  __weak SCVideoCapture *weakSelf = self;
+  dispatch_source_set_event_handler(_frameSource, ^{
+    [weakSelf drainLatestFrame];
+  });
+  dispatch_resume(_frameSource);
 }
 
 - (void)startKeepaliveEvery:(CMTime)interval {
@@ -49,30 +57,60 @@
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-  // Idle and blank status updates carry no image; the keepalive covers those stretches.
-  if (type != SCStreamOutputTypeScreen || CMSampleBufferGetImageBuffer(sampleBuffer) == NULL) {
+  if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sampleBuffer) || CMSampleBufferGetImageBuffer(sampleBuffer) == NULL) {
     return;
   }
-  if (_lastFrame != NULL) {
-    CFRelease(_lastFrame);
+  @synchronized(self) {
+    if (_finished) {
+      return;
+    }
+    if (_latestFrame != NULL) {
+      CFRelease(_latestFrame);
+    }
+    _latestFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
+    if (_keepaliveFrame != NULL) {
+      CFRelease(_keepaliveFrame);
+    }
+    _keepaliveFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
   }
-  _lastFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
-  [self deliverLastFrame];
+  if (_frameSource != nil) {
+    dispatch_source_merge_data(_frameSource, 1);
+  }
+}
+
+- (void)drainLatestFrame {
+  CMSampleBufferRef frame = NULL;
+  @synchronized(self) {
+    if (_finished || _latestFrame == NULL) {
+      return;
+    }
+    frame = _latestFrame;
+    _latestFrame = NULL;
+  }
+  _lastDelivery = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  BOOL ok = self.callback(frame);
+  CFRelease(frame);
+  if (!ok) {
+    [self finishOnQueue];
+  }
 }
 
 - (void)keepaliveTick {
   const uint64_t idle = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - _lastDelivery;
-  if (idle >= _keepalivePeriod * 9 / 10) {
-    [self deliverLastFrame];
-  }
-}
-
-- (void)deliverLastFrame {
-  if (_finished || _lastFrame == NULL) {
+  if (idle < _keepalivePeriod * 9 / 10) {
     return;
   }
+  CMSampleBufferRef frame = NULL;
+  @synchronized(self) {
+    if (_finished || _keepaliveFrame == NULL) {
+      return;
+    }
+    frame = (CMSampleBufferRef) CFRetain(_keepaliveFrame);
+  }
   _lastDelivery = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  if (!self.callback(_lastFrame)) {
+  BOOL ok = self.callback(frame);
+  CFRelease(frame);
+  if (!ok) {
     [self finishOnQueue];
   }
 }
@@ -93,10 +131,23 @@
 }
 
 - (void)finishOnQueue {
-  if (_finished) {
-    return;
+  @synchronized(self) {
+    if (_finished) {
+      return;
+    }
+    _finished = YES;
+    if (_latestFrame != NULL) {
+      CFRelease(_latestFrame);
+      _latestFrame = NULL;
+    }
+    if (_keepaliveFrame != NULL) {
+      CFRelease(_keepaliveFrame);
+      _keepaliveFrame = NULL;
+    }
   }
-  _finished = YES;
+  if (_frameSource != nil) {
+    dispatch_source_cancel(_frameSource);
+  }
   if (_keepalive != nil) {
     dispatch_source_cancel(_keepalive);
   }
@@ -105,11 +156,17 @@
 }
 
 - (void)dealloc {
+  if (_frameSource != nil) {
+    dispatch_source_cancel(_frameSource);
+  }
   if (_keepalive != nil) {
     dispatch_source_cancel(_keepalive);
   }
-  if (_lastFrame != NULL) {
-    CFRelease(_lastFrame);
+  if (_latestFrame != NULL) {
+    CFRelease(_latestFrame);
+  }
+  if (_keepaliveFrame != NULL) {
+    CFRelease(_keepaliveFrame);
   }
 }
 
@@ -135,7 +192,9 @@
   self.pixelFormat = kCVPixelFormatType_32BGRA;
   self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
   self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
-  self.minFrameDuration = CMTimeMake(1, frameRate);
+  // Slightly below 1/fps so WindowServer's 120Hz delivery clock doesn't beat and drop frames.
+  const int fps = MAX(frameRate, 1);
+  self.minFrameDuration = CMTimeMake(9, fps * 10);
   CGDisplayModeRelease(mode);
 
   dispatch_semaphore_t found = dispatch_semaphore_create(0);
@@ -162,10 +221,9 @@
   configuration.width = self.frameWidth;
   configuration.height = self.frameHeight;
   configuration.pixelFormat = self.pixelFormat;
+  configuration.captureResolution = SCCaptureResolutionBest;
+  configuration.preservesAspectRatio = YES;
   if (self.hdr && self.pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
-    // The stream's HDR color space, so the frames go to the encoder as they are. captureDynamicRange
-    // is new in macOS 15; set it by name so builds with an older SDK, such as the Apple Silicon CI's
-    // Xcode 15, still capture HDR. 1 is SCCaptureDynamicRangeHDRLocalDisplay.
     if ([configuration respondsToSelector:NSSelectorFromString(@"setCaptureDynamicRange:")]) {
       [configuration setValue:@1 forKey:@"captureDynamicRange"];
     }
@@ -174,21 +232,22 @@
   }
   configuration.minimumFrameInterval = self.minFrameDuration;
   configuration.showsCursor = YES;
-  // The pipeline holds a few frames and the last one is kept for the keepalive, so leave room.
   configuration.queueDepth = 8;
 
   SCVideoCapture *capture = [[SCVideoCapture alloc] init];
   capture.owner = self;
   capture.callback = frameCallback;
   capture.signal = dispatch_semaphore_create(0);
-  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
-  capture.queue = dispatch_queue_create("videoCaptureQueue", qos);
+  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+  capture.sampleQueue = dispatch_queue_create("videoSampleQueue", qos);
+  capture.queue = dispatch_queue_create("videoDeliveryQueue", qos);
+  [capture setupFrameSource];
 
   SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:_display excludingWindows:@[]];
   capture.stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:capture];
 
   NSError *error = nil;
-  if (![capture.stream addStreamOutput:capture type:SCStreamOutputTypeScreen sampleHandlerQueue:capture.queue error:&error]) {
+  if (![capture.stream addStreamOutput:capture type:SCStreamOutputTypeScreen sampleHandlerQueue:capture.sampleQueue error:&error]) {
     return nil;
   }
   [capture.stream startCaptureWithCompletionHandler:^(NSError *startError) {

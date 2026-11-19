@@ -1390,6 +1390,46 @@ namespace video {
     bool output_identity_failed = false;
   };
 
+  class vt_encode_session_t: public encode_session_t {
+  public:
+    vt_encode_session_t(std::unique_ptr<platf::vt_encode_device_t> encode_device):
+        device(std::move(encode_device)) {
+    }
+
+    int convert(platf::img_t &img) override {
+      if (!device) {
+        return -1;
+      }
+      return device->convert(img);
+    }
+
+    void request_idr_frame() override {
+      force_idr = true;
+    }
+
+    void request_normal_frame() override {
+      force_idr = false;
+    }
+
+    bool invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
+      force_idr = true;
+      return false;
+    }
+
+    platf::vt_encoded_frame encode_frame(uint64_t frame_index) {
+      if (!device) {
+        return {};
+      }
+      auto result = device->encode_frame(frame_index, force_idr);
+      force_idr = false;
+      return result;
+    }
+
+  private:
+    std::unique_ptr<platf::vt_encode_device_t> device;
+    bool force_idr = false;
+  };
+
   class amf_encode_session_t: public encode_session_t {
   public:
     amf_encode_session_t(std::unique_ptr<platf::amf_encode_device_t> encode_device):
@@ -2599,70 +2639,39 @@ namespace video {
 #ifdef __APPLE__
   encoder_t videotoolbox {
     "videotoolbox"sv,
-    std::make_unique<encoder_platform_formats_avcodec>(
-      AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-      AV_HWDEVICE_TYPE_NONE,
-      AV_PIX_FMT_VIDEOTOOLBOX,
-      AV_PIX_FMT_NV12,
-      AV_PIX_FMT_P010,
-      AV_PIX_FMT_NONE,
-      AV_PIX_FMT_NONE,
-      vt_init_avcodec_hardware_input_buffer
+    std::make_unique<encoder_platform_formats_vt>(
+      platf::mem_type_e::videotoolbox,
+      platf::pix_fmt_e::nv12,
+      platf::pix_fmt_e::p010,
+      platf::pix_fmt_e::unknown,
+      platf::pix_fmt_e::unknown
     ),
     {
-      // Common options
-      {
-        {"allow_sw"s, &config::video.vt.vt_allow_sw},
-        {"require_sw"s, &config::video.vt.vt_require_sw},
-        {"realtime"s, &config::video.vt.vt_realtime},
-        {"prio_speed"s, 1},
-        {"max_ref_frames"s, 1},
-      },
+      {},
       {},  // SDR-specific options
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
       {},  // Fallback options
-      "av1_videotoolbox"s,
+      "av1_vt"s,
     },
     {
-      // Common options
-      {
-        {"allow_sw"s, &config::video.vt.vt_allow_sw},
-        {"require_sw"s, &config::video.vt.vt_require_sw},
-        {"realtime"s, &config::video.vt.vt_realtime},
-        {"prio_speed"s, 1},
-        {"max_ref_frames"s, 1},
-      },
+      {},
       {},  // SDR-specific options
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
       {},  // Fallback options
-      "hevc_videotoolbox"s,
+      "hevc_vt"s,
     },
     {
-      // Common options
-      // Note: max_ref_frames is intentionally omitted for H.264 because
-      // VideoToolbox on Apple Silicon produces all-IDR output when
-      // ReferenceBufferCount=1 is set for H.264, causing massive bandwidth
-      // inflation (~3x) and frame drops. HEVC and AV1 are unaffected and
-      // retain max_ref_frames=1. See LizardByte/Sunshine#5013.
-      {
-        {"allow_sw"s, &config::video.vt.vt_allow_sw},
-        {"require_sw"s, &config::video.vt.vt_require_sw},
-        {"realtime"s, &config::video.vt.vt_realtime},
-        {"prio_speed"s, 1},
-      },
+      {},
       {},  // SDR-specific options
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
-      {
-        // Fallback options
-        {"flags"s, "-low_delay"},
-      },
-      "h264_videotoolbox"s,
+      {},  // Fallback options
+      "h264_vt"s,
     },
     PARALLEL_ENCODING
   };
@@ -3926,6 +3935,39 @@ namespace video {
     return 0;
   }
 
+  int encode_vt(
+    int64_t frame_nr,
+    vt_encode_session_t &session,
+    safe::mail_raw_t::queue_t<packet_t> &packets,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
+    std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
+  ) {
+    auto encoded_frame = session.encode_frame(frame_nr);
+    if (encoded_frame.data.empty()) {
+      BOOST_LOG(error) << "VideoToolbox returned empty packet";
+      return -1;
+    }
+
+    if (frame_nr != (int64_t) encoded_frame.frame_index) {
+      BOOST_LOG(error) << "VideoToolbox frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+    packet->host_processing_timestamp = host_processing_timestamp;
+    if (webrtc_stream::has_active_sessions()) {
+      webrtc_stream::submit_video_packet(*packet);
+    }
+    packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+
   void deliver_amf_frames(
     int64_t submitted_frame_nr,
     amf_encode_session_t &session,
@@ -4023,6 +4065,8 @@ namespace video {
       result = encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     } else if (auto amf_session = dynamic_cast<amf_encode_session_t *>(&session)) {
       result = encode_amf(frame_nr, *amf_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
+    } else if (auto vt_session = dynamic_cast<vt_encode_session_t *>(&session)) {
+      result = encode_vt(frame_nr, *vt_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     }
 
     encode_duration_logger.collect_and_log(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - encode_start).count());
@@ -4702,6 +4746,14 @@ namespace video {
     return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
   }
 
+  std::unique_ptr<vt_encode_session_t> make_vt_encode_session(const config_t &client_config, std::unique_ptr<platf::vt_encode_device_t> encode_device) {
+    if (!encode_device->init_encoder(client_config, encode_device->colorspace)) {
+      return nullptr;
+    }
+
+    return std::make_unique<vt_encode_session_t>(std::move(encode_device));
+  }
+
   using initialization_cancel_t = std::function<bool()>;
 
   bool acquire_amf_initialization_fence_until(
@@ -4920,6 +4972,9 @@ namespace video {
       if (operation_cancelled_out) *operation_cancelled_out = operation_cancelled;
       if (gate_contended_out) *gate_contended_out = gate_contended;
       return session;
+    } else if (dynamic_cast<platf::vt_encode_device_t *>(encode_device.get())) {
+      auto vt_encode_device = boost::dynamic_pointer_cast<platf::vt_encode_device_t>(std::move(encode_device));
+      return make_vt_encode_session(config, std::move(vt_encode_device));
     }
 
     return nullptr;
@@ -6069,6 +6124,8 @@ namespace video {
       result = disp.make_nvenc_encode_device(pix_fmt);
     } else if (dynamic_cast<const encoder_platform_formats_amf *>(encoder.platform_formats.get())) {
       result = disp.make_amf_encode_device(pix_fmt);
+    } else if (dynamic_cast<const encoder_platform_formats_vt *>(encoder.platform_formats.get())) {
+      result = disp.make_vt_encode_device(pix_fmt);
     }
 
     if (result) {
