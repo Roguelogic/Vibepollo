@@ -49,6 +49,7 @@ namespace platf {
     CGDirectDisplayID configured_display {};  ///< Chosen at startup from output_name.
     CGDirectDisplayID display {};  ///< Display input currently targets; see current_display().
     CGFloat displayScaling {};
+    CGFloat displayBoundsWidth {};
     CGEventSourceRef source {};
 
     // keyboard related stuff
@@ -57,6 +58,8 @@ namespace platf {
 
     // mouse related stuff
     CGEventRef mouse_event {};  // mouse event source
+    util::point_t last_cursor_loc {};
+    bool has_cursor_loc {};
     double scrollwheel_scaling {DEFAULT_SCROLLWHEEL_SCALING};
     int scroll_lines_per_detent {DEFAULT_SCROLL_LINES_PER_DETENT};
     bool mouse_down[3] {};  // mouse button status
@@ -109,8 +112,10 @@ namespace platf {
   // and goes with streams), so resolve it per event and refresh the scaling when it changes.
   CGDirectDisplayID current_display(macos_input_t *macos_input) {
     const CGDirectDisplayID display = macos_virtual_display::active_display_id().value_or(macos_input->configured_display);
-    if (display != macos_input->display) {
+    const CGFloat bounds_width = CGDisplayBounds(display).size.width;
+    if (display != macos_input->display || bounds_width != macos_input->displayBoundsWidth || macos_input->displayScaling <= 0) {
       macos_input->display = display;
+      macos_input->displayBoundsWidth = bounds_width;
       macos_input->displayScaling = display_scaling(display);
     }
     return display;
@@ -502,6 +507,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     // For why this is here, see:
     // https://stackoverflow.com/questions/15194409/simulated-mouseevent-not-working-properly-osx
     CGWarpMouseCursorPosition(location);
+    macos_input->last_cursor_loc = {location.x, location.y};
+    macos_input->has_cursor_loc = true;
   }
 
   inline CGEventType event_type_mouse(input_t &input) {
@@ -533,7 +540,9 @@ const KeyCodeMap kKeyCodesMap[] = {
   // Maps a point in the stream's touch port to a global screen point on the display it belongs to.
   CGPoint stream_location(macos_input_t *macos_input, const touch_port_t &touch_port, const float x, const float y) {
     const auto display = pointer_display(macos_input, touch_port);
-    const auto scaling = display_scaling(display);
+    const auto scaling = (display == macos_input->display && macos_input->displayScaling > 0) ?
+                           macos_input->displayScaling :
+                           display_scaling(display);
 
     // in order to get the correct mouse location for capturing display , we need to add the display bounds to the location
     const CGRect display_bounds = CGDisplayBounds(display);
@@ -548,8 +557,9 @@ const KeyCodeMap kKeyCodesMap[] = {
   ) {
     const auto macos_input = static_cast<macos_input_t *>(input.get());
     const auto location = stream_location(macos_input, touch_port, x, y);
+    const auto prev = macos_input->has_cursor_loc ? macos_input->last_cursor_loc : get_mouse_loc(input);
 
-    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), util::point_t {location.x, location.y}, get_mouse_loc(input), 0);
+    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), util::point_t {location.x, location.y}, prev, 0);
   }
 
   void button_mouse(input_t &input, const int button, const bool release) {
@@ -1165,6 +1175,8 @@ const KeyCodeMap kKeyCodesMap[] = {
       CGWarpMouseCursorPosition(location);
       last_location = location;
       have_location = true;
+      macos_input->last_cursor_loc = {location.x, location.y};
+      macos_input->has_cursor_loc = true;
     }
 
     void post_proximity(const bool enter) const {
@@ -1221,8 +1233,10 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     // Scrolls by the accumulated touch delta and feeds the continuous momentum tracker.
+    // Direct screen touch deltas are in screen coordinates (-y when dragging finger up), opposite
+    // to wheel coordinates, so flip only when macOS's own natural-scroll inverter is active.
     void scroll_by_remainder() {
-      const double sign = macos_natural_scrolling_enabled() ? 1.0 : -1.0;
+      const double sign = macos_natural_scrolling_enabled() ? -1.0 : 1.0;
       const double dx = scroll_remainder_x * sign;
       const double dy = scroll_remainder_y * sign;
       scroll_remainder_x = 0;
@@ -1562,10 +1576,17 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     macos_input->configured_display = macos_input->display;
+    macos_input->displayBoundsWidth = CGDisplayBounds(macos_input->display).size.width;
     macos_input->displayScaling = display_scaling(macos_input->display);
 
     macos_input->source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    if (macos_input->source) {
+      CGEventSourceSetLocalEventsSuppressionInterval(macos_input->source, 0.0);
+    }
     macos_input->keyboard_source = CGEventSourceCreate(kCGEventSourceStatePrivate);
+    if (macos_input->keyboard_source) {
+      CGEventSourceSetLocalEventsSuppressionInterval(macos_input->keyboard_source, 0.0);
+    }
     macos_input->scroll_lines_per_detent = get_scroll_lines_per_detent(macos_input->scrollwheel_scaling);
 
     macos_input->kb_flags = 0;
