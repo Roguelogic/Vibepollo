@@ -528,7 +528,7 @@ namespace confighttp {
           continue;
         }
 
-        if (key == "macos_scroll_inertia") {
+        if (key == "macos_scroll_inertia" || key == "macos_pencil_mode") {
           continue;
         }
 

@@ -8,6 +8,31 @@
 // local includes
 #import "sc_video.h"
 
+static NSHashTable<SCVideo *> *sActiveSCVideos = nil;
+static BOOL sGlobalShowsCursor = YES;
+
+@interface SCVideo ()
+- (void)reconfigureActiveCaptures;
+- (void)removeFinishedCapture:(id)capture;
+@end
+
+void macos_sc_set_cursor_visible(bool visible) {
+  @autoreleasepool {
+    const BOOL want = visible ? YES : NO;
+    NSArray<SCVideo *> *videos = nil;
+    @synchronized([SCVideo class]) {
+      if (sGlobalShowsCursor == want) {
+        return;
+      }
+      sGlobalShowsCursor = want;
+      videos = [sActiveSCVideos allObjects];
+    }
+    for (SCVideo *video in videos) {
+      [video reconfigureActiveCaptures];
+    }
+  }
+}
+
 /**
  * @brief One capture: a stream feeding a frame callback until the callback returns false.
  * @details ScreenCaptureKit delivers frames on sampleQueue, which stores the latest frame and
@@ -20,6 +45,7 @@
 @property (nonatomic, strong) dispatch_semaphore_t signal;
 @property (nonatomic, strong) dispatch_queue_t sampleQueue;
 @property (nonatomic, strong) dispatch_queue_t queue;
+@property (nonatomic, assign) BOOL directDelivery;
 - (void)setupFrameSource;
 - (void)startKeepaliveEvery:(CMTime)interval;
 - (void)finish;
@@ -58,6 +84,24 @@
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
   if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sampleBuffer) || CMSampleBufferGetImageBuffer(sampleBuffer) == NULL) {
+    return;
+  }
+  if (self.directDelivery) {
+    @synchronized(self) {
+      if (_finished) {
+        return;
+      }
+      if (_keepalive != nil) {
+        if (_keepaliveFrame != NULL) {
+          CFRelease(_keepaliveFrame);
+        }
+        _keepaliveFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
+      }
+    }
+    _lastDelivery = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!self.callback(sampleBuffer)) {
+      [self finishOnQueue];
+    }
     return;
   }
   @synchronized(self) {
@@ -152,6 +196,7 @@
     dispatch_source_cancel(_keepalive);
   }
   [self.stream stopCaptureWithCompletionHandler:nil];
+  [self.owner removeFinishedCapture:self];
   dispatch_semaphore_signal(self.signal);
 }
 
@@ -213,10 +258,23 @@
 
   _display = display;
   _captures = [NSMutableArray array];
+  @synchronized([SCVideo class]) {
+    if (sActiveSCVideos == nil) {
+      sActiveSCVideos = [NSHashTable weakObjectsHashTable];
+    }
+    [sActiveSCVideos addObject:self];
+    sGlobalShowsCursor = YES;
+  }
   return self;
 }
 
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
+- (void)removeFinishedCapture:(id)capture {
+  @synchronized(self) {
+    [_captures removeObjectIdenticalTo:capture];
+  }
+}
+
+- (SCStreamConfiguration *)makeStreamConfiguration {
   SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
   configuration.width = self.frameWidth;
   configuration.height = self.frameHeight;
@@ -231,17 +289,69 @@
     configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020;
   }
   configuration.minimumFrameInterval = self.minFrameDuration;
-  configuration.showsCursor = YES;
+  BOOL showCursor = YES;
+  @synchronized([SCVideo class]) {
+    showCursor = sGlobalShowsCursor;
+  }
+  configuration.showsCursor = showCursor;
+  if ([configuration respondsToSelector:NSSelectorFromString(@"setShouldBeOpaque:")]) {
+    [configuration setValue:@YES forKey:@"shouldBeOpaque"];
+  }
+  if ([configuration respondsToSelector:NSSelectorFromString(@"setIgnoreShadowsDisplay:")]) {
+    [configuration setValue:@YES forKey:@"ignoreShadowsDisplay"];
+  }
   configuration.queueDepth = 8;
+  return configuration;
+}
+
+- (void)reconfigureActiveCaptures {
+  NSArray<SCVideoCapture *> *active = nil;
+  @synchronized(self) {
+    if (_captures.count > 0) {
+      active = [_captures copy];
+    }
+  }
+  if (active.count == 0) {
+    return;
+  }
+  SCStreamConfiguration *configuration = [self makeStreamConfiguration];
+  for (SCVideoCapture *capture in active) {
+    [capture.stream updateConfiguration:configuration completionHandler:nil];
+  }
+}
+
+- (void)setPixelFormat:(OSType)pixelFormat {
+  if (self.pixelFormat == pixelFormat) {
+    return;
+  }
+  [super setPixelFormat:pixelFormat];
+  [self reconfigureActiveCaptures];
+}
+
+- (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight {
+  if (self.frameWidth == frameWidth && self.frameHeight == frameHeight) {
+    return;
+  }
+  [super setFrameWidth:frameWidth frameHeight:frameHeight];
+  [self reconfigureActiveCaptures];
+}
+
+- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
+  SCStreamConfiguration *configuration = [self makeStreamConfiguration];
 
   SCVideoCapture *capture = [[SCVideoCapture alloc] init];
   capture.owner = self;
   capture.callback = frameCallback;
   capture.signal = dispatch_semaphore_create(0);
+  capture.directDelivery = self.directDelivery;
   dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
   capture.sampleQueue = dispatch_queue_create("videoSampleQueue", qos);
-  capture.queue = dispatch_queue_create("videoDeliveryQueue", qos);
-  [capture setupFrameSource];
+  if (self.directDelivery) {
+    capture.queue = capture.sampleQueue;
+  } else {
+    capture.queue = dispatch_queue_create("videoDeliveryQueue", qos);
+    [capture setupFrameSource];
+  }
 
   SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:_display excludingWindows:@[]];
   capture.stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:capture];

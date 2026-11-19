@@ -142,12 +142,21 @@ namespace system_tray {
   static void tray_scroll_inertia_macos_cb(struct tray_menu *item);
   static void tray_scroll_inertia_ipados_cb(struct tray_menu *item);
   static void tray_scroll_inertia_disabled_cb(struct tray_menu *item);
+  static void tray_pencil_mode_scroll_cb(struct tray_menu *item);
+  static void tray_pencil_mode_draw_cb(struct tray_menu *item);
   static void sync_scroll_inertia_tray_checks();
+  static void sync_pencil_mode_tray_checks();
 
   static struct tray_menu scroll_inertia_submenu[] = {
     {.text = "MacBook Trackpad", .checked = 1, .checkbox = 1, .cb = tray_scroll_inertia_macos_cb},
     {.text = "iPad Momentum", .checked = 0, .checkbox = 1, .cb = tray_scroll_inertia_ipados_cb},
     {.text = "Disabled", .checked = 0, .checkbox = 1, .cb = tray_scroll_inertia_disabled_cb},
+    {.text = nullptr}
+  };
+
+  static struct tray_menu pencil_mode_submenu[] = {
+    {.text = "Scroll & Tap (iPad Style)", .checked = 1, .checkbox = 1, .cb = tray_pencil_mode_scroll_cb},
+    {.text = "Drawing Tablet (Pen Input)", .checked = 0, .checkbox = 1, .cb = tray_pencil_mode_draw_cb},
     {.text = nullptr}
   };
   #endif
@@ -178,6 +187,7 @@ namespace system_tray {
          }},
   #if defined(__APPLE__) || defined(__MACH__)
         {.text = "Scroll Inertia", .submenu = scroll_inertia_submenu},
+        {.text = "Apple Pencil", .submenu = pencil_mode_submenu},
         {.text = "Open at Login", .checkbox = 1, .cb = tray_open_at_login_cb},
   #endif
 
@@ -212,6 +222,7 @@ namespace system_tray {
       BOOST_LOG(warning) << "Couldn't persist macos_scroll_inertia to config file"sv;
     }
     sync_scroll_inertia_tray_checks();
+    sync_pencil_mode_tray_checks();
     tray_update(&tray);
     BOOST_LOG(info) << "macOS scroll inertia mode set to: "sv << mode;
   }
@@ -226,6 +237,39 @@ namespace system_tray {
 
   static void tray_scroll_inertia_disabled_cb(struct tray_menu *) {
     set_scroll_inertia_from_tray("disabled");
+  }
+
+  static void sync_pencil_mode_tray_checks() {
+    const auto &mode = config::input.macos_pencil_mode;
+    pencil_mode_submenu[0].checked = (mode != "draw") ? 1 : 0;
+    pencil_mode_submenu[1].checked = (mode == "draw") ? 1 : 0;
+  }
+
+  static void set_pencil_mode_from_tray(const char *mode) {
+    config::input.macos_pencil_mode = mode;
+    try {
+      auto cfg = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+      cfg["macos_pencil_mode"] = mode;
+      std::string out;
+      for (const auto &[k, v] : cfg) {
+        out += k + " = " + v + "\n";
+      }
+      file_handler::write_file(config::sunshine.config_file.c_str(), out);
+      config::apply_config_now();
+    } catch (...) {
+      BOOST_LOG(warning) << "Couldn't persist macos_pencil_mode to config file"sv;
+    }
+    sync_pencil_mode_tray_checks();
+    tray_update(&tray);
+    BOOST_LOG(info) << "macOS Apple Pencil mode set to: "sv << mode;
+  }
+
+  static void tray_pencil_mode_scroll_cb(struct tray_menu *) {
+    set_pencil_mode_from_tray("scroll");
+  }
+
+  static void tray_pencil_mode_draw_cb(struct tray_menu *) {
+    set_pencil_mode_from_tray("draw");
   }
 
   static void tray_open_at_login_cb(struct tray_menu *item) {
@@ -460,6 +504,7 @@ namespace system_tray {
       }
     }
     sync_scroll_inertia_tray_checks();
+    sync_pencil_mode_tray_checks();
 
     // AppKit only runs the menu bar on the main thread, which is where main() calls this from.
     // main() then runs the AppKit event loop there once startup is done.

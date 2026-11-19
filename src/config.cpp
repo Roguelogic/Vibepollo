@@ -1061,6 +1061,7 @@ namespace config {
     true,  // high resolution scrolling
     true,  // native pen/touch support
     "macos",  // macOS continuous scroll inertia mode ("macos", "ipados", "disabled")
+    "scroll",  // macOS Apple Pencil mode ("scroll", "draw")
     false,  // enable input only mode
     true,  // forward_rumble
   };
@@ -2286,6 +2287,7 @@ namespace config {
     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
     string_restricted_f(vars, "macos_scroll_inertia", input.macos_scroll_inertia, {"macos"sv, "ipados"sv, "disabled"sv});
+    string_restricted_f(vars, "macos_pencil_mode", input.macos_pencil_mode, {"scroll"sv, "draw"sv});
     bool_f(vars, "enable_input_only_mode", input.enable_input_only_mode);
 
     bool_f(vars, "system_tray", sunshine.system_tray);
@@ -2765,6 +2767,7 @@ namespace config {
         "high_resolution_scrolling",
         "native_pen_touch",
         "macos_scroll_inertia",
+        "macos_pencil_mode",
         "keybindings",
         "ds5_inputtino_randomize_mac",
         "proton_dualsense_compatibility",
