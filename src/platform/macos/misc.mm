@@ -15,10 +15,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <ifaddrs.h>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -89,6 +91,9 @@ namespace platf {
     static std::once_flag once;
     std::call_once(once, []() {
       [NSApplication sharedApplication];
+      // Never steal keyboard focus from SecurityAgent's password box on the LoginWindow screen
+      // or show a Dock icon when running as a background/tray host.
+      [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
       [NSApp finishLaunching];
     });
   }
@@ -143,25 +148,378 @@ namespace platf {
     }
   }  // namespace
 
+  namespace {
+    constexpr std::string_view loginscreen_label = PROJECT_FQDN ".loginscreen";
+    constexpr std::string_view loginscreen_plist_path = "/Library/LaunchAgents/" PROJECT_FQDN ".loginscreen.plist";
+    constexpr std::string_view loginwindow_runtime_root = "/Library/Application Support/Vibepollo/loginwindow-runtime";
+
+    bool detect_loginwindow_session() {
+      if (const char *forced = std::getenv("VIBEPOLLO_FORCE_LOGINWINDOW");
+          forced != nullptr && forced[0] == '1' && forced[1] == '\0') {
+        return true;
+      }
+      if (geteuid() != 0) {
+        return false;
+      }
+      bool is_prelogin = false;
+      if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
+        const auto login_done = static_cast<CFBooleanRef>(CFDictionaryGetValue(session, kCGSessionLoginDoneKey));
+        const auto username = static_cast<CFStringRef>(CFDictionaryGetValue(session, kCGSessionUserNameKey));
+        if (login_done == kCFBooleanFalse || username == nullptr) {
+          is_prelogin = true;
+        }
+        CFRelease(session);
+      } else if (const char *lw_env = std::getenv("VIBEPOLLO_LOGINWINDOW");
+                 lw_env != nullptr && lw_env[0] == '1') {
+        is_prelogin = true;
+      }
+      return is_prelogin;
+    }
+
+    bool copy_file_mode_0600(const fs::path &src, const fs::path &dst) {
+      std::error_code ec;
+      if (!fs::is_regular_file(src, ec) || ec) {
+        return false;
+      }
+      std::ifstream in(src, std::ios::binary);
+      if (!in) {
+        return false;
+      }
+      std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      fs::create_directories(dst.parent_path(), ec);
+      ::unlink(dst.c_str());
+      const int fd = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd < 0) {
+        return false;
+      }
+      std::size_t off = 0;
+      bool ok = true;
+      while (off < bytes.size()) {
+        const ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          ok = false;
+          break;
+        }
+        off += static_cast<std::size_t>(n);
+      }
+      ::fchmod(fd, 0600);
+      ::close(fd);
+      return ok;
+    }
+
+    std::string xml_escape(std::string_view s) {
+      std::string out;
+      out.reserve(s.size());
+      for (const char c : s) {
+        switch (c) {
+          case '&':
+            out += "&amp;";
+            break;
+          case '<':
+            out += "&lt;";
+            break;
+          case '>':
+            out += "&gt;";
+            break;
+          case '"':
+            out += "&quot;";
+            break;
+          case '\'':
+            out += "&apos;";
+            break;
+          default:
+            out.push_back(c);
+            break;
+        }
+      }
+      return out;
+    }
+  }  // namespace
+
+  bool is_loginwindow_session() {
+    static const bool cached = detect_loginwindow_session();
+    return cached;
+  }
+
+  void prepare_loginwindow_runtime() {
+    if (!is_loginwindow_session()) {
+      return;
+    }
+
+    const fs::path runtime_home {loginwindow_runtime_root};
+    const fs::path runtime_cfg = runtime_home / ".config" / "vibepollo";
+    std::error_code ec;
+    fs::create_directories(runtime_cfg / "credentials", ec);
+    ::chmod(runtime_home.parent_path().c_str(), 0755);
+    ::chmod(runtime_home.c_str(), 0700);
+    ::chmod((runtime_home / ".config").c_str(), 0700);
+    ::chmod(runtime_cfg.c_str(), 0700);
+    ::chmod((runtime_cfg / "credentials").c_str(), 0700);
+
+    const char *owner_cfg_env = std::getenv("VIBEPOLLO_OWNER_CONFIG_DIR");
+    if (owner_cfg_env != nullptr && owner_cfg_env[0] != '\0') {
+      const fs::path src_cfg {owner_cfg_env};
+      for (const char *fname : {"sunshine.conf", "sunshine_state.json", "vibeshine_state.json"}) {
+        copy_file_mode_0600(src_cfg / fname, runtime_cfg / fname);
+      }
+      const fs::path src_creds = src_cfg / "credentials";
+      if (fs::is_directory(src_creds, ec) && !ec) {
+        for (const auto &entry : fs::directory_iterator(src_creds, ec)) {
+          if (!ec && entry.is_regular_file()) {
+            copy_file_mode_0600(entry.path(), runtime_cfg / "credentials" / entry.path().filename());
+          }
+        }
+      }
+    }
+
+    // Lock pre-login apps.json strictly to Desktop only so no shell commands can be launched as root
+    // before authenticating through macOS SecurityAgent.
+    {
+      const fs::path apps_path = runtime_cfg / "apps.json";
+      constexpr std::string_view desktop_only_apps = R"({
+  "env": {},
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    }
+  ]
+}
+)";
+      ::unlink(apps_path.c_str());
+      const int fd = ::open(apps_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd >= 0) {
+        (void) ::write(fd, desktop_only_apps.data(), desktop_only_apps.size());
+        ::fchmod(fd, 0600);
+        ::close(fd);
+      }
+    }
+
+    ::setenv("HOME", runtime_home.c_str(), 1);
+    ::unsetenv("XDG_CONFIG_HOME");
+  }
+
   bool is_login_agent() {
     // launchd names the job it started in XPC_SERVICE_NAME. Restarting from the menu bar
     // re-executes in place, so it survives that too.
     const char *service = getenv("XPC_SERVICE_NAME");
-    return service != nullptr && std::string_view {service} == PROJECT_FQDN;
+    if (service == nullptr) {
+      return false;
+    }
+    const std::string_view sv {service};
+    return sv == PROJECT_FQDN || sv == loginscreen_label;
+  }
+
+  bool loginscreen_agent_enabled() {
+    std::error_code ec;
+    return fs::is_regular_file(fs::path {loginscreen_plist_path}, ec) && !ec;
   }
 
   bool opens_at_login() {
+    if (loginscreen_agent_enabled()) {
+      return true;
+    }
     if (@available(macOS 13.0, *)) {
       return login_agent().status == SMAppServiceStatusEnabled;
     }
     return false;
   }
 
+  int run_loginscreen_agent_helper(int argc, char *argv[]) {
+    if (argc >= 2 && std::string_view {argv[1]} == remove_loginscreen_agent_arg) {
+      if (geteuid() != 0) {
+        std::fprintf(stderr, "Vibepollo: removing the login-screen agent requires root.\n");
+        return 1;
+      }
+      ::unlink(std::string {loginscreen_plist_path}.c_str());
+      std::error_code ec;
+      fs::remove_all(fs::path {loginwindow_runtime_root}, ec);
+      return 0;
+    }
+
+    if (argc < 4 || std::string_view {argv[1]} != install_loginscreen_agent_arg) {
+      return 2;
+    }
+    if (geteuid() != 0) {
+      std::fprintf(stderr, "Vibepollo: installing the login-screen agent requires root.\n");
+      return 1;
+    }
+
+    const std::string owner_cfg_dir = argv[2];
+    const std::string executable_path = argv[3];
+    if (owner_cfg_dir.empty() || executable_path.empty() || executable_path.front() != '/') {
+      return 2;
+    }
+
+    const std::string plist_xml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+      "<plist version=\"1.0\">\n"
+      "<dict>\n"
+      "  <key>Label</key>\n"
+      "  <string>" + xml_escape(loginscreen_label) + "</string>\n"
+      "  <key>ProgramArguments</key>\n"
+      "  <array>\n"
+      "    <string>" + xml_escape(executable_path) + "</string>\n"
+      "  </array>\n"
+      "  <key>EnvironmentVariables</key>\n"
+      "  <dict>\n"
+      "    <key>VIBEPOLLO_LOGINWINDOW</key>\n"
+      "    <string>1</string>\n"
+      "    <key>VIBEPOLLO_OWNER_CONFIG_DIR</key>\n"
+      "    <string>" + xml_escape(owner_cfg_dir) + "</string>\n"
+      "  </dict>\n"
+      "  <key>LimitLoadToSessionType</key>\n"
+      "  <array>\n"
+      "    <string>Aqua</string>\n"
+      "    <string>LoginWindow</string>\n"
+      "  </array>\n"
+      "  <key>RunAtLoad</key>\n"
+      "  <true/>\n"
+      "  <key>KeepAlive</key>\n"
+      "  <dict>\n"
+      "    <key>SuccessfulExit</key>\n"
+      "    <false/>\n"
+      "  </dict>\n"
+      "  <key>ProcessType</key>\n"
+      "  <string>Interactive</string>\n"
+      "  <key>ThrottleInterval</key>\n"
+      "  <integer>2</integer>\n"
+      "</dict>\n"
+      "</plist>\n";
+
+    const fs::path dst {loginscreen_plist_path};
+    const fs::path tmp = dst.string() + ".tmp";
+    ::unlink(tmp.c_str());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+      return 1;
+    }
+    const ssize_t n = ::write(fd, plist_xml.data(), plist_xml.size());
+    ::fchmod(fd, 0644);
+    ::fchown(fd, 0, 0);
+    ::fsync(fd);
+    ::close(fd);
+    if (n != static_cast<ssize_t>(plist_xml.size())) {
+      ::unlink(tmp.c_str());
+      return 1;
+    }
+    std::error_code ec;
+    fs::rename(tmp, dst, ec);
+    if (ec) {
+      ::unlink(tmp.c_str());
+      return 1;
+    }
+    return 0;
+  }
+
+  bool set_loginscreen_agent_enabled(bool enabled) {
+    char executable[2048];
+    uint32_t exec_size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &exec_size) != 0) {
+      return loginscreen_agent_enabled();
+    }
+    std::error_code ec;
+    const std::string canon_exec = fs::weakly_canonical(fs::path {executable}, ec).string();
+    const std::string &exe = (!ec && !canon_exec.empty()) ? canon_exec : std::string {executable};
+    const std::string cfg_dir = appdata().string();
+
+    if (enabled) {
+      // Unregister duplicate per-user SMAppService agent if active so Aqua only runs one agent.
+      if (@available(macOS 13.0, *)) {
+        SMAppService *agent = login_agent();
+        if (agent.status == SMAppServiceStatusEnabled) {
+          NSError *err = nil;
+          (void) [agent unregisterAndReturnError:&err];
+        }
+      }
+    }
+
+    using AuthRef = struct AuthorizationOpaqueRef *;
+    struct AuthItem {
+      const char *name;
+      std::size_t valueLength;
+      void *value;
+      std::uint32_t flags;
+    };
+    struct AuthRights {
+      std::uint32_t count;
+      AuthItem *items;
+    };
+    using CreateFn = OSStatus (*)(const AuthRights *, const AuthRights *, std::uint32_t, AuthRef *);
+    using FreeFn = OSStatus (*)(AuthRef, std::uint32_t);
+    using ExecFn = OSStatus (*)(AuthRef, const char *, std::uint32_t, char *const *, FILE **);
+
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_LOCAL);
+    if (!sec) {
+      BOOST_LOG(warning) << "Unable to load Security.framework for administrator prompt"sv;
+      return loginscreen_agent_enabled();
+    }
+    const auto auth_create = reinterpret_cast<CreateFn>(dlsym(sec, "AuthorizationCreate"));
+    const auto auth_free = reinterpret_cast<FreeFn>(dlsym(sec, "AuthorizationFree"));
+    const auto auth_exec = reinterpret_cast<ExecFn>(dlsym(sec, "AuthorizationExecuteWithPrivileges"));
+    if (!auth_create || !auth_free || !auth_exec) {
+      dlclose(sec);
+      return loginscreen_agent_enabled();
+    }
+
+    AuthItem right {"system.privilege.admin", 0, nullptr, 0};
+    AuthRights rights {1, &right};
+    constexpr std::uint32_t kAuthFlags = (1u << 0) | (1u << 1) | (1u << 4);  // InteractionAllowed | ExtendRights | PreAuthorize
+    AuthRef auth = nullptr;
+    if (auth_create(&rights, nullptr, kAuthFlags, &auth) != errSecSuccess || !auth) {
+      dlclose(sec);
+      return loginscreen_agent_enabled();
+    }
+
+    std::string arg_install {install_loginscreen_agent_arg};
+    std::string arg_remove {remove_loginscreen_agent_arg};
+    std::vector<char *> helper_args;
+    if (enabled) {
+      helper_args = {
+        const_cast<char *>(arg_install.c_str()),
+        const_cast<char *>(cfg_dir.c_str()),
+        const_cast<char *>(exe.c_str()),
+        nullptr
+      };
+    } else {
+      helper_args = {
+        const_cast<char *>(arg_remove.c_str()),
+        nullptr
+      };
+    }
+
+    FILE *pipe_fp = nullptr;
+    const OSStatus exec_status = auth_exec(auth, exe.c_str(), 0, helper_args.data(), &pipe_fp);
+    if (pipe_fp) {
+      char buf[128];
+      while (std::fgets(buf, sizeof(buf), pipe_fp) != nullptr) {}
+      std::fclose(pipe_fp);
+    }
+    if (exec_status == errSecSuccess) {
+      int wait_status = 0;
+      (void) wait(&wait_status);
+    }
+    auth_free(auth, 0);
+    dlclose(sec);
+
+    return loginscreen_agent_enabled();
+  }
+
   bool set_opens_at_login(bool enabled) {
+    if (!enabled && loginscreen_agent_enabled()) {
+      (void) set_loginscreen_agent_enabled(false);
+    }
     if (@available(macOS 13.0, *)) {
       SMAppService *agent = login_agent();
       NSError *error = nil;
       if (enabled) {
+        if (loginscreen_agent_enabled()) {
+          return true;
+        }
         // launchd starts the agent right away, and it takes over from this copy.
         if (![agent registerAndReturnError:&error]) {
           BOOST_LOG(warning) << "Couldn't turn on Open at Login: "sv << error.localizedDescription.UTF8String;
@@ -176,14 +534,14 @@ namespace platf {
       }
 
       bool replace = is_login_agent();
-      if (![agent unregisterAndReturnError:&error]) {
+      if (agent.status == SMAppServiceStatusEnabled && ![agent unregisterAndReturnError:&error]) {
         BOOST_LOG(warning) << "Couldn't turn off Open at Login: "sv << error.localizedDescription.UTF8String;
         return false;
       }
       if (replace) {
         launch_replacement();
       }
-      return true;
+      return !opens_at_login();
     }
 
     BOOST_LOG(warning) << "Open at Login requires macOS 13 or later"sv;
@@ -224,11 +582,12 @@ namespace platf {
   }  // namespace
 
   bool defer_to_login_agent() {
-    if (is_login_agent() || !opens_at_login()) {
+    if (is_loginwindow_session() || is_login_agent() || !opens_at_login()) {
       return false;
     }
 
-    auto service = "gui/"s + std::to_string(getuid()) + "/" PROJECT_FQDN;
+    const std::string label = loginscreen_agent_enabled() ? std::string {loginscreen_label} : std::string {PROJECT_FQDN};
+    auto service = "gui/"s + std::to_string(getuid()) + "/" + label;
     if (!start_login_agent(service)) {
       // launchd only starts the agent for the build that registered it, so an update can leave it
       // unable to. Turning Open at Login off and on again registers it for this build.
@@ -416,6 +775,13 @@ namespace platf {
   }
 
   std::unique_ptr<deinit_t> init() {
+    if (is_loginwindow_session()) {
+      // Pre-login LoginWindow sessions have no interactive TCC approval dialogs; rely on the
+      // system-level TCC entries already granted to the signed app bundle.
+      screen_capture_allowed = true;
+      return std::make_unique<deinit_t>();
+    }
+
     // Remote mouse and keyboard input is posted as synthetic events, which macOS only delivers
     // for apps allowed under Privacy & Security > Accessibility. Streaming works without it.
     const bool can_post_events = CGPreflightPostEventAccess();

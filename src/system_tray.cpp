@@ -189,6 +189,18 @@ namespace system_tray {
         {.text = "Scroll Inertia", .submenu = scroll_inertia_submenu},
         {.text = "Apple Pencil", .submenu = pencil_mode_submenu},
         {.text = "Open at Login", .checkbox = 1, .cb = tray_open_at_login_cb},
+        {.text = "Allow on Login Screen", .checkbox = 1, .cb = [](struct tray_menu *item) {
+           const bool enable = !item->checked;
+           BOOST_LOG(info) << (enable ? "Enabling"sv : "Disabling"sv) << " LoginWindow agent from system tray"sv;
+           (void) platf::set_loginscreen_agent_enabled(enable);
+           item->checked = platf::loginscreen_agent_enabled();
+           for (auto *m = tray.menu; m->text != nullptr; ++m) {
+             if (m->cb == tray_open_at_login_cb) {
+               m->checked = platf::opens_at_login();
+             }
+           }
+           tray_update(&tray);
+         }},
   #endif
 
         {.text = "Restart", .cb = tray_restart_cb},
@@ -501,6 +513,8 @@ namespace system_tray {
     for (auto *item = tray.menu; item->text != nullptr; ++item) {
       if (item->cb == tray_open_at_login_cb) {
         item->checked = platf::opens_at_login();
+      } else if (std::string_view {item->text} == "Allow on Login Screen"sv) {
+        item->checked = platf::loginscreen_agent_enabled();
       }
     }
     sync_scroll_inertia_tray_checks();

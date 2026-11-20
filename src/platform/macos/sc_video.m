@@ -261,7 +261,8 @@ void macos_sc_set_cursor_visible(bool visible) {
     }
     dispatch_semaphore_signal(found);
   }];
-  if (dispatch_semaphore_wait(found, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0 || display == nil) {
+  const int64_t wait_ns = (geteuid() == 0) ? (1 * NSEC_PER_SEC) : (5 * NSEC_PER_SEC);
+  if (dispatch_semaphore_wait(found, dispatch_time(DISPATCH_TIME_NOW, wait_ns)) != 0 || display == nil) {
     return nil;
   }
 

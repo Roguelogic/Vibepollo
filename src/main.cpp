@@ -292,6 +292,9 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && argv[1] == platf::macos_virtual_display::restore_watchdog_arg) {
     return platf::macos_virtual_display::run_restore_watchdog(argc, argv);
   }
+  if (argc > 1 && (argv[1] == platf::install_loginscreen_agent_arg || argv[1] == platf::remove_loginscreen_agent_arg)) {
+    return platf::run_loginscreen_agent_helper(argc, argv);
+  }
 #endif
 #ifdef __linux__
   #ifdef SUNSHINE_BUILD_STEAMOS
@@ -395,12 +398,20 @@ int main(int argc, char *argv[]) {
       }
     }
   }
+  platf::prepare_loginwindow_runtime();
 #endif
 
   // parse config file
   if (config::parse(argc, argv)) {
     return 0;
   }
+#ifdef __APPLE__
+  if (platf::is_loginwindow_session()) {
+    config::sunshine.system_tray = false;
+    config::sunshine.session_history_enabled = false;
+    config::sunshine.update_check_interval_seconds = 0;
+  }
+#endif
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
   if (!log_deinit_guard) {
@@ -774,6 +785,15 @@ int main(int argc, char *argv[]) {
   on_signal(SIGTERM, [&shutdown_signal_requested, shutdown_event]() {
     shutdown_signal_requested.store(true, std::memory_order_relaxed);
     BOOST_LOG(info) << "Terminate handler called"sv;
+  #ifdef __APPLE__
+    if (platf::is_loginwindow_session()) {
+      // Release ports and virtual display immediately when macOS transitions LoginWindow -> Aqua
+      // after password entry so the incoming desktop agent binds without port contention.
+      platf::macos_virtual_display::end_launch_hold();
+      platf::macos_virtual_display::end_pause_hold();
+      std::_Exit(0);
+    }
+  #endif
 
     // Break out of the main loop
     shutdown_event->raise(true);

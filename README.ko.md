@@ -26,6 +26,10 @@ Apple Silicon 맥과 iPad / Moonlight 클라이언트 환경의 macOS 호스트 
 * **시스템 오디오**
   * 별도 가상 오디오 드라이버(BlackHole 등) 없이 CoreAudio 탭으로 시스템 오디오 직접 캡처
 
+* **재부팅 직후 로그인 화면 접속 (`LoginWindow`)**
+  * 상단 메뉴바의 **Allow on Login Screen** 옵션으로 `LoginWindow` 및 `Aqua` 세션을 함께 담당하는 LaunchAgent 등록 가능
+  * 참고: FileVault 디스크 암호화가 켜져 있으면 macOS 부팅 전 EFI 잠금 해제 단계에서 대기하므로, 전원 재인가·일반 재부팅 시에도 원격 접속하려면 FileVault를 해제하거나 `sudo fdesetup authrestart`로 재부팅해야 함
+
 ## 해상도 및 주사율 참고
 
 기본형 Apple Silicon의 단일 미디어 엔진은 초당 처리 가능한 픽셀 수에 하드웨어 상한(M4 기준 약 `8.95억 px/s`)이 있습니다.

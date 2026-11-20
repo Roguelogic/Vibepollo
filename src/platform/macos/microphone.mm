@@ -7,6 +7,7 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/macos/av_audio.h"
+#include "src/platform/macos/misc.h"
 
 namespace platf {
   using namespace std::literals;
@@ -64,6 +65,10 @@ namespace platf {
     }
 
     std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, bool host_audio_enabled) override {
+      if (is_loginwindow_session()) {
+        BOOST_LOG(info) << "Skipping system audio tap in pre-login LoginWindow session."sv;
+        return nullptr;
+      }
       auto mic = std::make_unique<av_mic_t>();
       mic->av_audio_capture = [[AVAudio alloc] init];
 

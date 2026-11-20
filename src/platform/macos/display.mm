@@ -15,7 +15,13 @@
 
 // platform includes
 #import <AppKit/AppKit.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#include <dlfcn.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOSurface/IOSurface.h>
+#include <time.h>
+#include <vector>
 
 // local includes
 #include "src/config.h"
@@ -36,6 +42,375 @@
 #undef AVMediaType
 
 namespace fs = std::filesystem;
+
+namespace {
+  struct cg_stream_api_t {
+    using frame_handler_t = void (^)(int32_t status, uint64_t display_time, IOSurfaceRef frame_surface, CFTypeRef update_ref);
+    using create_fn_t = CFTypeRef (*)(
+      CGDirectDisplayID display,
+      size_t output_width,
+      size_t output_height,
+      int32_t pixel_format,
+      CFDictionaryRef properties,
+      dispatch_queue_t queue,
+      frame_handler_t handler
+    );
+    using start_fn_t = CGError (*)(CFTypeRef stream);
+    using stop_fn_t = CGError (*)(CFTypeRef stream);
+
+    create_fn_t create = nullptr;
+    start_fn_t start = nullptr;
+    stop_fn_t stop = nullptr;
+    CFStringRef k_show_cursor = nullptr;
+    CFStringRef k_queue_depth = nullptr;
+    CFStringRef k_min_frame_time = nullptr;
+    CFStringRef k_ycbcr_matrix = nullptr;
+    CFStringRef k_matrix_709 = nullptr;
+
+    static const cg_stream_api_t &get() {
+      static const cg_stream_api_t api = [] {
+        cg_stream_api_t a;
+        a.create = reinterpret_cast<create_fn_t>(dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue"));
+        a.start = reinterpret_cast<start_fn_t>(dlsym(RTLD_DEFAULT, "CGDisplayStreamStart"));
+        a.stop = reinterpret_cast<stop_fn_t>(dlsym(RTLD_DEFAULT, "CGDisplayStreamStop"));
+        const auto sym_cfstr = [](const char *name) -> CFStringRef {
+          const auto *p = static_cast<const CFStringRef *>(dlsym(RTLD_DEFAULT, name));
+          return p ? *p : nullptr;
+        };
+        a.k_show_cursor = sym_cfstr("kCGDisplayStreamShowCursor");
+        a.k_queue_depth = sym_cfstr("kCGDisplayStreamQueueDepth");
+        a.k_min_frame_time = sym_cfstr("kCGDisplayStreamMinimumFrameTime");
+        a.k_ycbcr_matrix = sym_cfstr("kCGDisplayStreamYCbCrMatrix");
+        a.k_matrix_709 = sym_cfstr("kCGDisplayStreamYCbCrMatrix_ITU_R_709_2");
+        return a;
+      }();
+      return api;
+    }
+
+    bool available() const {
+      return create != nullptr && start != nullptr && stop != nullptr;
+    }
+  };
+
+  OSType normalize_cg_stream_pixel_format(OSType fmt) {
+    switch (fmt) {
+      case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+      case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+      case kCVPixelFormatType_ARGB2101010LEPacked:
+      case kCVPixelFormatType_32BGRA:
+        return fmt;
+      case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+      case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+        return kCVPixelFormatType_ARGB2101010LEPacked;
+      default:
+        return kCVPixelFormatType_32BGRA;
+    }
+  }
+
+  CMSampleBufferRef create_sample_from_iosurface(IOSurfaceRef surface, uint64_t display_time) {
+    if (!surface) {
+      return nullptr;
+    }
+    CVPixelBufferRef pixel_buffer = nullptr;
+    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, nullptr, &pixel_buffer) != kCVReturnSuccess || !pixel_buffer) {
+      return nullptr;
+    }
+    CMVideoFormatDescriptionRef format_desc = nullptr;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixel_buffer, &format_desc) != noErr || !format_desc) {
+      CVPixelBufferRelease(pixel_buffer);
+      return nullptr;
+    }
+    CMTime pts = CMClockGetTime(CMClockGetHostTimeClock());
+    if (display_time != 0) {
+      const CMTime host_pts = CMClockMakeHostTimeFromSystemUnits(display_time);
+      if (CMTIME_IS_NUMERIC(host_pts)) {
+        pts = host_pts;
+      }
+    }
+    const CMSampleTimingInfo timing {kCMTimeInvalid, pts, kCMTimeInvalid};
+    CMSampleBufferRef sample = nullptr;
+    CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixel_buffer, format_desc, &timing, &sample);
+    CFRelease(format_desc);
+    CVPixelBufferRelease(pixel_buffer);
+    return sample;
+  }
+
+  struct cg_stream_slot_t {
+    std::mutex mutex;
+    bool stopped = false;
+    CFTypeRef stream = nullptr;
+    dispatch_queue_t queue = nil;
+    dispatch_source_t keepalive_timer = nil;
+    CMSampleBufferRef last_sample = nullptr;
+    uint64_t keepalive_ns = 0;
+    std::atomic<uint64_t> last_delivery_ns {0};
+    FrameCallbackBlock callback = nil;
+    dispatch_semaphore_t signal = nil;
+
+    ~cg_stream_slot_t() {
+      stop(false);
+      if (callback) {
+        [callback release];
+        callback = nil;
+      }
+      if (queue) {
+        [queue release];
+        queue = nil;
+      }
+      if (signal) {
+        [signal release];
+        signal = nil;
+      }
+    }
+
+    bool is_stopped() {
+      std::lock_guard lock {mutex};
+      return stopped;
+    }
+
+    void stop(bool async_teardown) {
+      CFTypeRef to_stop = nullptr;
+      dispatch_source_t timer_to_cancel = nil;
+      CMSampleBufferRef sample_to_release = nullptr;
+      bool should_signal = false;
+      {
+        std::lock_guard lock {mutex};
+        if (!stopped) {
+          stopped = true;
+          should_signal = true;
+        }
+        to_stop = stream;
+        stream = nullptr;
+        timer_to_cancel = keepalive_timer;
+        keepalive_timer = nil;
+        sample_to_release = last_sample;
+        last_sample = nullptr;
+      }
+      if (timer_to_cancel) {
+        dispatch_source_cancel(timer_to_cancel);
+        [timer_to_cancel release];
+      }
+      if (sample_to_release) {
+        CFRelease(sample_to_release);
+      }
+      if (should_signal && signal) {
+        dispatch_semaphore_signal(signal);
+      }
+      if (to_stop) {
+        if (async_teardown) {
+          dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            cg_stream_api_t::get().stop(to_stop);
+            CFRelease(to_stop);
+          });
+        } else {
+          cg_stream_api_t::get().stop(to_stop);
+          CFRelease(to_stop);
+        }
+      }
+    }
+  };
+}  // namespace
+
+/**
+ * @brief Zero-copy CoreGraphics/SkyLight `CGDisplayStream` capture backend.
+ * @details Used in pre-login `LoginWindow` sessions (where ScreenCaptureKit's Aqua `replayd` agent
+ *          is not running) and as a fallback on virtual or physical displays when `SCVideo` fails.
+ */
+@interface CGStreamVideo: AVVideo
+@property (nonatomic, assign) CMTime keepaliveInterval;
+@end
+
+@implementation CGStreamVideo {
+  std::mutex _slots_mutex;
+  std::vector<std::shared_ptr<cg_stream_slot_t>> _slots;
+}
+
+- (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate {
+  if (!cg_stream_api_t::get().available()) {
+    [self release];
+    return nil;
+  }
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+  CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
+  if (mode == NULL) {
+    [self release];
+    return nil;
+  }
+  self.displayID = displayID;
+  super.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+  self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
+  self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
+  const int fps = std::max(frameRate, 1);
+  self.minFrameDuration = CMTimeMake(1, fps);
+  self.keepaliveInterval = kCMTimeInvalid;
+  CGDisplayModeRelease(mode);
+  return self;
+}
+
+- (void)setPixelFormat:(OSType)pixelFormat {
+  [super setPixelFormat:normalize_cg_stream_pixel_format(pixelFormat)];
+}
+
+- (void)dealloc {
+  std::vector<std::shared_ptr<cg_stream_slot_t>> slots;
+  {
+    std::lock_guard lock {_slots_mutex};
+    slots.swap(_slots);
+  }
+  for (auto &slot : slots) {
+    if (slot) {
+      slot->stop(false);
+    }
+  }
+  [super dealloc];
+}
+
+- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
+  const auto &api = cg_stream_api_t::get();
+  if (!api.available() || !frameCallback) {
+    return nil;
+  }
+
+  {
+    std::lock_guard lock {_slots_mutex};
+    std::erase_if(_slots, [](const std::shared_ptr<cg_stream_slot_t> &s) {
+      return !s || s->is_stopped();
+    });
+  }
+
+  auto slot = std::make_shared<cg_stream_slot_t>();
+  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+  slot->queue = dispatch_queue_create("dev.vibepollo.cgstream", qos);
+  slot->signal = dispatch_semaphore_create(0);
+  slot->callback = [frameCallback copy];
+  if (CMTIME_IS_VALID(self.keepaliveInterval) && CMTimeGetSeconds(self.keepaliveInterval) > 0.0) {
+    slot->keepalive_ns = static_cast<uint64_t>(CMTimeGetSeconds(self.keepaliveInterval) * NSEC_PER_SEC);
+  }
+
+  CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  if (api.k_show_cursor) {
+    CFDictionarySetValue(props, api.k_show_cursor, kCFBooleanTrue);
+  }
+  if (api.k_queue_depth) {
+    const int depth = 3;
+    CFNumberRef depth_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &depth);
+    CFDictionarySetValue(props, api.k_queue_depth, depth_num);
+    CFRelease(depth_num);
+  }
+  if (api.k_min_frame_time && CMTIME_IS_NUMERIC(self.minFrameDuration)) {
+    const double min_dt = std::max(0.0, CMTimeGetSeconds(self.minFrameDuration) * 0.9);
+    CFNumberRef dt_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &min_dt);
+    CFDictionarySetValue(props, api.k_min_frame_time, dt_num);
+    CFRelease(dt_num);
+  }
+  if (api.k_ycbcr_matrix && api.k_matrix_709) {
+    CFDictionarySetValue(props, api.k_ycbcr_matrix, api.k_matrix_709);
+  }
+
+  std::weak_ptr<cg_stream_slot_t> weak_slot = slot;
+  cg_stream_api_t::frame_handler_t handler = ^(int32_t status, uint64_t display_time, IOSurfaceRef frame_surface, CFTypeRef) {
+    auto s = weak_slot.lock();
+    if (!s) {
+      return;
+    }
+    if (status == 3 /* kCGDisplayStreamFrameStatusStopped */) {
+      s->stop(true);
+      return;
+    }
+    if (status != 0 /* kCGDisplayStreamFrameStatusFrameComplete */ || frame_surface == nullptr) {
+      return;
+    }
+    if (s->is_stopped()) {
+      return;
+    }
+    CMSampleBufferRef sample = create_sample_from_iosurface(frame_surface, display_time);
+    if (!sample) {
+      return;
+    }
+    if (s->keepalive_ns > 0) {
+      std::lock_guard lock {s->mutex};
+      if (!s->stopped) {
+        if (s->last_sample) {
+          CFRelease(s->last_sample);
+        }
+        s->last_sample = (CMSampleBufferRef) CFRetain(sample);
+      }
+    }
+    s->last_delivery_ns.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
+    const bool keep_going = s->callback(sample);
+    CFRelease(sample);
+    if (!keep_going) {
+      s->stop(true);
+    }
+  };
+
+  const size_t out_w = static_cast<size_t>(std::max(1, self.frameWidth));
+  const size_t out_h = static_cast<size_t>(std::max(1, self.frameHeight));
+  OSType chosen_fmt = normalize_cg_stream_pixel_format(self.pixelFormat);
+  CFTypeRef stream = api.create(self.displayID, out_w, out_h, static_cast<int32_t>(chosen_fmt), props, slot->queue, handler);
+  if (!stream && chosen_fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+    chosen_fmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    stream = api.create(self.displayID, out_w, out_h, static_cast<int32_t>(chosen_fmt), props, slot->queue, handler);
+  }
+  if (!stream && chosen_fmt != kCVPixelFormatType_32BGRA) {
+    chosen_fmt = kCVPixelFormatType_32BGRA;
+    stream = api.create(self.displayID, out_w, out_h, static_cast<int32_t>(chosen_fmt), props, slot->queue, handler);
+  }
+  CFRelease(props);
+
+  if (!stream) {
+    return nil;
+  }
+  super.pixelFormat = chosen_fmt;
+  slot->stream = stream;
+
+  if (slot->keepalive_ns > 0) {
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, slot->queue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, slot->keepalive_ns), slot->keepalive_ns, slot->keepalive_ns / 10);
+    dispatch_source_set_event_handler(timer, ^{
+      auto s = weak_slot.lock();
+      if (!s) {
+        return;
+      }
+      const uint64_t last = s->last_delivery_ns.load(std::memory_order_relaxed);
+      if (last != 0 && (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last) < (s->keepalive_ns * 9 / 10)) {
+        return;
+      }
+      CMSampleBufferRef sample = nullptr;
+      {
+        std::lock_guard lock {s->mutex};
+        if (s->stopped || !s->last_sample) {
+          return;
+        }
+        sample = (CMSampleBufferRef) CFRetain(s->last_sample);
+      }
+      s->last_delivery_ns.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
+      const bool keep_going = s->callback(sample);
+      CFRelease(sample);
+      if (!keep_going) {
+        s->stop(true);
+      }
+    });
+    slot->keepalive_timer = timer;
+    dispatch_resume(timer);
+  }
+
+  if (api.start(stream) != kCGErrorSuccess) {
+    slot->stop(false);
+    return nil;
+  }
+
+  {
+    std::lock_guard lock {_slots_mutex};
+    _slots.push_back(slot);
+  }
+  return slot->signal;
+}
+
+@end
 
 namespace platf {
   using namespace std::literals;
@@ -659,21 +1034,37 @@ namespace platf {
     // AVCaptureScreenInput delivers no frames from virtual displays, nor HDR; ScreenCaptureKit does.
     if (remote_monitor || macos_virtual_display::active_display_id() == display->display_id || display->hdr || hwdevice_type == platf::mem_type_e::videotoolbox) {
       SCVideo *capture = [[SCVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
-      capture.hdr = display->hdr;
-      if (hwdevice_type == platf::mem_type_e::videotoolbox) {
-        // Async PARALLEL_ENCODING enforces minimum_fps_target in encode_run() and only wraps
-        // IOSurface handles in the callback, so deliver directly on sampleQueue without a
-        // duplicate keepalive timer.
-        capture.directDelivery = YES;
-      } else {
-        // The sync encode path only encodes delivered frames, so enforce the minimum frame rate here
-        // (the same default as video.cpp: a fifth of the stream's rate, at least 10 fps).
-        const double minimum_fps = config::video.minimum_fps_target > 0 ? config::video.minimum_fps_target : std::max(config.framerate / 5.0, 10.0);
-        capture.keepaliveInterval = CMTimeMakeWithSeconds(1.0 / minimum_fps, 1000000);
+      if (capture) {
+        capture.hdr = display->hdr;
+        if (hwdevice_type == platf::mem_type_e::videotoolbox) {
+          // Async PARALLEL_ENCODING enforces minimum_fps_target in encode_run() and only wraps
+          // IOSurface handles in the callback, so deliver directly on sampleQueue without a
+          // duplicate keepalive timer.
+          capture.directDelivery = YES;
+        } else {
+          // The sync encode path only encodes delivered frames, so enforce the minimum frame rate here
+          // (the same default as video.cpp: a fifth of the stream's rate, at least 10 fps).
+          const double minimum_fps = config::video.minimum_fps_target > 0 ? config::video.minimum_fps_target : std::max(config.framerate / 5.0, 10.0);
+          capture.keepaliveInterval = CMTimeMakeWithSeconds(1.0 / minimum_fps, 1000000);
+        }
+        display->av_capture = capture;
+      } else if (cg_stream_api_t::get().available()) {
+        BOOST_LOG(info) << "ScreenCaptureKit unavailable for display "sv << display->display_id
+                        << "; falling back to CGDisplayStream capture"sv;
+        display->hdr = false;
+        display->headroom = 1.0;
+        CGStreamVideo *cg_capture = [[CGStreamVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
+        if (cg_capture && hwdevice_type != platf::mem_type_e::videotoolbox) {
+          const double minimum_fps = config::video.minimum_fps_target > 0 ? config::video.minimum_fps_target : std::max(config.framerate / 5.0, 10.0);
+          cg_capture.keepaliveInterval = CMTimeMakeWithSeconds(1.0 / minimum_fps, 1000000);
+        }
+        display->av_capture = cg_capture;
       }
-      display->av_capture = capture;
     } else {
       display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
+      if (!display->av_capture && cg_stream_api_t::get().available()) {
+        display->av_capture = [[CGStreamVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
+      }
     }
 
     if (!display->av_capture) {

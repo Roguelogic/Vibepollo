@@ -8,6 +8,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 // platform includes
@@ -105,6 +106,37 @@ namespace platf {
    * @brief Whether a MacBook's lid is closed right now. Always false on a Mac without one.
    */
   bool lid_closed();
+
+  inline constexpr std::string_view install_loginscreen_agent_arg = "--macos-install-loginscreen-agent";
+  inline constexpr std::string_view remove_loginscreen_agent_arg = "--macos-remove-loginscreen-agent";
+
+  /**
+   * @brief Whether this process is running inside the pre-login macOS LoginWindow session.
+   */
+  bool is_loginwindow_session();
+
+  /**
+   * @brief Prepare an isolated root-owned runtime directory seeded from the owner's paired config
+   *        when running in the pre-login macOS LoginWindow session.
+   */
+  void prepare_loginwindow_runtime();
+
+  /**
+   * @brief Whether the system-wide `/Library/LaunchAgents` agent (`Aqua` + `LoginWindow`) is installed.
+   */
+  bool loginscreen_agent_enabled();
+
+  /**
+   * @brief Install or remove the system-wide `/Library/LaunchAgents` agent (`Aqua` + `LoginWindow`)
+   *        via standard macOS administrator authorization.
+   */
+  bool set_loginscreen_agent_enabled(bool enabled);
+
+  /**
+   * @brief Privileged helper entrypoint invoked with administrator rights to install or remove the
+   *        `/Library/LaunchAgents` plist cleanly.
+   */
+  int run_loginscreen_agent_helper(int argc, char *argv[]);
 }
 
 namespace dyn {

@@ -26,6 +26,10 @@ A fork of [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [Apo
 * **System Audio**
   * Captures macOS system audio directly via CoreAudio tap without third-party virtual audio drivers.
 
+* **Pre-Login Access (`LoginWindow`)**
+  * Optional **Allow on Login Screen** toggle in the menu bar installs a LaunchAgent covering both `LoginWindow` and `Aqua` sessions, allowing remote password entry after a reboot.
+  * Note: If FileVault full-disk encryption is enabled, macOS waits at the EFI pre-boot unlock screen before starting `launchd` agents; unattended cold reboots require turning FileVault off or rebooting via `sudo fdesetup authrestart`.
+
 ## Notes on Resolution & Refresh Rate
 
 Single-engine Apple Silicon hardware encoders have a fixed pixel-rate ceiling (roughly `~895 Mpx/s` on base M4):

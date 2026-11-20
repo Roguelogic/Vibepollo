@@ -30,6 +30,7 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/macos/display_policy.h"
+#include "src/platform/macos/misc.h"
 #include "src/platform/macos/sc_video.h"
 #include "src/platform/macos/virtual_display.h"
 #include "src/utility.h"
@@ -524,7 +525,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
 
     CGEventSetFlags(event, macos_input->kb_flags);
-    CGEventPost(kCGSessionEventTap, event);
+    CGEventSetTimestamp(event, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    CGEventPost(is_loginwindow_session() ? kCGHIDEventTap : kCGSessionEventTap, event);
     CFRelease(event);
   }
 
