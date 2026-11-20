@@ -709,12 +709,43 @@ namespace platf {
     bool idr = false;
   };
 
+  struct vt_frame_metadata_t {
+    uint64_t frame_index = 0;
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
+  };
+
   struct vt_encode_device_t: encode_device_t {
+    using packet_callback_t = std::function<void(vt_encoded_frame &&frame, const vt_frame_metadata_t &meta)>;
+
     virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
     virtual vt_encoded_frame encode_frame(uint64_t frame_index, bool force_idr) = 0;
+    virtual int submit_frame(const vt_frame_metadata_t &meta, bool force_idr, packet_callback_t on_packet) {
+      auto encoded = encode_frame(meta.frame_index, force_idr);
+      if (encoded.data.empty()) {
+        return -1;
+      }
+      if (on_packet) {
+        on_packet(std::move(encoded), meta);
+      }
+      return 0;
+    }
+    virtual bool flush_encoder() {
+      return true;
+    }
+    virtual bool wait_for_slot() {
+      return true;
+    }
+    virtual std::size_t in_flight_count() const {
+      return 0;
+    }
     virtual bool set_bitrate(int bitrate_kbps) {
       (void) bitrate_kbps;
       return false;
+    }
+    virtual void set_hdr_metadata(const SS_HDR_METADATA &metadata) {
+      (void) metadata;
     }
   };
 

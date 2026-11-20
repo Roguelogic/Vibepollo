@@ -551,13 +551,17 @@ namespace platf {
 
       CVPixelBufferLockBaseAddress(buffer, 0);
       if (CVPixelBufferIsPlanar(buffer)) {
-        // Video-range black: luma 16 and chroma 128, or 64 and 512 in the high bits of 10-bit samples.
-        const bool ten_bit = pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+        // Video-range black: luma 16 and chroma 128, or 64 and 512 in the high bits of 10-bit samples;
+        // full-range 10-bit ('xf44') black: luma 0 and chroma 512 in the high bits.
+        const bool ten_bit = pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                             pixel_format == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+        const bool full_range = pixel_format == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
         for (size_t plane = 0; plane < CVPixelBufferGetPlaneCount(buffer); ++plane) {
           auto *base = static_cast<std::uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(buffer, plane));
           const size_t size = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane) * CVPixelBufferGetHeightOfPlane(buffer, plane);
           if (ten_bit) {
-            std::fill_n(reinterpret_cast<std::uint16_t *>(base), size / 2, static_cast<std::uint16_t>((plane == 0 ? 64 : 512) << 6));
+            const std::uint16_t luma_black = full_range ? 0 : 64;
+            std::fill_n(reinterpret_cast<std::uint16_t *>(base), size / 2, static_cast<std::uint16_t>((plane == 0 ? luma_black : 512) << 6));
           } else {
             std::memset(base, plane == 0 ? 16 : 128, size);
           }
@@ -606,6 +610,9 @@ namespace platf {
 
     auto display = std::make_shared<av_display_t>();
     display->lock_cpu_pixels.store(hwdevice_type == platf::mem_type_e::system, std::memory_order_relaxed);
+    // Async VideoToolbox encoding never calls dummy_img() during streaming; avoid retaining the
+    // first captured SCStream IOSurface in latest_sample for the entire session.
+    display->need_bootstrap_sample.store(hwdevice_type != platf::mem_type_e::videotoolbox, std::memory_order_relaxed);
 
     // Default to main display
     display->display_id = CGMainDisplayID();
@@ -685,9 +692,13 @@ namespace platf {
       // Pre-configure capture pixel format and output dimensions before captureThread starts SCStream;
       // otherwise async PARALLEL_ENCODING starts SCStream in 32BGRA SDR before make_vt_encode_device runs.
       const auto colorspace = video::colorspace_from_client_config(config, display->hdr);
-      display->av_capture.pixelFormat = colorspace.bit_depth == 10 ?
-                                          kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
-                                          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+      if (config.chromaSamplingType == 1) {
+        display->av_capture.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+      } else {
+        display->av_capture.pixelFormat = colorspace.bit_depth == 10 ?
+                                            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
+                                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+      }
       if (config.width > 0 && config.height > 0) {
         [display->av_capture setFrameWidth:config.width frameHeight:config.height];
       }

@@ -83,6 +83,13 @@ namespace stream {
   };
 
   std::optional<control_packet_view_t> decode_control_packet(std::string_view packet_bytes);
+  std::size_t concat_and_insert_into(
+    std::vector<std::uint8_t> &scratch,
+    std::uint64_t insert_size,
+    std::uint64_t slice_size,
+    std::string_view data1,
+    std::string_view data2
+  );
   std::vector<std::uint8_t> concat_and_insert(
     std::uint64_t insert_size,
     std::uint64_t slice_size,

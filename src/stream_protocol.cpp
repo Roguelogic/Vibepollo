@@ -94,27 +94,34 @@ namespace stream {
     return control_packet_view_t {type, packet_bytes.substr(sizeof(type))};
   }
 
-  std::vector<std::uint8_t> concat_and_insert(
+  std::size_t concat_and_insert_into(
+    std::vector<std::uint8_t> &scratch,
     std::uint64_t insert_size,
     std::uint64_t slice_size,
     std::string_view data1,
     std::string_view data2
   ) {
     if (slice_size == 0) {
-      return {};
+      return 0;
     }
     const std::size_t total_in = data1.size() + data2.size();
     if (total_in == 0) {
-      return {};
+      return 0;
     }
 
     const std::size_t slices = (total_in + slice_size - 1) / slice_size;
-    std::vector<std::uint8_t> result(total_in + slices * insert_size, 0);
-    std::uint8_t *dst = result.data();
+    const std::size_t total_out = total_in + slices * static_cast<std::size_t>(insert_size);
+    if (scratch.size() < total_out) {
+      scratch.resize(total_out);
+    }
+    std::uint8_t *dst = scratch.data();
 
     std::size_t in_pos = 0;
     while (in_pos < total_in) {
-      dst += insert_size;
+      if (insert_size > 0) {
+        std::memset(dst, 0, static_cast<std::size_t>(insert_size));
+        dst += insert_size;
+      }
       std::size_t rem = std::min<std::size_t>(slice_size, total_in - in_pos);
       if (in_pos < data1.size()) {
         const std::size_t n1 = std::min<std::size_t>(rem, data1.size() - in_pos);
@@ -130,6 +137,18 @@ namespace stream {
         in_pos += rem;
       }
     }
+    return total_out;
+  }
+
+  std::vector<std::uint8_t> concat_and_insert(
+    std::uint64_t insert_size,
+    std::uint64_t slice_size,
+    std::string_view data1,
+    std::string_view data2
+  ) {
+    std::vector<std::uint8_t> result;
+    const std::size_t used = concat_and_insert_into(result, insert_size, slice_size, data1, data2);
+    result.resize(used);
     return result;
   }
 }  // namespace stream

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 // platform includes
@@ -51,6 +52,21 @@ namespace platf::vt {
   CFStringRef h264_entropy_mode(int coder);
 
   /**
+   * @brief Build an Annex-B HEVC `PREFIX_SEI_NUT` (NAL type 39) containing ISO/IEC 23008-2 D.2.28
+   *        `mastering_display_colour_volume` (payload 137) and CTA-861.3 / D.2.35
+   *        `content_light_level_info` (payload 144) with RBSP `0x03` emulation prevention.
+   *
+   * Apple's hardware HEVC encoder (`AppleAVE2`) records MDCV/CLLI on `CMFormatDescription`
+   * container extensions but omits payloads 137 and 144 from the `CMBlockBuffer` bitstream.
+   * Injecting this NAL unit right after VPS/SPS/PPS on IDR frames ensures raw Annex-B RTP
+   * clients and decoders receive authoritative in-band HDR10 mastering metadata from frame 0.
+   *
+   * @param hdr Authoritative stream HDR10 metadata.
+   * @return Complete Annex-B `PREFIX_SEI_NUT` bytes (including `00 00 00 01`), or empty when unset.
+   */
+  std::vector<uint8_t> build_hdr_sei_hevc(const SS_HDR_METADATA &hdr);
+
+  /**
    * @brief Convert one encoded sample buffer from AVCC framing to an Annex-B elementary stream.
    *
    * On IDR frames the parameter sets held out-of-band in the format description are emitted
@@ -58,11 +74,17 @@ namespace platf::vt {
    * the leading parameter-set NAL and decodes each packet as a self-contained frame.
    *
    * @param sample_buffer Encoded sample buffer delivered by the compression session.
-   * @param idr Whether the sample buffer holds a sync (IDR) frame.
+   * @param idr Whether the sample buffer holds a sync (IDR) frame whose parameter sets must be emitted.
    * @param out Vector that receives the Annex-B bytes; left unchanged when conversion fails.
+   * @param prefix_sei Optional Annex-B `PREFIX_SEI_NUT` bytes emitted after parameter sets and before VCL slices.
    * @return True when the complete frame was converted.
    */
-  bool append_annexb(CMSampleBufferRef sample_buffer, bool idr, std::vector<uint8_t> &out);
+  bool append_annexb(
+    CMSampleBufferRef sample_buffer,
+    bool idr,
+    std::vector<uint8_t> &out,
+    std::span<const uint8_t> prefix_sei = {}
+  );
 
   /**
    * @brief Compute the frame rate to declare to a VideoToolbox compression session.

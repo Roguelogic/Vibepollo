@@ -1396,6 +1396,12 @@ namespace video {
         device(std::move(encode_device)) {
     }
 
+    ~vt_encode_session_t() override {
+      if (device) {
+        (void) device->flush_encoder();
+      }
+    }
+
     int convert(platf::img_t &img) override {
       if (!device) {
         return -1;
@@ -1408,7 +1414,7 @@ namespace video {
     }
 
     void request_normal_frame() override {
-      force_idr = false;
+      // Cleared atomically when submit_frame / encode_frame consumes the IDR request.
     }
 
     bool invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
@@ -1420,6 +1426,15 @@ namespace video {
       return device && device->set_bitrate(bitrate_kbps);
     }
 
+    void set_hdr_metadata(const SS_HDR_METADATA &metadata) override {
+      if (!device) {
+        return;
+      }
+      device->hdr_metadata = metadata;
+      device->hdr_metadata_valid = true;
+      device->set_hdr_metadata(metadata);
+    }
+
     platf::vt_encoded_frame encode_frame(uint64_t frame_index) {
       if (!device) {
         return {};
@@ -1427,6 +1442,26 @@ namespace video {
       auto result = device->encode_frame(frame_index, force_idr);
       force_idr = false;
       return result;
+    }
+
+    int submit_frame(const platf::vt_frame_metadata_t &meta, platf::vt_encode_device_t::packet_callback_t on_packet) {
+      if (!device) {
+        return -1;
+      }
+      const bool idr = std::exchange(force_idr, false);
+      return device->submit_frame(meta, idr, std::move(on_packet));
+    }
+
+    bool flush_encoder() {
+      return device && device->flush_encoder();
+    }
+
+    bool wait_for_slot() {
+      return !device || device->wait_for_slot();
+    }
+
+    std::size_t in_flight_count() const {
+      return device ? device->in_flight_count() : 0;
     }
 
   private:
@@ -2647,8 +2682,8 @@ namespace video {
       platf::mem_type_e::videotoolbox,
       platf::pix_fmt_e::nv12,
       platf::pix_fmt_e::p010,
-      platf::pix_fmt_e::unknown,
-      platf::pix_fmt_e::unknown
+      platf::pix_fmt_e::ayuv,
+      platf::pix_fmt_e::yuv444p16
     ),
     {
       {},
@@ -2677,7 +2712,7 @@ namespace video {
       {},  // Fallback options
       "h264_vt"s,
     },
-    PARALLEL_ENCODING
+    PARALLEL_ENCODING | YUV444_SUPPORT
   };
 #endif
 
@@ -3587,6 +3622,8 @@ namespace video {
           }
 
           if (frame_captured) {
+            // capture_ctx->images is a 1-slot safe::event_t (latest-frame mailbox), overwriting
+            // any unconsumed frame in O(1) so the encoder never builds up a multi-frame backlog.
             capture_ctx->images->raise(img);
           }
 
@@ -3948,26 +3985,47 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
-    auto encoded_frame = session.encode_frame(frame_nr);
-    if (encoded_frame.data.empty()) {
-      BOOST_LOG(error) << "VideoToolbox returned empty packet";
+    const platf::vt_frame_metadata_t meta {
+      .frame_index = static_cast<uint64_t>(frame_nr),
+      .frame_timestamp = frame_timestamp,
+      .capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp,
+      .host_processing_timestamp = host_processing_timestamp,
+    };
+
+    const int submit_status = session.submit_frame(
+      meta,
+      [packets, channel_data](platf::vt_encoded_frame &&encoded_frame, const platf::vt_frame_metadata_t &emitted_meta) {
+        if (encoded_frame.data.empty()) {
+          return;
+        }
+        if (emitted_meta.frame_index != encoded_frame.frame_index) {
+          BOOST_LOG(error) << "VideoToolbox frame index mismatch " << emitted_meta.frame_index << " " << encoded_frame.frame_index;
+        }
+        auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
+        packet->channel_data = channel_data;
+        packet->frame_timestamp = emitted_meta.frame_timestamp;
+        packet->capture_timestamp = emitted_meta.capture_timestamp;
+        packet->host_processing_timestamp = emitted_meta.host_processing_timestamp;
+        if (webrtc_stream::has_active_sessions()) {
+          webrtc_stream::submit_video_packet(*packet);
+        }
+        packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
+        packets->raise(std::move(packet));
+      }
+    );
+    if (submit_status != 0) {
+      BOOST_LOG(error) << "VideoToolbox failed to submit frame " << frame_nr;
       return -1;
     }
 
-    if (frame_nr != (int64_t) encoded_frame.frame_index) {
-      BOOST_LOG(error) << "VideoToolbox frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
+    // Flush synchronously for startup capability probes and the initial IDR packet so
+    // callers inspecting `packets` right after the first frame see it immediately.
+    if (channel_data == nullptr || frame_nr <= 1) {
+      if (!session.flush_encoder()) {
+        BOOST_LOG(error) << "VideoToolbox failed while flushing initial/probe frame " << frame_nr;
+        return -1;
+      }
     }
-
-    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
-    packet->channel_data = channel_data;
-    packet->frame_timestamp = frame_timestamp;
-    packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
-    packet->host_processing_timestamp = host_processing_timestamp;
-    if (webrtc_stream::has_active_sessions()) {
-      webrtc_stream::submit_video_packet(*packet);
-    }
-    packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
-    packets->raise(std::move(packet));
 
     return 0;
   }
@@ -5702,6 +5760,9 @@ namespace video {
 
     // A keyframe request that arrived with an input the conversion then reported as a repeat.
     bool retry_idr = false;
+    auto *vt_session = dynamic_cast<vt_encode_session_t *>(session.get());
+    bool prev_was_real_capture = false;
+    std::uint32_t consecutive_static_frames = 0;
 
     while (true) {
       raise_touch_port_if_geometry_changed(touch_port_event, disp.get(), config);
@@ -5771,6 +5832,7 @@ namespace video {
 
       if (requested_idr_frame) {
         session->request_idr_frame();
+        consecutive_static_frames = 0;
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -5787,6 +5849,20 @@ namespace video {
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         auto image_wait_budget = max_frametime;
+        if (vt_session && prev_was_real_capture && max_frametime <= encode_frame_threshold + 1ms) {
+          // GFN-style VSync phase grace: while real 120Hz SCStream frames are arriving, give
+          // WindowServer 50% extra VSync composite headroom (~12.5ms at 120Hz) before firing
+          // a synthetic CFR frame so real VSync captures are never preempted by duplicates.
+          image_wait_budget = max_frametime + (max_frametime / 2);
+        } else if (vt_session && consecutive_static_frames >= 90) {
+          // Parsec-style event-driven VFR idle conservation: wait ~3.0s (90 static frames at 30fps)
+          // before entering 4fps deep idle so brief reading/clicking pauses never trigger AppleAVE2
+          // DVFS frequency downclocking (which otherwise spikes 4K wake encode latency to ~34ms).
+          image_wait_budget = std::max(
+            image_wait_budget,
+            std::chrono::duration_cast<decltype(image_wait_budget)>(250ms)
+          );
+        }
         if (bootstrap_state.should_encode_placeholder()) {
           // Prime a lookahead encoder immediately; waiting for minimum FPS between
           // bootstrap placeholders needlessly delays the first packet.
@@ -5794,6 +5870,20 @@ namespace video {
         }
 
         const auto image_wait_started = std::chrono::steady_clock::now();
+        if (vt_session && frame_nr > 1) {
+          // Parsec-style zero-backlog admission gate: wait for an AppleAVE2 hardware slot BEFORE
+          // popping from the 1-slot `images` mailbox so SCStream overwrites stale frames in O(1)
+          // while the silicon is busy, eliminating multi-frame FIFO queue bloat (e.g. 44ms -> 11ms at 4K@144).
+          const auto slot_wait_started = std::chrono::steady_clock::now();
+          if (!vt_session->wait_for_slot()) {
+            BOOST_LOG(error) << "VideoToolbox entered an unrecoverable state while waiting for a slot"sv;
+            break;
+          }
+          const auto slot_waited = std::chrono::steady_clock::now() - slot_wait_started;
+          image_wait_budget = slot_waited < image_wait_budget ?
+                                image_wait_budget - slot_waited :
+                                decltype(max_frametime)::zero();
+        }
         if (auto *amf_session = native_session;
             amf_session && image_wait_budget > decltype(max_frametime)::zero()) {
           // Wait for either the next capture or output that became due with the
@@ -5855,10 +5945,12 @@ namespace video {
         }
         if (img) {
           placeholder_input = is_placeholder_capture_image(*img);
+          prev_was_real_capture = !placeholder_input;
           if (placeholder_input) {
             ++loop_stats.popped_placeholder;
           } else {
             ++loop_stats.popped_real;
+            consecutive_static_frames = 0;
           }
           if (!placeholder_input && bootstrap_state.current_input_placeholder) {
             session->request_idr_frame();
@@ -5933,12 +6025,21 @@ namespace video {
         } else if (!images->running()) {
           break;
         } else {
+          prev_was_real_capture = false;
           if (images->peek()) {
             // A fresh frame arrived right as the minimum-FPS wait expired; pop it on the
             // next iteration instead of blocking the encoder on a duplicate frame.
             continue;
           }
+          if (vt_session && vt_session->in_flight_count() > 0 && !requested_idr_frame) {
+            // Reflex-style backpressure guard: never queue synthetic keepalive frames behind
+            // an already in-flight hardware encode so real VSync frames enter stage 0 cleanly.
+            continue;
+          }
           ++loop_stats.pop_timeouts;
+          if (consecutive_static_frames < 1000) {
+            ++consecutive_static_frames;
+          }
           placeholder_input = bootstrap_state.current_input_placeholder;
         }
       }
@@ -6124,6 +6225,7 @@ namespace video {
 
       BOOST_LOG(info) << "Color coding: " << color_coding;
       BOOST_LOG(info) << "Color depth: " << colorspace.bit_depth << "-bit";
+      BOOST_LOG(info) << "Chroma sampling: " << (config.chromaSamplingType == 1 ? "4:4:4" : "4:2:0");
       BOOST_LOG(info) << "Color range: " << (colorspace.full_range ? "JPEG" : "MPEG");
     }
 

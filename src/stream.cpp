@@ -786,6 +786,8 @@ namespace stream {
       std::atomic<std::int64_t> wire_frame_index {-1};
       /// Frames abandoned by a socket send failure; adaptive pacing treats a rise as loss.
       std::atomic<std::uint64_t> video_send_failures {0};
+      /// Monotonic steady_clock ns of the latest network/FEC recovery or loss hazard.
+      std::atomic<std::int64_t> last_fec_hazard_ns {0};
       std::chrono::steady_clock::time_point start_time {std::chrono::steady_clock::now()};
     } stats;
 
@@ -1191,57 +1193,62 @@ namespace stream {
     ENetEvent event;
     auto res = enet_host_service(_host.get(), &event, (enet_uint32) timeout.count());
 
-    if (res > 0) {
+    // GFN-style zero-wait input burst drain: once woken from poll(), drain all queued ENet
+    // events immediately via enet_host_check_events() without re-entering the outer session loop.
+    for (int drained = 0; res > 0; ++drained) {
       auto session = get_session(event.peer, event.data);
       if (!session) {
         BOOST_LOG(warning) << "Rejected connection from ["sv << platf::from_sockaddr((sockaddr *) &event.peer->address.address) << "]: it's not properly set up"sv;
         enet_peer_disconnect_now(event.peer, 0);
+      } else {
+        session->pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-        return;
-      }
+        switch (event.type) {
+          case ENET_EVENT_TYPE_RECEIVE:
+            {
+              net::packet_t packet {event.packet};
 
-      session->pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+              std::string_view packet_bytes {
+                reinterpret_cast<const char *>(packet->data),
+                packet->dataLength
+              };
+              const auto decoded = decode_control_packet(packet_bytes);
+              if (!decoded) {
+                BOOST_LOG(warning) << "Ignoring runt control packet (" << packet->dataLength << " bytes)";
+                break;
+              }
 
-      switch (event.type) {
-        case ENET_EVENT_TYPE_RECEIVE:
-          {
-            net::packet_t packet {event.packet};
-
-            std::string_view packet_bytes {
-              reinterpret_cast<const char *>(packet->data),
-              packet->dataLength
-            };
-            const auto decoded = decode_control_packet(packet_bytes);
-            if (!decoded) {
-              BOOST_LOG(warning) << "Ignoring runt control packet (" << packet->dataLength << " bytes)";
-              break;
+              call(decoded->type, session, decoded->payload, false);
             }
-
-            call(decoded->type, session, decoded->payload, false);
-          }
-          break;
-        case ENET_EVENT_TYPE_CONNECT:
-          BOOST_LOG(info) << "CLIENT CONNECTED"sv;
-          // Match the contributor's opt-in retry window for each accepted peer.
-          // The separate ping deadline and explicit stop path retain ownership.
-          static_assert(config::max_control_peer_timeout.count() < ENET_TIME_OVERFLOW);
-          if (const auto timeout = config::get_control_peer_timeout(); timeout.count() > 0) {
-            const auto timeout_ms = static_cast<enet_uint32>(timeout.count());
-            enet_peer_timeout(event.peer, ENET_PEER_TIMEOUT_LIMIT, timeout_ms, timeout_ms);
-            BOOST_LOG(info) << "Control peer timeout set to "sv << timeout_ms << " ms"sv;
-          }
-          break;
-        case ENET_EVENT_TYPE_DISCONNECT:
-          BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
-          session->client_disconnected.store(true, std::memory_order_release);
-          // No more clients to send video data to ^_^
-          if (session->state == session::state_e::RUNNING) {
-            session::stop(*session);
-          }
-          break;
-        case ENET_EVENT_TYPE_NONE:
-          break;
+            break;
+          case ENET_EVENT_TYPE_CONNECT:
+            BOOST_LOG(info) << "CLIENT CONNECTED"sv;
+            // Match the contributor's opt-in retry window for each accepted peer.
+            // The separate ping deadline and explicit stop path retain ownership.
+            static_assert(config::max_control_peer_timeout.count() < ENET_TIME_OVERFLOW);
+            if (const auto peer_timeout = config::get_control_peer_timeout(); peer_timeout.count() > 0) {
+              const auto timeout_ms = static_cast<enet_uint32>(peer_timeout.count());
+              enet_peer_timeout(event.peer, ENET_PEER_TIMEOUT_LIMIT, timeout_ms, timeout_ms);
+              BOOST_LOG(info) << "Control peer timeout set to "sv << timeout_ms << " ms"sv;
+            }
+            break;
+          case ENET_EVENT_TYPE_DISCONNECT:
+            BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
+            session->client_disconnected.store(true, std::memory_order_release);
+            // No more clients to send video data to ^_^
+            if (session->state == session::state_e::RUNNING) {
+              session::stop(*session);
+            }
+            break;
+          case ENET_EVENT_TYPE_NONE:
+            break;
+        }
       }
+
+      if (drained >= 63) {
+        break;
+      }
+      res = enet_host_check_events(_host.get(), &event);
     }
   }
 
@@ -1727,9 +1734,24 @@ namespace stream {
       }
     });
 
+    auto mark_fec_hazard = [](session_t *session) {
+      if (session) {
+        session->stats.last_fec_hazard_ns.store(
+          std::chrono::steady_clock::now().time_since_epoch().count(),
+          std::memory_order_relaxed
+        );
+      }
+    };
+
     // Client to host SS_FRAME_FEC_STATUS: one report per FEC block that needed
     // recovery or was dropped. (Host to client, the same number is Set RGB LED.)
-    server->map(pacing::fec_status_packet_type, [](session_t *session, const std::string_view &payload) {
+    server->map(pacing::fec_status_packet_type, [mark_fec_hazard](session_t *session, const std::string_view &payload) {
+      if (const auto parsed = pacing::parse_fec_status(payload);
+          parsed && parsed->received_data < parsed->data) {
+        // Even a single lost data packet recovered seamlessly by parity elevates Adaptive FEC
+        // immediately to full configured protection before any visible frame loss can occur.
+        mark_fec_hazard(session);
+      }
       if (!session->video.adaptive_pacing_enabled) {
         // Off: behave as before this type had a handler.
         BOOST_LOG(debug)
@@ -1803,6 +1825,9 @@ namespace stream {
       auto lastGoodFrame = *last_good_frame;
 
       saturating_add_relaxed(session->stats.client_reported_losses, static_cast<std::int64_t>(count));
+      if (count > 0) {
+        mark_fec_hazard(session);
+      }
 
       BOOST_LOG(verbose)
         << "type [IDX_LOSS_STATS]"sv << std::endl
@@ -1817,6 +1842,9 @@ namespace stream {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
       saturating_add_relaxed(session->stats.idr_requests, 1u);
+      if (session->stats.frames_sent.load(std::memory_order_relaxed) > 30) {
+        mark_fec_hazard(session);
+      }
       // Every PyroWave frame is intra-coded; the next frame already recovers.
       if (session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT) {
         return;
@@ -1841,6 +1869,7 @@ namespace stream {
       }
 
       saturating_add_relaxed(session->stats.invalidate_ref_count, 1u);
+      mark_fec_hazard(session);
 
       BOOST_LOG(debug)
         << "type [IDX_INVALIDATE_REF_FRAMES]"sv << std::endl
@@ -2434,8 +2463,13 @@ namespace stream {
       std::uint64_t cached_link_bps = 0;
       std::uint64_t cached_interface_id = 0;
       std::string cached_link_alias = "unavailable";
+      std::uint64_t last_seen_send_failures = 0;
     };
     std::unordered_map<session_t *, wire_timeline_state_t> wire_timeline_by_session;
+    // Persistent scratch buffer for RTP packet header interleaving so 120-144Hz streams do not
+    // heap-allocate, zero-fault, and munmap hundreds of KiB per frame.
+    std::vector<std::uint8_t> payload_scratch;
+    payload_scratch.reserve(512 * 1024);
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
@@ -2525,6 +2559,28 @@ namespace stream {
       // may also protect detail, bounded by unused bitrate and FEC block capacity.
       const bool pyrowave_session = session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT;
       auto fecPercentage = pyrowave_session ? 0 : config::stream.fec_percentage;
+      const auto send_failures_now = session->stats.video_send_failures.load(std::memory_order_relaxed);
+      if (send_failures_now != wire_timeline_state.last_seen_send_failures) {
+        wire_timeline_state.last_seen_send_failures = send_failures_now;
+        session->stats.last_fec_hazard_ns.store(packet_pop_timestamp.time_since_epoch().count(), std::memory_order_relaxed);
+      }
+      if (!pyrowave_session && fecPercentage > 5 && !packet->is_idr()) {
+        // Parsec-style lossless Adaptive FEC: keep full configured parity on IDR frames, during
+        // session warmup (first 2s), and for 8s after ANY single recovered/lost packet reported by
+        // SS_FRAME_FEC_STATUS or IDX_LOSS_STATS; otherwise step down to 10% (8..15s) -> 5% (>=15s
+        // zero-loss steady state) while preserving >=2 parity shards per block for 0% frame loss.
+        const auto now_ns = packet_pop_timestamp.time_since_epoch().count();
+        const auto start_ns = session->stats.start_time.time_since_epoch().count();
+        const auto hazard_ns = session->stats.last_fec_hazard_ns.load(std::memory_order_relaxed);
+        if ((now_ns - start_ns) >= 2'000'000'000LL) {
+          const auto clean_ns = hazard_ns > 0 ? (now_ns - hazard_ns) : (now_ns - start_ns);
+          if (clean_ns >= 15'000'000'000LL) {
+            fecPercentage = std::min(fecPercentage, 5);
+          } else if (clean_ns >= 8'000'000'000LL) {
+            fecPercentage = std::min(fecPercentage, 10);
+          }
+        }
+      }
       if (session->video.adaptive_pacing_enabled) {
         session->stats.wire_frame_index.store(packet->frame_index(), std::memory_order_relaxed);
       }
@@ -2540,9 +2596,19 @@ namespace stream {
                                             0;
       frame_header.pyrowave_critical_packets = std::uint16_t(std::min<std::size_t>(critical_shards, std::numeric_limits<std::uint16_t>::max()));
 
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      if (payload_scratch.size() > 4 * 1024 * 1024 && payload.size() < 256 * 1024) {
+        payload_scratch.resize(512 * 1024);
+        payload_scratch.shrink_to_fit();
+      }
+      const auto payload_new_size = concat_and_insert_into(
+        payload_scratch,
+        sizeof(video_packet_raw_t),
+        payload_blocksize,
+        std::string_view {(char *) &frame_header, sizeof(frame_header)},
+        payload
+      );
 
-      payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      payload = std::string_view {(char *) payload_scratch.data(), payload_new_size};
 
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = pyrowave::protocol::MAX_FEC_BLOCKS;
@@ -2550,8 +2616,9 @@ namespace stream {
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
       std::array<int, MAX_FEC_BLOCKS> fec_block_percentages {};
       std::size_t fec_blocks_needed = 0;
-      // The client asks for at least 2 parity shards; PyroWave's critical block always has them.
-      const std::size_t min_parity_shards = pyrowave_session ?
+      // The client asks for at least 2 parity shards; keep >=2 parity shards whenever FEC is active
+      // so isolated 1-2 packet Wi-Fi blips are still 100% recovered even in 5% Adaptive FEC mode.
+      const std::size_t min_parity_shards = (pyrowave_session || fecPercentage > 0) ?
                                               std::max<std::size_t>(2, std::size_t(std::max(session->config.minRequiredFecPackets, 0))) :
                                               std::size_t(std::max(session->config.minRequiredFecPackets, 0));
 

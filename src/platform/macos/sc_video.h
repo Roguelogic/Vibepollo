@@ -11,6 +11,12 @@ extern "C" {
 #endif
 /// Dynamically shows or hides the composited macOS cursor across active ScreenCaptureKit streams.
 void macos_sc_set_cursor_visible(bool visible);
+
+/// Updates and shows the Windows-Ink-style stylus hover reticle at Quartz global coordinates (x, y).
+void macos_pen_hover_cursor_show(double cg_x, double cg_y, float distance_norm, bool eraser);
+
+/// Hides the stylus hover reticle immediately.
+void macos_pen_hover_cursor_hide(void);
 #ifdef __cplusplus
 }
 #endif

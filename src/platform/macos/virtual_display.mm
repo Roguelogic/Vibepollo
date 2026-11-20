@@ -150,7 +150,7 @@ namespace platf::macos_virtual_display {
         if (std::chrono::steady_clock::now() >= deadline) {
           return false;
         }
-        std::this_thread::sleep_for(50ms);
+        std::this_thread::sleep_for(5ms);
       }
       return true;
     }
@@ -710,7 +710,15 @@ namespace platf::macos_virtual_display {
      * @param serial Distinguishes the display from Vibepollo's others, so macOS remembers each one's settings.
      * @param hdr Make it an HDR display, where this macOS can.
      */
-    std::unique_ptr<virtual_display_t> make_display(NSString *name, const unsigned int serial, const int width, const int height, const double refresh, const bool hdr) {
+    std::unique_ptr<virtual_display_t> make_display(
+      NSString *name,
+      const unsigned int serial,
+      const int width,
+      const int height,
+      const double refresh,
+      const bool hdr,
+      const bool skip_other_modes_restore = false
+    ) {
       const Class descriptor_class = NSClassFromString(@"CGVirtualDisplayDescriptor");
       const Class display_class = NSClassFromString(@"CGVirtualDisplay");
       const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
@@ -841,7 +849,11 @@ namespace platf::macos_virtual_display {
       }
 
       ensure_retina_mode(*result);
-      other_modes.restore(1s);
+      // In exclusive layout, apply_layout() immediately turns off all other displays right after
+      // make_display() returns, so polling other_modes for 1000ms here only stalls connection startup.
+      if (!skip_other_modes_restore) {
+        other_modes.restore(150ms);
+      }
       BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << result->pixel_width << 'x' << result->pixel_height << '@' << refresh << "Hz"sv
                       << (make_hdr ? " HDR"sv : ""sv)
                       << (hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
@@ -852,7 +864,8 @@ namespace platf::macos_virtual_display {
     std::unique_ptr<virtual_display_t> create(const video::config_t &config) {
       const double refresh = config.framerateX100 > 0 ? config.framerateX100 / 100.0 : config.framerate;
       const bool hdr = config.dynamicRange > 0 && !config.prefer_sdr_10bit && !config.force_sdr;
-      auto result = make_display(@PROJECT_NAME, serial_number, config.width, config.height, refresh, hdr);
+      const bool exclusive_layout = (config::video.virtual_display_layout == config::video_t::virtual_display_layout_e::exclusive);
+      auto result = make_display(@PROJECT_NAME, serial_number, config.width, config.height, refresh, hdr, exclusive_layout);
       if (!result) {
         BOOST_LOG(warning) << "Virtual display: streaming the physical display instead"sv;
         return nullptr;
@@ -904,9 +917,9 @@ namespace platf::macos_virtual_display {
                    3s);
       }
       if (turned_off_modes) {
-        turned_off_modes->restore(500ms);
+        turned_off_modes->restore(100ms);
       }
-      other_modes.restore(500ms);
+      other_modes.restore(100ms);
     }
 
     void release() {
