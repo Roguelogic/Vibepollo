@@ -35,6 +35,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+#include <net/if.h>
 #include <net/if_dl.h>
 #include <poll.h>
 #include <pwd.h>
@@ -673,8 +674,8 @@ namespace platf {
         };
         thread_time_constraint_policy_data_t policy {};
         policy.period = ns_to_abs(8'333'333);       // 120 Hz cadence (8.33 ms)
-        policy.computation = ns_to_abs(2'000'000);  // 2.0 ms nominal compute budget
-        policy.constraint = ns_to_abs(4'000'000);   // 4.0 ms scheduling constraint
+        policy.computation = ns_to_abs(5'000'000);  // 5.0 ms RT compute budget (prevents mid-frame demotion)
+        policy.constraint = ns_to_abs(8'000'000);   // 8.0 ms deadline within one 120 Hz VSync
         policy.preemptible = TRUE;
         thread_policy_set(
           mach_thread_self(),
@@ -792,6 +793,58 @@ namespace platf {
     ssize_t sendmsg_x(int s, const struct msghdr_x *msgp, u_int cnt, int flags);
   }
 
+  // On multi-homed Macs where wired `en0` (e.g. 192.168.1.209) and Wi-Fi `en1` (e.g. 192.168.1.214)
+  // share the same IPv4 subnet on a wildcard `0.0.0.0` UDP socket, passing `ipi_ifindex = 0` in
+  // `IP_PKTINFO` lets XNU's unscoped route lookup pick `en1` (when `en1` has a lower link index
+  // than `en0`), transmitting 100% of 120fps RTP packets out of the Mac's Wi-Fi radio instead of
+  // wired Ethernet! Resolve and pin the exact outbound `ifindex` matching `src_addr` (preferring `en0`).
+  unsigned int resolve_ipv4_outbound_ifindex(in_addr_t src_addr) {
+    if (src_addr == 0) {
+      return 0;
+    }
+    struct cache_entry_t {
+      in_addr_t addr {};
+      unsigned int ifindex {};
+    };
+    static std::mutex cache_mutex;
+    static std::chrono::steady_clock::time_point last_refresh {};
+    static std::vector<cache_entry_t> entries;
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock {cache_mutex};
+    if (entries.empty() || (now - last_refresh) >= std::chrono::seconds(5)) {
+      entries.clear();
+      last_refresh = now;
+      ifaddrs *ifaddr = nullptr;
+      if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+        // Insert `en0` first if multiple interfaces ever alias.
+        for (int pass = 0; pass < 2; ++pass) {
+          for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || ifa->ifa_addr->sa_family != AF_INET) {
+              continue;
+            }
+            const bool is_en0 = (std::strcmp(ifa->ifa_name, "en0") == 0);
+            if ((pass == 0) != is_en0) {
+              continue;
+            }
+            const in_addr_t a = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+            const unsigned int idx = if_nametoindex(ifa->ifa_name);
+            if (a != 0 && idx != 0) {
+              entries.push_back({a, idx});
+            }
+          }
+        }
+        freeifaddrs(ifaddr);
+      }
+    }
+    for (const auto &e : entries) {
+      if (e.addr == src_addr) {
+        return e.ifindex;
+      }
+    }
+    return 0;
+  }
+
   bool send_batch(batched_send_info_t &send_info) {
     if (send_info.block_count == 0) {
       return true;
@@ -839,7 +892,7 @@ namespace platf {
         struct in_pktinfo pktInfo {};
         struct sockaddr_in saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
         pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
-        pktInfo.ipi_ifindex = 0;
+        pktInfo.ipi_ifindex = resolve_ipv4_outbound_ifindex(saddr_v4.sin_addr.s_addr);
 
         cmbuflen += CMSG_SPACE(sizeof(pktInfo));
         pktinfo_cm->cmsg_level = IPPROTO_IP;
@@ -972,7 +1025,7 @@ namespace platf {
 
       struct sockaddr_in saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
       pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
-      pktInfo.ipi_ifindex = 0;
+      pktInfo.ipi_ifindex = resolve_ipv4_outbound_ifindex(saddr_v4.sin_addr.s_addr);
 
       cmbuflen += CMSG_SPACE(sizeof(pktInfo));
 
@@ -1088,20 +1141,13 @@ namespace platf {
       }
     }
 
+    // Set DSCP (when requested) and L4S ECN `ECT(1)` (0x01, RFC 9331) on outgoing video UDP
+    // packets so Apple/L4S-capable Wi-Fi APs and clients apply low-latency AQM without drops.
+    const int ecn_bits = (data_type == qos_data_type_e::video) ? 0x01 : 0x00;
+    int dscp = 0;
     if (dscp_tagging) {
-      int level;
-      int option;
-      if (address.is_v6()) {
-        level = IPPROTO_IPV6;
-        option = IPV6_TCLASS;
-      } else {
-        level = IPPROTO_IP;
-        option = IP_TOS;
-      }
-
       // The specific DSCP values here are chosen to be consistent with Windows,
       // except that we use CS6 instead of CS7 for audio traffic.
-      int dscp = 0;
       switch (data_type) {
         case qos_data_type_e::video:
           dscp = 40;
@@ -1113,17 +1159,16 @@ namespace platf {
           BOOST_LOG(error) << "Unknown traffic type: "sv << (int) data_type;
           break;
       }
+    }
 
-      if (dscp) {
-        // Shift to put the DSCP value in the correct position in the TOS field
-        dscp <<= 2;
-
-        if (setsockopt(sockfd, level, option, &dscp, sizeof(dscp)) == 0) {
-          // Reset TOS to -1 when QoS is disabled
-          reset_options.emplace_back(std::make_tuple(level, option, -1));
-        } else {
-          BOOST_LOG(error) << "Failed to set TOS/TCLASS: "sv << errno;
-        }
+    const int tos = (dscp << 2) | ecn_bits;
+    if (tos != 0) {
+      const int level = address.is_v6() ? IPPROTO_IPV6 : IPPROTO_IP;
+      const int option = address.is_v6() ? IPV6_TCLASS : IP_TOS;
+      if (setsockopt(sockfd, level, option, &tos, sizeof(tos)) == 0) {
+        reset_options.emplace_back(std::make_tuple(level, option, 0));
+      } else {
+        BOOST_LOG(error) << "Failed to set TOS/TCLASS: "sv << errno;
       }
     }
 
@@ -1200,6 +1245,214 @@ namespace platf {
     return {};
   }
 }  // namespace platf
+
+@interface VibepolloPenHoverView: NSView
+@property (nonatomic, assign) int distanceStep;
+@property (nonatomic, assign) BOOL eraserMode;
+@end
+
+@implementation VibepolloPenHoverView
+- (BOOL)isOpaque {
+  return NO;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void) dirtyRect;
+  CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
+  if (!ctx) {
+    return;
+  }
+  CGContextClearRect(ctx, self.bounds);
+  const CGFloat cx = NSMidX(self.bounds);
+  const CGFloat cy = NSMidY(self.bounds);
+
+  if (self.eraserMode) {
+    // Windows-style hollow circular eraser tip with high-contrast dual ring.
+    const CGFloat r = 5.8;
+    CGContextSetRGBStrokeColor(ctx, 0.08, 0.08, 0.10, 0.88);
+    CGContextSetLineWidth(ctx, 2.6);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - r, cy - r, r * 2.0, r * 2.0));
+
+    CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, 0.96);
+    CGContextSetLineWidth(ctx, 1.4);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - r, cy - r, r * 2.0, r * 2.0));
+    return;
+  }
+
+  // Subtle distance-reactive outer hover ring (tightens toward the tip as Pencil approaches glass).
+  const CGFloat norm = std::clamp<CGFloat>(self.distanceStep / 8.0, 0.0, 1.0);
+  if (self.distanceStep > 0) {
+    const CGFloat haloR = 4.6 + norm * 3.6;
+    const CGFloat haloAlpha = 0.58 - norm * 0.22;
+    CGContextSetRGBStrokeColor(ctx, 0.06, 0.06, 0.08, haloAlpha * 0.55);
+    CGContextSetLineWidth(ctx, 1.8);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - haloR, cy - haloR, haloR * 2.0, haloR * 2.0));
+
+    CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, haloAlpha);
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - haloR, cy - haloR, haloR * 2.0, haloR * 2.0));
+  }
+
+  // Windows 11-style crisp precision stylus dot: high-contrast dark border + bright white core,
+  // clearly distinct from the macOS mouse arrow and readable on both dark and light surfaces.
+  const CGFloat outerR = 3.1;
+  CGContextSetRGBFillColor(ctx, 0.07, 0.07, 0.09, 0.94);
+  CGContextFillEllipseInRect(ctx, CGRectMake(cx - outerR, cy - outerR, outerR * 2.0, outerR * 2.0));
+
+  const CGFloat innerR = 1.95;
+  CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 0.99);
+  CGContextFillEllipseInRect(ctx, CGRectMake(cx - innerR, cy - innerR, innerR * 2.0, innerR * 2.0));
+}
+@end
+
+namespace {
+  struct pen_hover_overlay_state_t {
+    std::mutex mutex;
+    bool visible = false;
+    double cg_x = 0.0;
+    double cg_y = 0.0;
+    int distance_step = 0;
+    bool eraser = false;
+    bool dispatch_pending = false;
+  };
+
+  pen_hover_overlay_state_t &pen_hover_state() {
+    static pen_hover_overlay_state_t s;
+    return s;
+  }
+
+  void apply_pen_hover_on_main() {
+    static NSWindow *sWindow = nil;
+    static VibepolloPenHoverView *sView = nil;
+    constexpr CGFloat kWinSize = 28.0;
+
+    bool visible = false;
+    double cg_x = 0.0;
+    double cg_y = 0.0;
+    int distance_step = 0;
+    bool eraser = false;
+    {
+      auto &st = pen_hover_state();
+      std::lock_guard lock(st.mutex);
+      st.dispatch_pending = false;
+      visible = st.visible;
+      cg_x = st.cg_x;
+      cg_y = st.cg_y;
+      distance_step = st.distance_step;
+      eraser = st.eraser;
+    }
+
+    if (!visible) {
+      if (sWindow != nil && sWindow.alphaValue > 0.0) {
+        [sWindow setAlphaValue:0.0];
+      }
+      return;
+    }
+
+    platf::ensure_appkit_session();
+    if (sWindow == nil) {
+      NSRect rect = NSMakeRect(0, 0, kWinSize, kWinSize);
+      sWindow = [[NSWindow alloc] initWithContentRect:rect
+                                            styleMask:NSWindowStyleMaskBorderless
+                                              backing:NSBackingStoreBuffered
+                                                defer:NO];
+      [sWindow setReleasedWhenClosed:NO];
+      [sWindow setOpaque:NO];
+      [sWindow setBackgroundColor:NSColor.clearColor];
+      [sWindow setHasShadow:NO];
+      [sWindow setIgnoresMouseEvents:YES];
+      [sWindow setHidesOnDeactivate:NO];
+      [sWindow setCanHide:NO];
+      [sWindow setExcludedFromWindowsMenu:YES];
+      [sWindow setRestorable:NO];
+      [sWindow setTabbingMode:NSWindowTabbingModeDisallowed];
+      [sWindow setSharingType:NSWindowSharingReadOnly];
+      [sWindow setAnimationBehavior:NSWindowAnimationBehaviorNone];
+      [sWindow setLevel:NSScreenSaverWindowLevel];
+      [sWindow setCollectionBehavior:(NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                      NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                      NSWindowCollectionBehaviorStationary |
+                                      NSWindowCollectionBehaviorIgnoresCycle)];
+      sView = [[VibepolloPenHoverView alloc] initWithFrame:rect];
+      sView.distanceStep = -1;
+      [sWindow setContentView:sView];
+      [sWindow setAlphaValue:1.0];
+      [sWindow orderFrontRegardless];
+    }
+
+    const CGFloat primaryH = CGDisplayBounds(CGMainDisplayID()).size.height;
+    const NSPoint origin = NSMakePoint(cg_x - kWinSize * 0.5, (primaryH - cg_y) - kWinSize * 0.5);
+    if (!NSEqualPoints(sWindow.frame.origin, origin)) {
+      [sWindow setFrameOrigin:origin];
+    }
+
+    const BOOL wantEraser = eraser ? YES : NO;
+    if (sView.distanceStep != distance_step || sView.eraserMode != wantEraser) {
+      sView.distanceStep = distance_step;
+      sView.eraserMode = wantEraser;
+      [sView setNeedsDisplay:YES];
+    }
+    if (sWindow.alphaValue < 1.0) {
+      [sWindow setAlphaValue:1.0];
+    }
+    if (!sWindow.visible) {
+      [sWindow orderFrontRegardless];
+    }
+  }
+
+  void schedule_pen_hover_apply() {
+    if (NSThread.isMainThread) {
+      apply_pen_hover_on_main();
+      return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @autoreleasepool {
+        apply_pen_hover_on_main();
+      }
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+  }
+}  // namespace
+
+extern "C" void macos_pen_hover_cursor_show(double cg_x, double cg_y, float distance_norm, bool eraser) {
+  const int step = distance_norm <= 0.0005f ? 0 : std::clamp<int>(static_cast<int>(std::lround(distance_norm * 8.0f)), 1, 8);
+  bool need_schedule = false;
+  {
+    auto &st = pen_hover_state();
+    std::lock_guard lock(st.mutex);
+    st.visible = true;
+    st.cg_x = cg_x;
+    st.cg_y = cg_y;
+    st.distance_step = step;
+    st.eraser = eraser;
+    if (!st.dispatch_pending) {
+      st.dispatch_pending = true;
+      need_schedule = true;
+    }
+  }
+  if (need_schedule) {
+    schedule_pen_hover_apply();
+  }
+}
+
+extern "C" void macos_pen_hover_cursor_hide(void) {
+  bool need_schedule = false;
+  {
+    auto &st = pen_hover_state();
+    std::lock_guard lock(st.mutex);
+    if (!st.visible && !st.dispatch_pending) {
+      return;
+    }
+    st.visible = false;
+    if (!st.dispatch_pending) {
+      st.dispatch_pending = true;
+      need_schedule = true;
+    }
+  }
+  if (need_schedule) {
+    schedule_pen_hover_apply();
+  }
+}
 
 namespace dyn {
   void *handle(const std::vector<const char *> &libs) {

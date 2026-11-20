@@ -2342,17 +2342,77 @@ namespace input {
           return;
       }
     }
+    const bool fast_inline_eligible = (packet->magic == MOUSE_MOVE_REL_MAGIC_GEN5 ||
+                                       packet->magic == MOUSE_MOVE_ABS_MAGIC ||
+                                       packet->magic == SCROLL_MAGIC_GEN5 ||
+                                       packet->magic == SS_HSCROLL_MAGIC ||
+                                       packet->magic == SS_PEN_MAGIC ||
+                                       packet->magic == SS_TOUCH_MAGIC);
+    bool run_inline = false;
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
       if (input->input_closed) {
         return;
       }
-      input->input_queue.push_back({
-        std::move(input_data),
-        input->guide_permission_state.load(std::memory_order_acquire),
-        (permission & crypto::PERM::input_controller) != crypto::PERM::_no,
-      });
-      schedule_input_task = geometry::request_serialized_worker_wake(input->input_queue_task_scheduled);
+      if (fast_inline_eligible &&
+          input->input_queue.empty() &&
+          !input->input_queue_task_scheduled.load(std::memory_order_relaxed)) {
+        // Direct real-time injection (GFN/Parsec-style): execute continuous pointer/scroll/pen/touch packets
+        // immediately on stream::controlBroadcast without a task_pool condition_variable hop.
+        input->input_queue_task_scheduled.store(true, std::memory_order_release);
+        run_inline = true;
+      } else {
+        input->input_queue.push_back({
+          std::move(input_data),
+          input->guide_permission_state.load(std::memory_order_acquire),
+          (permission & crypto::PERM::input_controller) != crypto::PERM::_no,
+        });
+        schedule_input_task = geometry::request_serialized_worker_wake(input->input_queue_task_scheduled);
+      }
+    }
+    if (run_inline) {
+      if (packet->magic == MOUSE_MOVE_ABS_MAGIC ||
+          packet->magic == SS_PEN_MAGIC ||
+          packet->magic == SS_TOUCH_MAGIC) {
+        refresh_input_geometry(input);
+      }
+      auto *payload = reinterpret_cast<PNV_INPUT_HEADER>(input_data.data());
+      input::print((void *) payload);
+      switch (packet->magic) {
+        case MOUSE_MOVE_REL_MAGIC_GEN5:
+          passthrough(input, reinterpret_cast<PNV_REL_MOUSE_MOVE_PACKET>(payload));
+          break;
+        case MOUSE_MOVE_ABS_MAGIC:
+          passthrough(input, reinterpret_cast<PNV_ABS_MOUSE_MOVE_PACKET>(payload));
+          break;
+        case SCROLL_MAGIC_GEN5:
+          passthrough(input, reinterpret_cast<PNV_SCROLL_PACKET>(payload));
+          break;
+        case SS_HSCROLL_MAGIC:
+          passthrough(input, reinterpret_cast<PSS_HSCROLL_PACKET>(payload));
+          break;
+        case SS_TOUCH_MAGIC:
+          passthrough(input, reinterpret_cast<PSS_TOUCH_PACKET>(payload));
+          break;
+        case SS_PEN_MAGIC:
+          passthrough(input, reinterpret_cast<PSS_PEN_PACKET>(payload));
+          break;
+      }
+      bool handoff_remaining = false;
+      {
+        std::lock_guard<std::mutex> lg(input->input_queue_lock);
+        if (input->input_queue.empty() && !input->input_closed) {
+          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+        } else if (!input->input_closed) {
+          handoff_remaining = true;
+        } else {
+          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+        }
+      }
+      if (handoff_remaining) {
+        task_pool.push(passthrough_next_message, input);
+      }
+      return;
     }
     if (schedule_input_task) {
       task_pool.push(passthrough_next_message, input);
