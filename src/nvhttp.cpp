@@ -50,6 +50,11 @@
 #ifdef _WIN32
   #include "platform/windows/hotkey_manager.h"
 #endif
+#ifdef __APPLE__
+  #include <arpa/inet.h>
+  #include <ifaddrs.h>
+  #include <net/if.h>
+#endif
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "file_handler.h"
@@ -3705,6 +3710,21 @@ namespace nvhttp {
       }
     }
 
+    // moonlight-qt (PcView.qml:307) has an unimplemented `onRejected: // FIXME: We should interrupt pairing here`,
+    // leaving cancelled `PendingPairingTask` QNetworkReply sockets waiting with `timeoutMs = 0`.
+    // Immediately returning Error 409 (or closing the socket) when the user clicks to pair again causes
+    // the orphaned task #1 to emit `pairingCompleted(error)` and immediately close `pairDialog` #2 in a
+    // permanent ping-pong loop. Parking superseded responses silently prevents task #1 from killing `pairDialog` #2.
+    std::vector<decltype(pair_session_t::async_insert_pin.response)> parked_superseded_pairing_responses;
+
+    void park_superseded_pairing_response(pair_session_t &session) {
+      constexpr std::size_t max_parked = 8;
+      if (parked_superseded_pairing_responses.size() >= max_parked) {
+        parked_superseded_pairing_responses.erase(parked_superseded_pairing_responses.begin());
+      }
+      parked_superseded_pairing_responses.push_back(std::move(session.async_insert_pin.response));
+    }
+
     void expire_pairing_sessions_locked(const std::chrono::steady_clock::time_point now) {
       for (auto session = map_id_sess.begin(); session != map_id_sess.end();) {
         if (now - session->second.created_at <= pairing_session_expiry) {
@@ -4190,7 +4210,7 @@ namespace nvhttp {
             return;
           }
           if (replacing) {
-            close_pending_pairing_response(existing->second, 409, "Pairing request replaced by a newer request from the same client"sv);
+            park_superseded_pairing_response(existing->second);
             map_id_sess.erase(existing);
           }
           pair_session_t sess;
@@ -4490,15 +4510,56 @@ namespace nvhttp {
       // always be an IPv4 address. If we return that same IPv6 address here, it will clobber the
       // stored LAN IPv4 address. To avoid this, we need to return an IPv4 address in this field
       // when we get a request over IPv6.
-      //
-      // HACK: We should return the IPv4 address of local interface here, but we don't currently
-      // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
-      // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
-      // support know to ignore this bogus address.
-      if (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped()) {
+      const auto preferred_local = [&]() -> boost::asio::ip::address {
+        auto addr = local_endpoint.address();
+#ifdef __APPLE__
+        if (config::sunshine.bind_address.empty()) {
+          ifaddrs *ifaddr = nullptr;
+          if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+            bool has_en0 = false, en1_same_subnet = false;
+            uint32_t en0_addr_net = 0, en0_mask = 0, en1_addr_net = 0;
+            boost::asio::ip::address_v4 en0_v4;
+            for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+              if (!ifa->ifa_addr || !ifa->ifa_netmask || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || ifa->ifa_addr->sa_family != AF_INET) {
+                continue;
+              }
+              const uint32_t a = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+              const uint32_t m = reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr;
+              if (std::strcmp(ifa->ifa_name, "en0") == 0 && a != 0) {
+                has_en0 = true;
+                en0_addr_net = a;
+                en0_mask = m;
+                en0_v4 = boost::asio::ip::address_v4(ntohl(a));
+              } else if (std::strcmp(ifa->ifa_name, "en1") == 0 && a != 0) {
+                en1_addr_net = a;
+              }
+            }
+            if (has_en0 && en1_addr_net != 0 && (en1_addr_net & en0_mask) == (en0_addr_net & en0_mask)) {
+              en1_same_subnet = true;
+            }
+            freeifaddrs(ifaddr);
+            if (en1_same_subnet) {
+              if (addr.is_v4() && htonl(addr.to_v4().to_uint()) == en1_addr_net) {
+                return en0_v4;
+              }
+              if (addr.is_v6() && addr.to_v6().is_v4_mapped() &&
+                  htonl(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, addr.to_v6()).to_uint()) == en1_addr_net) {
+                return en0_v4;
+              }
+              if (addr.is_v6() && addr.to_v6().is_link_local()) {
+                return en0_v4;
+              }
+            }
+          }
+        }
+#endif
+        return addr;
+      }();
+
+      if (preferred_local.is_v6() && !preferred_local.to_v6().is_v4_mapped()) {
         tree.put("root.LocalIP", "127.0.0.1");
       } else {
-        tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
+        tree.put("root.LocalIP", net::addr_to_normalized_string(preferred_local));
       }
 
 #ifdef _WIN32
@@ -5489,7 +5550,34 @@ launch_session->exact_target_hold.reset();
           std::format(
             "{}{}:{}",
             launch_session->rtsp_url_scheme,
-            net::addr_to_url_escaped_string(request->local_endpoint().address()),
+            net::addr_to_url_escaped_string([&]() {
+              auto addr = request->local_endpoint().address();
+#ifdef __APPLE__
+              if (config::sunshine.bind_address.empty()) {
+                ifaddrs *ifaddr = nullptr;
+                if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+                  bool has_en0 = false;
+                  uint32_t en0_a = 0, en0_m = 0, en1_a = 0;
+                  for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+                    if (!ifa->ifa_addr || !ifa->ifa_netmask || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || ifa->ifa_addr->sa_family != AF_INET) continue;
+                    const uint32_t a = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+                    const uint32_t m = reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr;
+                    if (std::strcmp(ifa->ifa_name, "en0") == 0 && a != 0) { has_en0 = true; en0_a = a; en0_m = m; }
+                    else if (std::strcmp(ifa->ifa_name, "en1") == 0 && a != 0) { en1_a = a; }
+                  }
+                  freeifaddrs(ifaddr);
+                  if (has_en0 && en1_a != 0 && (en1_a & en0_m) == (en0_a & en0_m)) {
+                    const uint32_t v4_net = addr.is_v4() ? htonl(addr.to_v4().to_uint()) :
+                                            (addr.is_v6() && addr.to_v6().is_v4_mapped() ? htonl(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, addr.to_v6()).to_uint()) : 0);
+                    if (v4_net == en1_a || (addr.is_v6() && addr.to_v6().is_link_local())) {
+                      return boost::asio::ip::address {boost::asio::ip::address_v4(ntohl(en0_a))};
+                    }
+                  }
+                }
+              }
+#endif
+              return addr;
+            }()),
             static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
           )
         );
@@ -6087,7 +6175,34 @@ launch_session->exact_target_hold.reset();
         std::format(
           "{}{}:{}",
           launch_session->rtsp_url_scheme,
-          net::addr_to_url_escaped_string(request->local_endpoint().address()),
+          net::addr_to_url_escaped_string([&]() {
+            auto addr = request->local_endpoint().address();
+#ifdef __APPLE__
+            if (config::sunshine.bind_address.empty()) {
+              ifaddrs *ifaddr = nullptr;
+              if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+                bool has_en0 = false;
+                uint32_t en0_a = 0, en0_m = 0, en1_a = 0;
+                for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+                  if (!ifa->ifa_addr || !ifa->ifa_netmask || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || ifa->ifa_addr->sa_family != AF_INET) continue;
+                  const uint32_t a = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+                  const uint32_t m = reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr;
+                  if (std::strcmp(ifa->ifa_name, "en0") == 0 && a != 0) { has_en0 = true; en0_a = a; en0_m = m; }
+                  else if (std::strcmp(ifa->ifa_name, "en1") == 0 && a != 0) { en1_a = a; }
+                }
+                freeifaddrs(ifaddr);
+                if (has_en0 && en1_a != 0 && (en1_a & en0_m) == (en0_a & en0_m)) {
+                  const uint32_t v4_net = addr.is_v4() ? htonl(addr.to_v4().to_uint()) :
+                                          (addr.is_v6() && addr.to_v6().is_v4_mapped() ? htonl(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, addr.to_v6()).to_uint()) : 0);
+                  if (v4_net == en1_a || (addr.is_v6() && addr.to_v6().is_link_local())) {
+                    return boost::asio::ip::address {boost::asio::ip::address_v4(ntohl(en0_a))};
+                  }
+                }
+              }
+            }
+#endif
+            return addr;
+          }()),
           static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
         )
       );
@@ -6881,7 +6996,34 @@ launch_session->exact_target_hold.reset();
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string([&]() {
+          auto addr = request->local_endpoint().address();
+#ifdef __APPLE__
+          if (config::sunshine.bind_address.empty()) {
+            ifaddrs *ifaddr = nullptr;
+            if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+              bool has_en0 = false;
+              uint32_t en0_a = 0, en0_m = 0, en1_a = 0;
+              for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || !ifa->ifa_netmask || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || ifa->ifa_addr->sa_family != AF_INET) continue;
+                const uint32_t a = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+                const uint32_t m = reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr;
+                if (std::strcmp(ifa->ifa_name, "en0") == 0 && a != 0) { has_en0 = true; en0_a = a; en0_m = m; }
+                else if (std::strcmp(ifa->ifa_name, "en1") == 0 && a != 0) { en1_a = a; }
+              }
+              freeifaddrs(ifaddr);
+              if (has_en0 && en1_a != 0 && (en1_a & en0_m) == (en0_a & en0_m)) {
+                const uint32_t v4_net = addr.is_v4() ? htonl(addr.to_v4().to_uint()) :
+                                        (addr.is_v6() && addr.to_v6().is_v4_mapped() ? htonl(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, addr.to_v6()).to_uint()) : 0);
+                if (v4_net == en1_a || (addr.is_v6() && addr.to_v6().is_link_local())) {
+                  return boost::asio::ip::address {boost::asio::ip::address_v4(ntohl(en0_a))};
+                }
+              }
+            }
+          }
+#endif
+          return addr;
+        }()),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
@@ -7921,6 +8063,7 @@ launch_session->exact_target_hold.reset();
     {
       std::lock_guard pairing_lock {pairing_sessions_mutex};
       map_id_sess.clear();
+      parked_superseded_pairing_responses.clear();
     }
     https_server.stop();
     http_server.stop();

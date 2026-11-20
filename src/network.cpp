@@ -163,6 +163,18 @@ namespace net {
     if (host) {
       // Enable opportunistic QoS tagging (automatically disables if the network appears to drop tagged packets)
       enet_socket_set_option(host->socket, ENET_SOCKOPT_QOS, 1);
+#ifdef __APPLE__
+      // Tag the ENet control UDP socket with macOS WMM Voice (AC_VO) link-layer priority and L4S ECT(1)
+      // so bidirectional input ACKs, IDR requests, and feedback bypass best-effort Wi-Fi queues.
+      const int svc_vo = NET_SERVICE_TYPE_VO;
+      (void) setsockopt(host->socket, SOL_SOCKET, SO_NET_SERVICE_TYPE, &svc_vo, sizeof(svc_vo));
+      const int tos = (48 << 2) | 0x01;  // CS6 + L4S ECT(1)
+      if (use_ipv4) {
+        (void) setsockopt(host->socket, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+      } else {
+        (void) setsockopt(host->socket, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
+      }
+#endif
     }
 
     return host;

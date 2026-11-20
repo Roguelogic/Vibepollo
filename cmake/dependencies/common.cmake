@@ -12,6 +12,9 @@ include(dependencies/Boost_Sunshine)
 # moonlight common library
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
+if(APPLE AND TARGET enet)
+    target_compile_options(enet PRIVATE -include "${CMAKE_SOURCE_DIR}/src/platform/macos/enet_pktinfo_shim.h")
+endif()
 
 # web server
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")

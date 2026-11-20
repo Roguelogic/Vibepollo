@@ -2331,6 +2331,7 @@ namespace rtsp_stream {
     }
 
     // Initialize any omitted parameters to defaults
+    const bool client_sent_dynamic_range = args.contains("x-nv-video[0].dynamicRangeMode"sv);
     args.try_emplace("x-nv-video[0].encoderCscMode"sv, "0"sv);
     args.try_emplace("x-nv-vqos[0].bitStreamFormat"sv, "0"sv);
     args.try_emplace("x-nv-video[0].dynamicRangeMode"sv, "0"sv);
@@ -2609,9 +2610,16 @@ namespace rtsp_stream {
     } else if (config.monitor.dynamicRange == 0) {
       // A PyroWave bitstream does not carry its bit depth: the client sizes its planes
       // from the profile it negotiated, so never upgrade an 8-bit PyroWave request.
-      if (session->enable_hdr && supports_10bit_dynamic_range && !pyrowave_session) {
-        BOOST_LOG(info) << "RTSP ANNOUNCE requested SDR while launch HDR is enabled; using HDR 10-bit encode";
+      // Likewise, only upgrade when dynamicRangeMode was omitted by a legacy pre-v7 client:
+      // when a v7+ client explicitly sends dynamicRangeMode=0 (e.g. AV1+HDR selected on a host
+      // without AV1 Main10, causing client fallback to 8-bit SDR HEVC), its renderer is SDR,
+      // so forcing 10-bit BT.2020 PQ produces washed-out un-tonemapped colors.
+      if (!client_sent_dynamic_range && session->enable_hdr && supports_10bit_dynamic_range && !pyrowave_session) {
+        BOOST_LOG(info) << "RTSP ANNOUNCE omitted dynamicRangeMode while launch HDR is enabled; using HDR 10-bit encode";
         config.monitor.dynamicRange = 1;
+        config.monitor.encoderCscMode &= ~0x1;
+      } else if (client_sent_dynamic_range && session->enable_hdr) {
+        BOOST_LOG(info) << "RTSP ANNOUNCE explicitly requested SDR after codec negotiation; keeping SDR encode to match client renderer";
       }
     }
     apply_rtx_hdr_stream_policy(config.monitor);
