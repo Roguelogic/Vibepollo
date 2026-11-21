@@ -41,7 +41,6 @@
 #include "virtual_display_scale.h"
 #include "config_key.h"
 #include "config_playnite.h"
-#include "config_lutris.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "config_steam.h"

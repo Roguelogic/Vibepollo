@@ -1,60 +1,16 @@
-# common compile definitions
-# this file will also load platform specific definitions
+# common compile definitions (macOS)
 
 list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
-# Wall - enable all warnings
-# Werror - treat warnings as errors
-# Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
-# Wno-sign-compare - disable warnings for signed/unsigned comparisons
-# Wno-restrict - disable warnings for memory overlap
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # GCC specific compile options
-
-    # GCC 12 and higher will complain about maybe-uninitialized
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
-        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-maybe-uninitialized)
-
-        # Disable the bogus warning that may prevent compilation (only for GCC 12).
-        # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105651.
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
-            list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-restrict)
-        endif()
-    endif()
-
-    # GCC 15 will complain about uninitialized variables in some cases (Simple-Web-Server)
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
-        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
-    endif()
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    # Clang specific compile options
-
-    # Clang doesn't actually complain about this this, so disabling for now
-    # list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
-endif()
 if(BUILD_WERROR)
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Werror)
 endif()
 
-# setup assets directory
 if(NOT SUNSHINE_ASSETS_DIR)
     set(SUNSHINE_ASSETS_DIR "assets")
 endif()
 
-# platform specific compile definitions
-if(WIN32)
-    include(${CMAKE_MODULE_PATH}/compile_definitions/windows.cmake)
-elseif(UNIX)
-    include(${CMAKE_MODULE_PATH}/compile_definitions/unix.cmake)
-
-    if(APPLE)
-        include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
-    else()
-        include(${CMAKE_MODULE_PATH}/compile_definitions/linux.cmake)
-    endif()
-endif()
-
-file(GLOB NVENC_SOURCES CONFIGURE_DEPENDS "src/nvenc/*.cpp" "src/nvenc/*.h")
-list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
+include(${CMAKE_MODULE_PATH}/compile_definitions/unix.cmake)
+include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
 
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
@@ -121,10 +77,7 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
         "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/config_http_policy.cpp"
-        "${CMAKE_SOURCE_DIR}/src/confighttp_playnite.cpp"
         "${CMAKE_SOURCE_DIR}/src/confighttp_steam.cpp"
-        "${CMAKE_SOURCE_DIR}/src/confighttp_lutris.cpp"
-        "${CMAKE_SOURCE_DIR}/src/confighttp_rtss.cpp"
         "${CMAKE_SOURCE_DIR}/src/confighttp.h"
         "${CMAKE_SOURCE_DIR}/src/webrtc_stream.cpp"
         "${CMAKE_SOURCE_DIR}/src/webrtc_stream.h"
@@ -181,21 +134,12 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/managed_app_focus.cpp"
         "${CMAKE_SOURCE_DIR}/src/steam_process_tracker.cpp"
         "${CMAKE_SOURCE_DIR}/src/steam_process_tracker.h"
-        "${CMAKE_SOURCE_DIR}/src/lutris_integration.cpp"
-        "${CMAKE_SOURCE_DIR}/src/lutris_integration.h"
-        "${CMAKE_SOURCE_DIR}/src/lutris_artwork.cpp"
-        "${CMAKE_SOURCE_DIR}/src/lutris_artwork.h"
-        "${CMAKE_SOURCE_DIR}/src/lutris_sync_policy.cpp"
-        "${CMAKE_SOURCE_DIR}/src/lutris_sync_policy.h"
-        "${CMAKE_SOURCE_DIR}/src/lutris_auto_sync.cpp"
-        "${CMAKE_SOURCE_DIR}/src/lutris_auto_sync.h"
         "${CMAKE_SOURCE_DIR}/src/config_steam.cpp"
         "${CMAKE_SOURCE_DIR}/src/config_steam.h"
-        "${CMAKE_SOURCE_DIR}/src/config_lutris.cpp"
-        "${CMAKE_SOURCE_DIR}/src/config_lutris.h"
+        "${CMAKE_SOURCE_DIR}/src/provider_scan_protocol.cpp"
+        "${CMAKE_SOURCE_DIR}/src/provider_scan_protocol.h"
         "${CMAKE_SOURCE_DIR}/src/app_framegen_config.cpp"
         "${CMAKE_SOURCE_DIR}/src/app_framegen_config.h"
-        "${CMAKE_SOURCE_DIR}/src/platform/linux/smooth_motion_policy.h"
         "${CMAKE_SOURCE_DIR}/src/deferred_action.h"
         "${CMAKE_SOURCE_DIR}/src/paused_app_monitor.h"
         "${CMAKE_SOURCE_DIR}/src/process_catalog.cpp"
@@ -252,7 +196,6 @@ if(NOT SUNSHINE_ASSETS_DIR_DEF)
     set(SUNSHINE_ASSETS_DIR_DEF "${SUNSHINE_ASSETS_DIR}")
 endif()
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_ASSETS_DIR_DEF}")
-
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
 
 # Publisher metadata
@@ -266,55 +209,16 @@ include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
 
 set(SUNSHINE_FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
 
-# Minimal FFmpeg bundles used by Vibepollo intentionally omit still-image
-# codecs. Windows packages must include the image libraries so Steam covers
-# can always be converted to client-compatible PNGs.
-if(WIN32)
-    # The Windows executable is linked statically; do not select DLL import
-    # libraries whose runtime DLLs are not part of the installer payload.
-    set(_steam_artwork_library_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
-    set(CMAKE_FIND_LIBRARY_SUFFIXES .a .lib)
-    # Existing build trees may still cache the DLL import libraries selected
-    # before static linking was required. find_package does not re-search them.
-    foreach(_artwork_library_cache IN ITEMS
-            PNG_LIBRARY_RELEASE PNG_LIBRARY_DEBUG
-            JPEG_LIBRARY_RELEASE JPEG_LIBRARY_DEBUG STEAM_ARTWORK_WEBP_LIBRARY)
-        if("${${_artwork_library_cache}}" MATCHES "\\.dll\\.a$")
-            unset(${_artwork_library_cache} CACHE)
-            unset(${_artwork_library_cache})
-        endif()
-    endforeach()
-    unset(_artwork_library_cache)
-    find_package(PNG REQUIRED)
-    find_package(JPEG REQUIRED)
-    find_library(STEAM_ARTWORK_WEBP_LIBRARY NAMES webp REQUIRED)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_steam_artwork_library_suffixes}")
-    unset(_steam_artwork_library_suffixes)
-else()
-    find_package(PNG QUIET)
-    find_package(JPEG QUIET)
-    find_library(STEAM_ARTWORK_WEBP_LIBRARY NAMES webp)
-endif()
+find_package(PNG QUIET)
+find_package(JPEG QUIET)
+find_library(STEAM_ARTWORK_WEBP_LIBRARY NAMES webp)
 if(PNG_FOUND AND JPEG_FOUND AND STEAM_ARTWORK_WEBP_LIBRARY)
     list(APPEND SUNSHINE_DEFINITIONS VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS=1)
     list(APPEND SUNSHINE_EXTERNAL_LIBRARIES PNG::PNG JPEG::JPEG ${STEAM_ARTWORK_WEBP_LIBRARY})
     set(STEAM_ARTWORK_TEST_DEFINITIONS VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS=1)
     set(STEAM_ARTWORK_TEST_LIBRARIES PNG::PNG JPEG::JPEG ${STEAM_ARTWORK_WEBP_LIBRARY})
 endif()
-# Enable the bounded official Steam CDN fallback in the application target.
-# Focused component tests intentionally omit this definition and inject their
-# own byte fetcher, so they never require network access.
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_STEAM_ARTWORK_NETWORK=1)
-if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # The prepared FFmpeg headers must win over MSYS2's system FFmpeg headers
-    # (which can be older and lack macros like AV_HAS_ATTRIBUTE used by the
-    # bundled internal headers). Use -isystem with -iquote-style precedence so
-    # they are searched before /ucrt64/include.
-    set(SUNSHINE_FFMPEG_INCLUDE_DIRS "")
-    foreach(ffmpeg_dir IN LISTS FFMPEG_INCLUDE_DIRS)
-        add_compile_options("-isystem" "${ffmpeg_dir}")
-    endforeach()
-endif()
 
 include_directories(
         BEFORE
@@ -323,7 +227,6 @@ include_directories(
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include"
         "${CMAKE_SOURCE_DIR}/third-party/nanors"
         "${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl"
-        ${WEBRTC_INCLUDE_DIRS}
         ${SQLITE3_INCLUDE_DIRS}
         # BEFORE prepends these one at a time, so later entries are searched first. Keep OpenSSL
         # and pinned FFmpeg after Opus: on macOS Opus resolves to Homebrew's shared include directory,
@@ -334,18 +237,12 @@ include_directories(
         ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
 )
 
-# Pin the CUDA dispatch ABI after the bulk include list above. FFmpeg bundles
-# may provide an older CudaFunctions layout; every object sharing that table
-# (including TrueHDR and its tests) must use the same repository revision.
-include_directories(BEFORE SYSTEM "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
-
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         ${SQLITE3_LIBRARIES}
         enet
         libdisplaydevice::display_device
-        libvirtualdisplay::driver
         nlohmann_json::nlohmann_json
         ${Opus_LIBRARY}
         ${FFMPEG_LIBRARIES}

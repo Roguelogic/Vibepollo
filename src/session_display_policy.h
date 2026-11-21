@@ -6,9 +6,35 @@
 
 #include "config.h"
 #include "legacy_generated_app_identities.h"
-#include "platform/windows/virtual_display_policy.h"
+
+#include <cstddef>
 
 namespace proc::display_policy {
+  namespace detail {
+    constexpr char ascii_lower(const char value) noexcept {
+      return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value;
+    }
+
+    constexpr bool equals_ascii_ci(const std::string_view lhs, const std::string_view rhs) noexcept {
+      if (lhs.size() != rhs.size()) {
+        return false;
+      }
+      for (std::size_t index = 0; index < lhs.size(); ++index) {
+        if (ascii_lower(lhs[index]) != ascii_lower(rhs[index])) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    constexpr bool is_virtual_display_selection(
+      const std::string_view value,
+      const bool accept_sudovda_alias
+    ) noexcept {
+      return equals_ascii_ci(value, "sunshine:virtual_display") ||
+             (accept_sudovda_alias && equals_ascii_ci(value, "sunshine:sudovda_virtual_display"));
+    }
+  }  // namespace detail
   using preparation_e = config::video_t::dd_t::config_option_e;
 
   // Selecting the desktop applet is an explicit virtual target selection,
@@ -83,8 +109,7 @@ namespace proc::display_policy {
       const auto first = output.find_first_not_of(" \t\r\n");
       if (first == std::string_view::npos) return false;
       output = output.substr(first, output.find_last_not_of(" \t\r\n") - first + 1);
-      // Both host drivers share this token; SudoVDA also accepts its legacy alias.
-      return VDISPLAY::policy::is_virtual_display_selection(output, true);
+      return detail::is_virtual_display_selection(output, true);
     }
     if (session.virtual_display_mode_override &&
         *session.virtual_display_mode_override == config::video_t::virtual_display_mode_e::disabled) {

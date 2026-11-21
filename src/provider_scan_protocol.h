@@ -1,10 +1,9 @@
 /**
  * @file src/provider_scan_protocol.h
- * @brief Bounded protocol for unprivileged Linux provider discovery.
+ * @brief Bounded protocol for Steam provider catalog serialization.
  */
 #pragma once
 
-#include "lutris_integration.h"
 #include "steam_integration.h"
 
 #include <chrono>
@@ -27,39 +26,6 @@ namespace platf::provider_scan {
     std::vector<steam::game_t> games;
   };
 
-  struct lutris_catalog_t {
-    bool database_available = false;
-    bool executable_available = false;
-    std::vector<lutris::game_t> games;
-  };
-
-  // The wire catalog intentionally excludes every user-derived filesystem
-  // path and Steam direct-launch command field. Only an opaque artwork revision
-  // crosses in the catalog; separate ID-only requests return bounded PNG bytes. The machine
-  // host must never open or interpolate desktop-user-controlled provider
-  // content while holding CAP_SYS_ADMIN.
   std::optional<std::string> encode_steam_catalog(const steam_catalog_t &catalog);
-  std::optional<std::string> encode_lutris_catalog(const lutris_catalog_t &catalog);
   std::optional<steam_catalog_t> decode_steam_catalog(std::string_view payload);
-  std::optional<lutris_catalog_t> decode_lutris_catalog(std::string_view payload);
-
-#if defined(__linux__)
-  namespace detail {
-    struct capture_limits_t {
-      std::chrono::milliseconds timeout;
-      std::size_t maximum_bytes;
-    };
-
-    // Exposed for focused tests. Production callers use the fixed wrapper
-    // below, never a caller-controlled executable path.
-    std::optional<std::string> capture_command(
-      const std::filesystem::path &executable,
-      std::string_view verb,
-      capture_limits_t limits
-    );
-  }  // namespace detail
-
-  std::optional<steam_catalog_t> scan_steam_session();
-  std::optional<lutris_catalog_t> scan_lutris_session();
-#endif
 }  // namespace platf::provider_scan

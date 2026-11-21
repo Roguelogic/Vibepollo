@@ -106,8 +106,6 @@
 #ifdef __APPLE__
   #include "platform/macos/virtual_display.h"
 #endif
-// Header-only policy used by shared launch code; safe on every platform.
-#include "tools/playnite_launcher/lossless_scaling_policy.h"
 #include "remote_monitor_profile_policy.h"
 #ifdef _WIN32
   #include "platform/windows/virtual_display.h"

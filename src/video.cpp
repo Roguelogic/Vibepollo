@@ -45,7 +45,9 @@ extern "C" {
 #include "input.h"
 #include "input_geometry_policy.h"
 #include "logging.h"
-#include "nvenc/nvenc_base.h"
+#if !defined(__APPLE__)
+  #include "nvenc/nvenc_base.h"
+#endif
 #include "platform/common.h"
 #include "process.h"
 #include "pyrowave_host.h"
@@ -1293,6 +1295,7 @@ namespace video {
     int inject;
   };
 
+#if !defined(__APPLE__)
   class nvenc_encode_session_t: public encode_session_t {
   public:
     nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device):
@@ -1389,6 +1392,7 @@ namespace video {
     bool force_idr = false;
     bool output_identity_failed = false;
   };
+#endif
 
   class vt_encode_session_t: public encode_session_t {
   public:
@@ -3946,6 +3950,7 @@ namespace video {
     return 0;
   }
 
+#if !defined(__APPLE__)
   int encode_nvenc(
     int64_t frame_nr,
     nvenc_encode_session_t &session,
@@ -3975,6 +3980,7 @@ namespace video {
 
     return 0;
   }
+#endif
 
   int encode_vt(
     int64_t frame_nr,
@@ -4123,8 +4129,10 @@ namespace video {
     int result = -1;
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       result = encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
+#if !defined(__APPLE__)
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       result = encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
+#endif
     } else if (auto amf_session = dynamic_cast<amf_encode_session_t *>(&session)) {
       result = encode_amf(frame_nr, *amf_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     } else if (auto vt_session = dynamic_cast<vt_encode_session_t *>(&session)) {
@@ -4793,6 +4801,7 @@ namespace video {
     return session;
   }
 
+#if !defined(__APPLE__)
   std::unique_ptr<nvenc_encode_session_t> make_nvenc_encode_session(const config_t &client_config, std::unique_ptr<platf::nvenc_encode_device_t> encode_device) {
     if (!encode_device->init_encoder(client_config, encode_device->colorspace)) {
       if (!encode_device->prepare_to_destroy()) {
@@ -4807,6 +4816,7 @@ namespace video {
 
     return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
   }
+#endif
 
   std::unique_ptr<vt_encode_session_t> make_vt_encode_session(const config_t &client_config, std::unique_ptr<platf::vt_encode_device_t> encode_device) {
     if (!encode_device->init_encoder(client_config, encode_device->colorspace)) {
@@ -5021,9 +5031,11 @@ namespace video {
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
+#if !defined(__APPLE__)
     } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
       auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));
       return make_nvenc_encode_session(config, std::move(nvenc_encode_device));
+#endif
     } else if (dynamic_cast<platf::amf_encode_device_t *>(encode_device.get())) {
       auto amf_encode_device = boost::dynamic_pointer_cast<platf::amf_encode_device_t>(std::move(encode_device));
       amf::lifecycle::initialization_failure_e failure;
@@ -6079,6 +6091,7 @@ namespace video {
       // This is useful for KVM switch scenarios where mouse may disappear during streaming
       platf::enable_mouse_keys();
     }
+#if !defined(__APPLE__)
     if (auto *native_session = dynamic_cast<nvenc_encode_session_t *>(session.get());
         native_session && native_session->has_output_identity_failure()) {
       // Signal stream termination before driver teardown can block this thread.
@@ -6086,6 +6099,7 @@ namespace video {
       force_sync_teardown = true;
       return encode_run_result_e::native_nvenc_identity_failed;
     }
+#endif
     if (native_amf_runtime_failed) {
       force_sync_teardown = true;
     }

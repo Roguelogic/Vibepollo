@@ -58,7 +58,6 @@
   #include "logging.h"
   #include "network.h"
   #include "platform/common.h"
-  #include "platform/windows/service_constants.h"
   #include "process.h"
   #include "src/entry_handler.h"
   #include "system_tray_lifecycle.h"

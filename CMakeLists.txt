@@ -1,47 +1,27 @@
 cmake_minimum_required(VERSION 3.20)
-# `CMAKE_CUDA_ARCHITECTURES` requires 3.18
-# `set_source_files_properties` requires 3.18
-# `cmake_path(CONVERT ... TO_NATIVE_PATH_LIST ...)` requires 3.20
-# todo - set this conditionally
 
 project(Vibepollo VERSION 0.0.0
-        DESCRIPTION "Self-hosted game stream host for Moonlight"
-        HOMEPAGE_URL "https://github.com/Nonary/Vibepollo")
+        DESCRIPTION "macOS remote desktop and game stream host for Moonlight"
+        HOMEPAGE_URL "https://github.com/Roguelogic/Vibepollo")
+
+if(NOT APPLE)
+    message(FATAL_ERROR "Vibepollo is a standalone macOS-only host project.")
+endif()
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(NOT DEFINED CMAKE_CUDA_STANDARD)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
 
 set(PROJECT_LICENSE "GPL-3.0-only")
-
 set(PROJECT_FQDN "io.github.Nonary.vibepollo")
-set(WINDOWS_APP_USER_MODEL_ID "Nonary.Vibepollo")
+set(PROJECT_BRIEF_DESCRIPTION "macOS host for Moonlight/Artemis")  # must be <= 35 characters
 
-set(PROJECT_BRIEF_DESCRIPTION "GameStream host for Artemis")  # must be <= 35 characters
-
-set(PROJECT_LONG_DESCRIPTION "Offering low latency, cloud gaming server capabilities with support for AMD, Intel, \
-and Nvidia GPUs for hardware encoding. Software encoding is also available. You can connect to Apollo from any \
-Artemis client on a variety of devices. A web UI and configuration API are available for configuration, client \
-pairing, and integrations.")
-
-# Ensure WiX-specific CPack variables are present early in config generation
-if (WIN32)
-    # WiX requires RTF license; also set stable Upgrade GUID
-    set(CPACK_WIX_LICENSE_RTF "${CMAKE_SOURCE_DIR}/packaging/windows/LICENSE.rtf")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/packaging/windows/LICENSE.rtf")
-    set(CPACK_WIX_UPGRADE_GUID "{E3FA501A-85F8-4187-85A7-D6E6BDC7EDA1}")
-endif()
+set(PROJECT_LONG_DESCRIPTION "Low-latency macOS remote desktop and game streaming host powered by ScreenCaptureKit, \
+VideoToolbox hardware encoding, and CGVirtualDisplay. Connect from Moonlight or Artemis clients with Web UI \
+configuration, client pairing, and LoginWindow pre-login streaming.")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "Setting build type to 'Release' as none was specified.")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
-endif()
-
-if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-    set(FREEBSD ON)
 endif()
 
 # set the module path, used for includes
@@ -59,21 +39,7 @@ include(${CMAKE_MODULE_PATH}/prep/options.cmake)
 # initial prep
 include(${CMAKE_MODULE_PATH}/prep/init.cmake)
 
-# Resolve libvirtualdisplay before platform package templates consume its
-# driver-owned assets. The dependency target itself is added later.
-include(${CMAKE_MODULE_PATH}/dependencies/libvirtualdisplay_source.cmake)
-
-# Native Linux package templates need this value before dependency targets are
-# added. Keep it in the cache so libvirtualdisplay sees the same decision.
-if(SUNSHINE_BUILD_STEAMOS)
-    set(BUILD_VIBESHINE_KWIN_GPU_BRIDGE OFF CACHE BOOL
-            "Build the Vibepollo KWin GPU-association bridge" FORCE)
-else()
-    set(BUILD_VIBESHINE_KWIN_GPU_BRIDGE ON CACHE BOOL
-        "Build the Vibepollo KWin GPU-association bridge" FORCE)
-endif()
-
-# configure special package files, such as sunshine.desktop, Flatpak manifest, Portfile , etc.
+# configure special package files, such as Homebrew formula or Portfile
 include(${CMAKE_MODULE_PATH}/prep/special_package_configuration.cmake)
 
 # Exit early if END_BUILD is ON, i.e. when only generating package manifests
@@ -99,9 +65,6 @@ include(${CMAKE_MODULE_PATH}/targets/common.cmake)
 # packaging
 include(${CMAKE_MODULE_PATH}/packaging/common.cmake)
 
-# Unit tests are part of every project build. Configure packaging first so its
-# globally guarded contracts are initialized in the project scope before test
-# targets consume them.
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

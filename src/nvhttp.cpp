@@ -3110,7 +3110,7 @@ namespace nvhttp {
       auto output_choice = proc::display_policy::app_override_e::inherit;
       if (output) {
         const auto trimmed = boost::algorithm::trim_copy(*output);
-        output_choice = !trimmed.empty() && VDISPLAY::policy::is_virtual_display_selection(trimmed, true) ?
+        output_choice = !trimmed.empty() && proc::display_policy::detail::is_virtual_display_selection(trimmed, true) ?
                           proc::display_policy::app_override_e::virtual_display : proc::display_policy::app_override_e::physical;
       }
       // Layout-only and legacy app flags do not consistently request creation on

@@ -1,8 +1,6 @@
-# load common dependencies
-# this file will also load platform specific dependencies
+# load macOS dependencies
 
 # Resolve OpenSSL before subprojects run their own find_package(OpenSSL) calls.
-# This ensures a user-provided OPENSSL_ROOT_DIR is honored consistently.
 find_package(OpenSSL REQUIRED)
 
 # boost, this should be before Simple-Web-Server as it also depends on boost
@@ -12,7 +10,7 @@ include(dependencies/Boost_Sunshine)
 # moonlight common library
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
-if(APPLE AND TARGET enet)
+if(TARGET enet)
     target_compile_options(enet PRIVATE -include "${CMAKE_SOURCE_DIR}/src/platform/macos/enet_pktinfo_shim.h")
 endif()
 
@@ -21,12 +19,6 @@ add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
 
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")
-
-# libvirtualdisplay
-include(dependencies/libvirtualdisplay_source)
-set(BUILD_VIBESHINE_KWIN_GPU_BRIDGE ON CACHE BOOL
-        "Build the bundled libvirtualdisplay KWin GPU-association bridge" FORCE)
-add_subdirectory("${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third-party/libvirtualdisplay")
 
 # common dependencies
 include("${CMAKE_MODULE_PATH}/dependencies/nlohmann_json.cmake")
@@ -53,18 +45,9 @@ else()
 endif()
 include("${CMAKE_MODULE_PATH}/dependencies/FindOpus.cmake")
 
-# platform specific dependencies
-if(WIN32)
-    include("${CMAKE_MODULE_PATH}/dependencies/windows.cmake")
-elseif(UNIX)
-    include("${CMAKE_MODULE_PATH}/dependencies/unix.cmake")
+# macOS platform dependencies
+include("${CMAKE_MODULE_PATH}/dependencies/unix.cmake")
+include("${CMAKE_MODULE_PATH}/dependencies/macos.cmake")
 
-    if(APPLE)
-        include("${CMAKE_MODULE_PATH}/dependencies/macos.cmake")
-    else()
-        include("${CMAKE_MODULE_PATH}/dependencies/linux.cmake")
-    endif()
-endif()
-
-# PyroWave codec library (optional)
+# PyroWave codec library (optional, disabled by default on macOS)
 include("${CMAKE_MODULE_PATH}/dependencies/pyrowave.cmake")
