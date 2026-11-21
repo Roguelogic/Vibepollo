@@ -29,10 +29,11 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
   * Reduced idle frame rate on static desktops and adaptive FEC.
 
 * **iPad, Magic Keyboard & Apple Pencil Input**
-  * **Apple Pencil modes** (live-switchable from the menu bar):
-    * *Scroll & Tap*: Smooth touch/scroll navigation, tap-to-click, window chrome dragging, and hover reticle without teleporting the desktop mouse arrow.
-    * *Drawing Tablet*: Native macOS tablet events (`CGEvent` tablet proximity/point) with pressure, tilt, rotation, and hover.
-  * **Trackpad scrolling**: Continuous 120Hz scrolling with selectable **MacBook** or **iPadOS** inertia curves, isotropic horizontal aspect scaling, and automatic horizontal travel/velocity reconstruction for unpatched VoidLink / Moonlight-iOS clients.
+  * **Apple Pencil modes** (live-switchable from the menu bar & web console):
+    * *Follow Client (VoidLink, Default)*: Automatically follows VoidLink's `Pencil Mode` (`Stylus` / `Hovering Disabled` / `Touch` / `Mouse`).
+    * *Scroll & Tap*: Smooth touch/scroll navigation, tap-to-click, background-prefetched window chrome dragging, and hover reticle without teleporting the desktop mouse arrow.
+    * *Drawing Tablet*: Native macOS tablet events (`CGEvent` tablet proximity/point) with pressure, tilt, **Apple Pencil Pro barrel roll** (`Reverse Barrel Roll`), VoidLink **`Stroke Type: HD`** hook-filter support, and native **Double-Tap (Pen ↔ Eraser)** / **Squeeze (right-click & drag)** gestures.
+  * **Trackpad & touch scrolling**: Continuous 120Hz scrolling with standardized scroll polarity across Moonlight and VoidLink (`Peripherals → Physical Mouse Wheel Scroll: Align with System`), selectable **MacBook** or **iPadOS** inertia curves, isotropic horizontal aspect scaling, and automatic horizontal travel/velocity reconstruction.
   * **Keyboard**: Korean/English (`한/영` Caps Lock and Globe) input source switching on iPad keyboards.
 
 * **Driverless System Audio**

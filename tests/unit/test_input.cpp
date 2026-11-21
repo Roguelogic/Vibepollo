@@ -12,8 +12,10 @@ extern "C" {
 }
 
 #include <src/input_validation_policy.h>
+#include <src/input_geometry_policy.h>
 #include <src/steam_controller_protocol.h>
 #include <src/controller_speaker_pcm.h>
+#include <src/voidlink_protocol.h>
 
 namespace {
 
@@ -154,4 +156,77 @@ TEST(InputValidation, SteamAttributesRequireExactWireSize) {
   bytes.resize(sizeof(packet) + 1);
   write_u32_be(bytes, 0, bytes.size() - 4);
   EXPECT_FALSE(input::validation::validate_packet(bytes));
+}
+
+TEST(InputValidation, AcceptsVoidLinkPencilAndMacGesturePacketsWithExactWireSizes) {
+  {
+    input::voidlink::pen_barrel_roll_packet_t pkt {};
+    auto bytes = packet_bytes(pkt);
+    write_u32_be(bytes, 0, bytes.size() - 4);
+    write_u32_le(bytes, 4, input::voidlink::pen_barrel_roll_magic);
+    EXPECT_TRUE(input::validation::validate_packet(bytes));
+    bytes.pop_back();
+    write_u32_be(bytes, 0, bytes.size() - 4);
+    EXPECT_FALSE(input::validation::validate_packet(bytes));
+  }
+  {
+    input::voidlink::pencil_side_button_packet_t pkt {};
+    auto bytes = packet_bytes(pkt);
+    write_u32_be(bytes, 0, bytes.size() - 4);
+    write_u32_le(bytes, 4, input::voidlink::apple_pencil_side_button_magic);
+    EXPECT_TRUE(input::validation::validate_packet(bytes));
+    bytes.push_back(0);
+    write_u32_be(bytes, 0, bytes.size() - 4);
+    EXPECT_FALSE(input::validation::validate_packet(bytes));
+  }
+  for (const auto magic : {input::voidlink::mac_magnify_magic, input::voidlink::mac_rotate_magic}) {
+    input::voidlink::mac_trackpad_gesture_packet_t pkt {};
+    auto bytes = packet_bytes(pkt);
+    write_u32_be(bytes, 0, bytes.size() - 4);
+    write_u32_le(bytes, 4, magic);
+    EXPECT_TRUE(input::validation::validate_packet(bytes));
+  }
+}
+
+TEST(VoidLinkPencilConsistency, RollProbeAndModeAndHdHookFilterBehaveConsistently) {
+  // Non-Pro Apple Pencil reports constant 0 roll -> keep azimuth until roll actually varies.
+  input::voidlink::roll_probe_t probe;
+  EXPECT_EQ(probe.select(input::voidlink::barrel_roll_unknown, 135), 135u);
+  EXPECT_EQ(probe.select(0, 135), 135u);
+  EXPECT_EQ(probe.select(0, 210), 210u);
+  // Apple Pencil Pro varies barrel roll -> switch to live barrel roll.
+  EXPECT_EQ(probe.select(42, 210), 42u);
+  EXPECT_EQ(probe.select(0, 210), 0u);
+  EXPECT_EQ(input::voidlink::decode_roll(725), 5u);
+
+  // Follow Client ("auto") enables Drawing Tablet for VoidLink Stylus packets while keeping
+  // Scroll & Tap for legacy Moonlight pen packets; explicit host overrides win.
+  EXPECT_TRUE(input::voidlink::resolve_pencil_draw_mode("auto", true));
+  EXPECT_FALSE(input::voidlink::resolve_pencil_draw_mode("auto", false));
+  EXPECT_FALSE(input::voidlink::resolve_pencil_draw_mode("scroll", true));
+  EXPECT_TRUE(input::voidlink::resolve_pencil_draw_mode("draw", false));
+
+  // VoidLink `Stroke Type: HD` hook filter swallows `DOWN` into `HOVER` during phase 1 and starts
+  // surface contact directly with `MOVE`. Both `input_geometry_policy` and `should_press_pen_tip`
+  // must activate contact on unquarantined `MOVE` while still blocking quarantined mid-reinit strokes.
+  EXPECT_FALSE(input::voidlink::should_press_pen_tip(LI_TOUCH_EVENT_HOVER, false));
+  EXPECT_TRUE(input::voidlink::should_press_pen_tip(LI_TOUCH_EVENT_MOVE, false));
+  EXPECT_TRUE(input::voidlink::should_press_pen_tip(LI_TOUCH_EVENT_BUTTON_ONLY, true));
+  EXPECT_FALSE(input::voidlink::should_press_pen_tip(LI_TOUCH_EVENT_BUTTON_ONLY, false));
+  EXPECT_FALSE(input::voidlink::should_press_pen_tip(LI_TOUCH_EVENT_UP, true));
+
+  input::geometry::transport_t transport;
+  struct dummy_port_t {
+    int offset_x {}, offset_y {}, env_width {}, env_height {};
+    std::uint64_t capture_generation {}, geometry_sequence {};
+    bool geometry_valid {};
+  } port;
+  transport.refresh({.offset_x = 0, .offset_y = 0, .desktop_width = 1920, .desktop_height = 1080, .capture_generation = 1, .geometry_sequence = 1, .valid = true}, port, [] {});
+  EXPECT_EQ(transport.pen(input::geometry::contact_event_e::hover, true), input::geometry::contact_result_e::accept);
+  EXPECT_EQ(transport.pen(input::geometry::contact_event_e::move, true), input::geometry::contact_result_e::accept);
+  // Display geometry switch mid-stroke still quarantines trailing moves until lift.
+  transport.refresh({.offset_x = 0, .offset_y = 0, .desktop_width = 2560, .desktop_height = 1440, .capture_generation = 1, .geometry_sequence = 2, .valid = true}, port, [] {});
+  EXPECT_EQ(transport.pen(input::geometry::contact_event_e::move, true), input::geometry::contact_result_e::suppress);
+  EXPECT_EQ(transport.pen(input::geometry::contact_event_e::up, true), input::geometry::contact_result_e::suppress);
+  EXPECT_EQ(transport.pen(input::geometry::contact_event_e::move, true), input::geometry::contact_result_e::accept);
 }

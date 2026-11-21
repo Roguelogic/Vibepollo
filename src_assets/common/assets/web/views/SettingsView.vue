@@ -1430,7 +1430,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 
 <style scoped>
 .settings-page {
-  max-width: 1200px;
+  max-width: 1480px;
   padding-bottom: var(--vs-space-80);
 }
 
@@ -1481,8 +1481,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
   position: sticky;
   top: var(--vs-space-24);
   display: grid;
-  width: 176px;
-  flex: 0 0 176px;
+  width: 216px;
+  flex: 0 0 216px;
   gap: var(--vs-space-4);
   padding-right: var(--vs-space-16);
   border-right: 1px solid var(--vs-color-border-subtle);
@@ -1493,10 +1493,10 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 }
 
 .settings-nav button {
-  min-height: 40px;
+  min-height: 46px;
   padding: var(--vs-space-8) var(--vs-space-12);
-  font-size: var(--vs-type-size-metadata);
-  line-height: 20px;
+  font-size: var(--vs-type-size-control);
+  line-height: 24px;
   border: 0;
   border-radius: var(--vs-radius-control);
   color: var(--vs-color-text-secondary);
@@ -1527,7 +1527,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 .settings-category-heading > span,
 .settings-section__heading > span {
   color: var(--vs-color-accent-default);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1540,7 +1540,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 }
 
 .settings-category-heading p {
-  max-width: 680px;
+  max-width: 780px;
   margin: var(--vs-space-4) 0 0;
   color: var(--vs-color-text-secondary);
 }
@@ -1562,8 +1562,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 .settings-section__heading h3,
 .danger-zone h2 {
   margin: 0;
-  font-size: 16px;
-  line-height: 24px;
+  font-size: 19px;
+  line-height: 26px;
 }
 
 .settings-section__heading p,

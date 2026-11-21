@@ -2138,7 +2138,14 @@ namespace rtsp_stream {
     }
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    const auto host_caps = platf::get_capabilities();
+    ss << "a=x-ss-general.featureFlags:" << (uint32_t) host_caps << std::endl;
+#ifdef __APPLE__
+    if (host_caps & platf::platform_caps::pen_touch) {
+      ss << "a=x-ss-general.penBarrelRoll:1"sv << std::endl;
+      ss << "a=x-ss-general.applePencilSideButtons:1"sv << std::endl;
+    }
+#endif
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

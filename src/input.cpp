@@ -32,6 +32,7 @@ extern "C" {
 #include "platform/common.h"
 #include "thread_pool.h"
 #include "utility.h"
+#include "voidlink_protocol.h"
 
 using namespace std::literals;
 
@@ -292,6 +293,8 @@ namespace input {
     std::list<queued_input_packet_t> input_queue;
     std::mutex input_queue_lock;
     std::atomic_bool input_queue_task_scheduled;
+    // Protected by input_queue_lock; set when touch_port_event publishes a newer generation.
+    bool geometry_refresh_pending = false;
     // Protected by input_queue_lock; reset permanently closes this context.
     bool input_closed = false;
 
@@ -346,6 +349,13 @@ namespace input {
         return packet_size_bounds_t {sizeof(SS_TOUCH_PACKET), sizeof(SS_TOUCH_PACKET)};
       case SS_PEN_MAGIC:
         return packet_size_bounds_t {sizeof(SS_PEN_PACKET), sizeof(SS_PEN_PACKET)};
+      case input::voidlink::pen_barrel_roll_magic:
+        return packet_size_bounds_t {sizeof(input::voidlink::pen_barrel_roll_packet_t), sizeof(input::voidlink::pen_barrel_roll_packet_t)};
+      case input::voidlink::apple_pencil_side_button_magic:
+        return packet_size_bounds_t {sizeof(input::voidlink::pencil_side_button_packet_t), sizeof(input::voidlink::pencil_side_button_packet_t)};
+      case input::voidlink::mac_magnify_magic:
+      case input::voidlink::mac_rotate_magic:
+        return packet_size_bounds_t {sizeof(input::voidlink::mac_trackpad_gesture_packet_t), sizeof(input::voidlink::mac_trackpad_gesture_packet_t)};
       case SS_CONTROLLER_ARRIVAL_MAGIC:
         return packet_size_bounds_t {sizeof(SS_CONTROLLER_ARRIVAL_PACKET), sizeof(SS_CONTROLLER_ARRIVAL_PACKET)};
       case SS_CONTROLLER_TOUCH_MAGIC:
@@ -649,6 +659,27 @@ namespace input {
       case SS_PEN_MAGIC:
         print((PSS_PEN_PACKET) payload);
         break;
+      case input::voidlink::pen_barrel_roll_magic: {
+        auto *ext = reinterpret_cast<input::voidlink::pen_barrel_roll_packet_t *>(payload);
+        print(&ext->pen);
+        BOOST_LOG(verbose) << "barrelRoll ["sv << input::voidlink::decode_roll(ext->barrelRoll) << ']';
+        break;
+      }
+      case input::voidlink::apple_pencil_side_button_magic: {
+        auto *btn = reinterpret_cast<input::voidlink::pencil_side_button_packet_t *>(payload);
+        BOOST_LOG(verbose)
+          << "--apple pencil side button packet-- eventType ["sv << util::hex(btn->eventType).to_string_view()
+          << "] x ["sv << from_netfloat(btn->x) << "] y ["sv << from_netfloat(btn->y) << ']';
+        break;
+      }
+      case input::voidlink::mac_magnify_magic:
+      case input::voidlink::mac_rotate_magic: {
+        auto *gest = reinterpret_cast<input::voidlink::mac_trackpad_gesture_packet_t *>(payload);
+        BOOST_LOG(verbose)
+          << "--mac trackpad gesture packet-- phase ["sv << util::hex(gest->phase).to_string_view()
+          << "] amount ["sv << from_netfloat(gest->amount) << ']';
+        break;
+      }
       case SS_CONTROLLER_ARRIVAL_MAGIC:
         print((PSS_CONTROLLER_ARRIVAL_PACKET) payload);
         break;
@@ -710,6 +741,7 @@ namespace input {
     {
       std::lock_guard<std::mutex> lock(input->input_queue_lock);
       if (input->input_closed) return;
+      input->geometry_refresh_pending = false;
     }
     const auto latest = input->touch_port_event->view_if_newer(input->observed_touch_port_event_generation);
     if (!latest) return;
@@ -1490,7 +1522,12 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The pen packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_PEN_PACKET packet) {
+  void passthrough(
+    std::shared_ptr<input_t> &input,
+    PSS_PEN_PACKET packet,
+    const std::uint16_t barrel_roll = input::voidlink::barrel_roll_unknown,
+    const bool voidlink_extended = false
+  ) {
     if (!config::input.mouse) {
       return;
     }
@@ -1500,6 +1537,7 @@ namespace input {
       input->geometry_transport.pen(event, static_cast<bool>(input->touch_port));
       platf::pen_input_t cancel {};
       cancel.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      cancel.voidlink_extended = voidlink_extended;
       platf::pen_update(input->client_context.get(), {}, cancel);
       return;
     }
@@ -1545,9 +1583,53 @@ namespace input {
       from_clamped_netfloat(packet->pressureOrDistance, 0.0f, 1.0f),
       contact_area.first,
       contact_area.second,
+      barrel_roll,
+      voidlink_extended,
     };
 
     platf::pen_update(input->client_context.get(), *abs_port, pen);
+  }
+
+  void passthrough(std::shared_ptr<input_t> &input, input::voidlink::pen_barrel_roll_packet_t *packet) {
+    passthrough(input, &packet->pen, input::voidlink::decode_roll(packet->barrelRoll), true);
+  }
+
+  void passthrough(std::shared_ptr<input_t> &input, input::voidlink::pencil_side_button_packet_t *packet) {
+    if (!config::input.mouse || !input->touch_port || !input::voidlink::valid_side_button_event(packet->eventType)) {
+      return;
+    }
+
+    auto coords = client_to_touchport(
+      input,
+      {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f},
+      {65535.f, 65535.f}
+    );
+    if (!coords) {
+      return;
+    }
+
+    auto abs_port = monitor_touch_port(input->touch_port, *coords);
+    if (!abs_port) {
+      return;
+    }
+
+    platf::pencil_side_button_input_t btn {
+      packet->eventType,
+      coords->first,
+      coords->second,
+    };
+    platf::pencil_side_button(input->client_context.get(), *abs_port, btn);
+  }
+
+  void passthrough(input::voidlink::mac_trackpad_gesture_packet_t *packet, const bool is_rotate) {
+    if (!config::input.mouse || !input::voidlink::valid_gesture_phase(packet->phase)) {
+      return;
+    }
+    const float amount = from_netfloat(packet->amount);
+    if (!std::isfinite(amount)) {
+      return;
+    }
+    platf::mac_trackpad_gesture(platf_input, {is_rotate, packet->phase, amount});
   }
 
   /**
@@ -1972,6 +2054,23 @@ namespace input {
     return batch_result_e::batched;
   }
 
+  batch_result_e batch(
+    input::voidlink::pen_barrel_roll_packet_t *dest,
+    input::voidlink::pen_barrel_roll_packet_t *src
+  ) {
+    if (dest->pen.eventType != LI_TOUCH_EVENT_MOVE &&
+        dest->pen.eventType != LI_TOUCH_EVENT_HOVER) {
+      return batch_result_e::terminate_batch;
+    }
+    if (dest->pen.eventType != src->pen.eventType ||
+        dest->pen.penButtons != src->pen.penButtons ||
+        dest->pen.toolType != src->pen.toolType) {
+      return batch_result_e::terminate_batch;
+    }
+    *dest = *src;
+    return batch_result_e::batched;
+  }
+
   /**
    * @brief Batch two controller touch messages.
    * @param dest The original packet to batch into.
@@ -2070,6 +2169,11 @@ namespace input {
         return batch((PSS_TOUCH_PACKET) dest, (PSS_TOUCH_PACKET) src);
       case SS_PEN_MAGIC:
         return batch((PSS_PEN_PACKET) dest, (PSS_PEN_PACKET) src);
+      case input::voidlink::pen_barrel_roll_magic:
+        return batch(
+          reinterpret_cast<input::voidlink::pen_barrel_roll_packet_t *>(dest),
+          reinterpret_cast<input::voidlink::pen_barrel_roll_packet_t *>(src)
+        );
       case SS_CONTROLLER_TOUCH_MAGIC:
         return batch((PSS_CONTROLLER_TOUCH_PACKET) dest, (PSS_CONTROLLER_TOUCH_PACKET) src);
       case SS_CONTROLLER_MOTION_MAGIC:
@@ -2097,42 +2201,52 @@ namespace input {
       // Lock the input queue while batching, but release it before sending
       // the input to the OS. This avoids potentially lengthy lock contention
       // in the control stream thread while input is being processed by the OS.
+      bool refresh_only = false;
       {
         std::lock_guard<std::mutex> lg(input->input_queue_lock);
 
-        // If all entries have already been processed, nothing to do
+        // If all entries have already been processed, nothing to do unless a geometry
+        // change arrived after the preceding refresh_input_geometry() call.
         if (input->input_queue.empty()) {
-          input->input_queue_task_scheduled.store(false, std::memory_order_release);
-          return;
-        }
-
-        // Pop off the first entry, which we will send
-        entry = std::move(input->input_queue.front());
-        payload = (PNV_INPUT_HEADER) entry.data.data();
-        input->input_queue.pop_front();
-
-        // Try to batch with remaining items on the queue
-        auto i = input->input_queue.begin();
-        while (!entry.data.empty() && i != input->input_queue.end()) {
-          const auto &batchable_entry = *i;
-          // Empty entries are ordered Guide neutralization after revocation.
-          if (batchable_entry.data.empty()) {
-            break;
+          if (!input->geometry_refresh_pending || input->input_closed) {
+            input->input_queue_task_scheduled.store(false, std::memory_order_release);
+            return;
           }
-          auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data.data();
+          refresh_only = true;
+        } else {
+          // Pop off the first entry, which we will send
+          entry = std::move(input->input_queue.front());
+          payload = (PNV_INPUT_HEADER) entry.data.data();
+          input->input_queue.pop_front();
 
-          auto batch_result = batch(payload, batchable_payload);
-          if (batch_result == batch_result_e::terminate_batch) {
-            // Stop batching
-            break;
-          } else if (batch_result == batch_result_e::batched) {
-            // Erase this entry since it was batched
-            i = input->input_queue.erase(i);
-          } else {
-            // We couldn't batch this entry, but try to batch later entries.
-            i++;
+          // Try to batch with remaining items on the queue
+          auto i = input->input_queue.begin();
+          while (!entry.data.empty() && i != input->input_queue.end()) {
+            const auto &batchable_entry = *i;
+            // Empty entries are ordered Guide neutralization after revocation.
+            if (batchable_entry.data.empty()) {
+              break;
+            }
+            auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data.data();
+
+            auto batch_result = batch(payload, batchable_payload);
+            if (batch_result == batch_result_e::terminate_batch) {
+              // Stop batching
+              break;
+            } else if (batch_result == batch_result_e::batched) {
+              // Erase this entry since it was batched
+              i = input->input_queue.erase(i);
+            } else {
+              // We couldn't batch this entry, but try to batch later entries.
+              i++;
+            }
           }
         }
+      }
+
+      if (refresh_only) {
+        refresh_input_geometry(input);
+        continue;
       }
 
       if (entry.data.empty()) {
@@ -2187,6 +2301,18 @@ namespace input {
           case SS_PEN_MAGIC:
             passthrough(input, (PSS_PEN_PACKET) payload);
             break;
+          case input::voidlink::pen_barrel_roll_magic:
+            passthrough(input, reinterpret_cast<input::voidlink::pen_barrel_roll_packet_t *>(payload));
+            break;
+          case input::voidlink::apple_pencil_side_button_magic:
+            passthrough(input, reinterpret_cast<input::voidlink::pencil_side_button_packet_t *>(payload));
+            break;
+          case input::voidlink::mac_magnify_magic:
+            passthrough(reinterpret_cast<input::voidlink::mac_trackpad_gesture_packet_t *>(payload), false);
+            break;
+          case input::voidlink::mac_rotate_magic:
+            passthrough(reinterpret_cast<input::voidlink::mac_trackpad_gesture_packet_t *>(payload), true);
+            break;
           case controller_speaker_pcm::binding_magic:
             if (config::input.controller) {
               input->speaker_bindings.bind(entry.data, [&](std::uint16_t slot) {
@@ -2214,7 +2340,7 @@ namespace input {
 
       {
         std::lock_guard<std::mutex> lg(input->input_queue_lock);
-        if (input->input_queue.empty()) {
+        if ((input->input_queue.empty() && !input->geometry_refresh_pending) || input->input_closed) {
           input->input_queue_task_scheduled.store(false, std::memory_order_release);
           return;
         }
@@ -2252,25 +2378,43 @@ namespace input {
     }
   }
 
-  void input_geometry_refresh_tick(std::weak_ptr<input_t> weak_input) {
-    auto input = weak_input.lock();
-    if (!input) return;
+  bool wake_input_geometry_worker(const std::shared_ptr<input_t> &input) {
+    if (!input) {
+      return false;
+    }
 
     bool schedule_worker = false;
     {
       std::lock_guard<std::mutex> lock(input->input_queue_lock);
-      if (input->input_closed) return;
+      if (input->input_closed) {
+        return false;
+      }
+      input->geometry_refresh_pending = true;
       schedule_worker = geometry::request_serialized_worker_wake(input->input_queue_task_scheduled);
     }
-    if (schedule_worker) task_pool.push(passthrough_next_message, input);
-
-    // The recurring timer holds only a weak reference and stops when reset
-    // seals the session input queue.
-    task_pool.pushDelayed(input_geometry_refresh_tick, 50ms, weak_input);
+    if (schedule_worker) {
+      task_pool.push(passthrough_next_message, input);
+    }
+    return true;
   }
 
   void start_input_geometry_refresh(const std::shared_ptr<input_t> &input) {
-    task_pool.pushDelayed(input_geometry_refresh_tick, 50ms, std::weak_ptr<input_t> {input});
+    if (!input || !input->touch_port_event) {
+      return;
+    }
+
+    std::weak_ptr<input_t> weak_input {input};
+    input->touch_port_event->subscribe([weak_input]() -> bool {
+      auto locked = weak_input.lock();
+      if (!locked) {
+        return false;
+      }
+      return wake_input_geometry_worker(locked);
+    });
+
+    if (input->touch_port_event->generation() != 0) {
+      wake_input_geometry_worker(input);
+    }
   }
 
   /**
@@ -2312,6 +2456,8 @@ namespace input {
         case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
         case SCROLL_MAGIC_GEN5:
         case SS_HSCROLL_MAGIC:
+        case input::voidlink::mac_magnify_magic:
+        case input::voidlink::mac_rotate_magic:
           if (!(permission & crypto::PERM::input_mouse)) {
             return;
           } else {
@@ -2332,6 +2478,8 @@ namespace input {
             break;
           }
         case SS_PEN_MAGIC:
+        case input::voidlink::pen_barrel_roll_magic:
+        case input::voidlink::apple_pencil_side_button_magic:
           if (!(permission & crypto::PERM::input_pen)) {
             return;
           } else {
@@ -2346,7 +2494,11 @@ namespace input {
                                        packet->magic == MOUSE_MOVE_ABS_MAGIC ||
                                        packet->magic == SCROLL_MAGIC_GEN5 ||
                                        packet->magic == SS_HSCROLL_MAGIC ||
+                                       packet->magic == input::voidlink::mac_magnify_magic ||
+                                       packet->magic == input::voidlink::mac_rotate_magic ||
                                        packet->magic == SS_PEN_MAGIC ||
+                                       packet->magic == input::voidlink::pen_barrel_roll_magic ||
+                                       packet->magic == input::voidlink::apple_pencil_side_button_magic ||
                                        packet->magic == SS_TOUCH_MAGIC);
     bool run_inline = false;
     {
@@ -2373,6 +2525,8 @@ namespace input {
     if (run_inline) {
       if (packet->magic == MOUSE_MOVE_ABS_MAGIC ||
           packet->magic == SS_PEN_MAGIC ||
+          packet->magic == input::voidlink::pen_barrel_roll_magic ||
+          packet->magic == input::voidlink::apple_pencil_side_button_magic ||
           packet->magic == SS_TOUCH_MAGIC) {
         refresh_input_geometry(input);
       }
@@ -2391,22 +2545,32 @@ namespace input {
         case SS_HSCROLL_MAGIC:
           passthrough(input, reinterpret_cast<PSS_HSCROLL_PACKET>(payload));
           break;
+        case input::voidlink::mac_magnify_magic:
+          passthrough(reinterpret_cast<input::voidlink::mac_trackpad_gesture_packet_t *>(payload), false);
+          break;
+        case input::voidlink::mac_rotate_magic:
+          passthrough(reinterpret_cast<input::voidlink::mac_trackpad_gesture_packet_t *>(payload), true);
+          break;
         case SS_TOUCH_MAGIC:
           passthrough(input, reinterpret_cast<PSS_TOUCH_PACKET>(payload));
           break;
         case SS_PEN_MAGIC:
           passthrough(input, reinterpret_cast<PSS_PEN_PACKET>(payload));
           break;
+        case input::voidlink::pen_barrel_roll_magic:
+          passthrough(input, reinterpret_cast<input::voidlink::pen_barrel_roll_packet_t *>(payload));
+          break;
+        case input::voidlink::apple_pencil_side_button_magic:
+          passthrough(input, reinterpret_cast<input::voidlink::pencil_side_button_packet_t *>(payload));
+          break;
       }
       bool handoff_remaining = false;
       {
         std::lock_guard<std::mutex> lg(input->input_queue_lock);
-        if (input->input_queue.empty() && !input->input_closed) {
+        if ((input->input_queue.empty() && !input->geometry_refresh_pending) || input->input_closed) {
           input->input_queue_task_scheduled.store(false, std::memory_order_release);
-        } else if (!input->input_closed) {
-          handoff_remaining = true;
         } else {
-          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+          handoff_remaining = true;
         }
       }
       if (handoff_remaining) {

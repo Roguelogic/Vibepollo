@@ -59,23 +59,42 @@ namespace safe {
   class event_t {
   public:
     using status_t = util::optional_t<T>;
+    using listener_fn_t = std::function<bool()>;
 
-    template<class... Args>
-    void raise(Args &&...args) {
+    void subscribe(listener_fn_t listener) {
+      if (!listener) {
+        return;
+      }
       std::lock_guard lg {_lock};
       if (!_poll_state.running()) {
         return;
       }
+      _listeners.push_back(std::make_shared<listener_entry_t>(std::move(listener)));
+    }
 
-      if constexpr (std::is_same_v<std::optional<T>, status_t>) {
-        _status = std::make_optional<T>(std::forward<Args>(args)...);
-      } else {
-        _status = status_t {std::forward<Args>(args)...};
+    template<class... Args>
+    void raise(Args &&...args) {
+      std::vector<std::shared_ptr<listener_entry_t>> listeners_snapshot;
+      {
+        std::lock_guard lg {_lock};
+        if (!_poll_state.running()) {
+          return;
+        }
+
+        if constexpr (std::is_same_v<std::optional<T>, status_t>) {
+          _status = std::make_optional<T>(std::forward<Args>(args)...);
+        } else {
+          _status = status_t {std::forward<Args>(args)...};
+        }
+        _poll_state.set_ready((bool) _status);
+        _generation.fetch_add(1, std::memory_order_release);
+
+        _cv.notify_all();
+        if (!_listeners.empty()) {
+          listeners_snapshot = _listeners;
+        }
       }
-      _poll_state.set_ready((bool) _status);
-      _generation.fetch_add(1, std::memory_order_release);
-
-      _cv.notify_all();
+      notify_listeners(listeners_snapshot);
     }
 
     // Publish a replaceable snapshot without allowing a late producer with an
@@ -86,23 +105,30 @@ namespace safe {
     // even if a consumer has already popped that payload.
     template<class IsOlder>
     bool raise_monotonic(T value, IsOlder &&is_older) {
-      std::lock_guard lg {_lock};
-      if (!_poll_state.running()) {
-        return false;
-      }
-      if (_last_monotonic_raise && std::invoke(is_older, value, *_last_monotonic_raise)) {
-        return false;
-      }
+      std::vector<std::shared_ptr<listener_entry_t>> listeners_snapshot;
+      {
+        std::lock_guard lg {_lock};
+        if (!_poll_state.running()) {
+          return false;
+        }
+        if (_last_monotonic_raise && std::invoke(is_older, value, *_last_monotonic_raise)) {
+          return false;
+        }
 
-      _last_monotonic_raise = value;
-      if constexpr (std::is_same_v<std::optional<T>, status_t>) {
-        _status = std::make_optional<T>(std::move(value));
-      } else {
-        _status = status_t {std::move(value)};
+        _last_monotonic_raise = value;
+        if constexpr (std::is_same_v<std::optional<T>, status_t>) {
+          _status = std::make_optional<T>(std::move(value));
+        } else {
+          _status = status_t {std::move(value)};
+        }
+        _poll_state.set_ready((bool) _status);
+        _generation.fetch_add(1, std::memory_order_release);
+        _cv.notify_all();
+        if (!_listeners.empty()) {
+          listeners_snapshot = _listeners;
+        }
       }
-      _poll_state.set_ready((bool) _status);
-      _generation.fetch_add(1, std::memory_order_release);
-      _cv.notify_all();
+      notify_listeners(listeners_snapshot);
       return true;
     }
 
@@ -230,6 +256,7 @@ namespace safe {
       std::lock_guard lg {_lock};
 
       _poll_state.stop();
+      _listeners.clear();
 
       _cv.notify_all();
     }
@@ -247,10 +274,43 @@ namespace safe {
     }
 
   private:
+    struct listener_entry_t {
+      explicit listener_entry_t(listener_fn_t callback):
+          fn {std::move(callback)} {
+      }
+
+      std::atomic_bool active {true};
+      listener_fn_t fn;
+    };
+
+    void notify_listeners(const std::vector<std::shared_ptr<listener_entry_t>> &snapshot) {
+      if (snapshot.empty()) {
+        return;
+      }
+      bool any_inactive = false;
+      for (const auto &entry : snapshot) {
+        if (!entry->active.load(std::memory_order_acquire)) {
+          any_inactive = true;
+          continue;
+        }
+        if (!entry->fn()) {
+          entry->active.store(false, std::memory_order_release);
+          any_inactive = true;
+        }
+      }
+      if (any_inactive) {
+        std::lock_guard lg {_lock};
+        std::erase_if(_listeners, [](const auto &entry) {
+          return !entry->active.load(std::memory_order_relaxed);
+        });
+      }
+    }
+
     detail::poll_state_t _poll_state;
     status_t _status {util::false_v<status_t>};
     std::optional<T> _last_monotonic_raise;
     std::atomic<std::uint64_t> _generation {};
+    std::vector<std::shared_ptr<listener_entry_t>> _listeners;
 
     std::condition_variable _cv;
     std::mutex _lock;

@@ -203,8 +203,13 @@ namespace input::geometry {
         return contact_result_e::accept;
       }
       if (event == contact_event_e::move) {
-        return mapping_valid && _pen_active && !_pen_quarantined ?
-                 contact_result_e::accept : contact_result_e::suppress;
+        if (!mapping_valid || _pen_quarantined) {
+          return contact_result_e::suppress;
+        }
+        // VoidLink's `Stroke Type: HD` hook filter converts initial `DOWN` samples into `HOVER`
+        // and begins surface contact with `MOVE`, so unquarantined `MOVE` activates contact.
+        _pen_active = true;
+        return contact_result_e::accept;
       }
       if (event == contact_event_e::up || event == contact_event_e::cancel) {
         if (_pen_quarantined) {

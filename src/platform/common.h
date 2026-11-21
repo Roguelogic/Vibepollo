@@ -567,6 +567,20 @@ namespace platf {
     float pressureOrDistance;  // Distance for hover and pressure for contact
     float contactAreaMajor;
     float contactAreaMinor;
+    std::uint16_t barrelRoll {0xFFFF};  // Degrees (0..359) or LI_ROT_UNKNOWN
+    bool voidlink_extended {false};  // True when sent via VoidLink SS_PEN_BARREL_ROLL_MAGIC
+  };
+
+  struct pencil_side_button_input_t {
+    std::uint8_t eventType;
+    float x;
+    float y;
+  };
+
+  struct mac_trackpad_gesture_t {
+    bool is_rotate;
+    std::uint8_t phase;
+    float amount;
   };
 
   class deinit_t {
@@ -1223,6 +1237,8 @@ namespace platf {
    * @param pen The pen event.
    */
   void pen_update(client_input_t *input, const touch_port_t &touch_port, const pen_input_t &pen);
+  void pencil_side_button(client_input_t *input, const touch_port_t &touch_port, const pencil_side_button_input_t &btn);
+  void mac_trackpad_gesture(input_t &input, const mac_trackpad_gesture_t &gesture);
 
   /**
    * @brief Send a gamepad touch event to the OS.

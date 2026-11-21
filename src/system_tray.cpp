@@ -141,6 +141,7 @@ namespace system_tray {
   static void tray_scroll_inertia_macos_cb(struct tray_menu *item);
   static void tray_scroll_inertia_ipados_cb(struct tray_menu *item);
   static void tray_scroll_inertia_disabled_cb(struct tray_menu *item);
+  static void tray_pencil_mode_auto_cb(struct tray_menu *item);
   static void tray_pencil_mode_scroll_cb(struct tray_menu *item);
   static void tray_pencil_mode_draw_cb(struct tray_menu *item);
   static void sync_scroll_inertia_tray_checks();
@@ -154,7 +155,8 @@ namespace system_tray {
   };
 
   static struct tray_menu pencil_mode_submenu[] = {
-    {.text = "Scroll & Tap (iPad Style)", .checked = 1, .checkbox = 1, .cb = tray_pencil_mode_scroll_cb},
+    {.text = "Follow Client (VoidLink)", .checked = 1, .checkbox = 1, .cb = tray_pencil_mode_auto_cb},
+    {.text = "Scroll & Tap (iPad Style)", .checked = 0, .checkbox = 1, .cb = tray_pencil_mode_scroll_cb},
     {.text = "Drawing Tablet (Pen Input)", .checked = 0, .checkbox = 1, .cb = tray_pencil_mode_draw_cb},
     {.text = nullptr}
   };
@@ -252,8 +254,9 @@ namespace system_tray {
 
   static void sync_pencil_mode_tray_checks() {
     const auto &mode = config::input.macos_pencil_mode;
-    pencil_mode_submenu[0].checked = (mode != "draw") ? 1 : 0;
-    pencil_mode_submenu[1].checked = (mode == "draw") ? 1 : 0;
+    pencil_mode_submenu[0].checked = (mode != "scroll" && mode != "draw") ? 1 : 0;
+    pencil_mode_submenu[1].checked = (mode == "scroll") ? 1 : 0;
+    pencil_mode_submenu[2].checked = (mode == "draw") ? 1 : 0;
   }
 
   static void set_pencil_mode_from_tray(const char *mode) {
@@ -273,6 +276,10 @@ namespace system_tray {
     sync_pencil_mode_tray_checks();
     tray_update(&tray);
     BOOST_LOG(info) << "macOS Apple Pencil mode set to: "sv << mode;
+  }
+
+  static void tray_pencil_mode_auto_cb(struct tray_menu *) {
+    set_pencil_mode_from_tray("auto");
   }
 
   static void tray_pencil_mode_scroll_cb(struct tray_menu *) {

@@ -234,6 +234,55 @@ TEST(ThreadSafeEventTests, LateOlderSnapshotCannotReplaceNewerPublishedVersion) 
   EXPECT_EQ(latest->sequence, 12);
 }
 
+TEST(ThreadSafeEventTests, SubscribeNotifiesOnAcceptedRaisesAndPrunesRetiredListeners) {
+  struct snapshot_t {
+    std::uint64_t generation;
+    std::uint64_t sequence;
+  };
+  const auto is_older = [](const snapshot_t &candidate, const snapshot_t &current) {
+    return candidate.generation < current.generation ||
+           (candidate.generation == current.generation && candidate.sequence < current.sequence);
+  };
+
+  safe::event_t<snapshot_t> event;
+  int persistent_notifications = 0;
+  int one_shot_notifications = 0;
+  std::uint64_t observed_generation = 0;
+
+  event.subscribe([&]() -> bool {
+    ++persistent_notifications;
+    const auto latest = event.view_if_newer(observed_generation);
+    EXPECT_TRUE(latest);
+    return true;
+  });
+  event.subscribe([&]() -> bool {
+    ++one_shot_notifications;
+    return false;
+  });
+
+  EXPECT_TRUE(event.raise_monotonic(snapshot_t {1, 1}, is_older));
+  EXPECT_EQ(persistent_notifications, 1);
+  EXPECT_EQ(one_shot_notifications, 1);
+
+  // Stale monotonic raises must NOT wake subscribers.
+  EXPECT_FALSE(event.raise_monotonic(snapshot_t {1, 0}, is_older));
+  EXPECT_EQ(persistent_notifications, 1);
+  EXPECT_EQ(one_shot_notifications, 1);
+
+  // Accepted updates wake active subscribers while retired ones remain pruned.
+  EXPECT_TRUE(event.raise_monotonic(snapshot_t {1, 2}, is_older));
+  EXPECT_EQ(persistent_notifications, 2);
+  EXPECT_EQ(one_shot_notifications, 1);
+
+  event.raise(snapshot_t {2, 0});
+  EXPECT_EQ(persistent_notifications, 3);
+  EXPECT_EQ(one_shot_notifications, 1);
+
+  event.stop();
+  event.raise(snapshot_t {3, 0});
+  EXPECT_EQ(persistent_notifications, 3);
+}
+
 TEST(MailRegistryTests, QueueLookupReplacesExpiredPost) {
   constexpr auto id = "stale_queue";
   auto mail = std::make_shared<safe::mail_raw_t>();

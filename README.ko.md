@@ -29,10 +29,11 @@
   * 정지 화면 유휴 프레임 절감 및 적응형 FEC
 
 * **iPad · 매직 키보드 · Apple Pencil 특화 입력**
-  * **Apple Pencil 모드 실시간 전환** (상단 메뉴바에서 선택):
-    * *Scroll & Tap*: 데스크톱 마우스 커서 위치를 어지럽히지 않고 스크롤, 탭 클릭, 창 이동 드래그, 에어 호버 포인터 표시
-    * *Drawing Tablet*: 필압, 기울기, 회전, 에어 호버를 전달하는 macOS 네이티브 타블렛 이벤트 입력
-  * **트랙패드 스크롤**: 120Hz 연속 스크롤, 메뉴바 **MacBook / iPadOS 관성 곡선** 선택, 가로 화면비 감도 보정 및 VoidLink / Moonlight-iOS 좌우 스크롤 프레임 유실·속도 복원 엔진 내장
+  * **Apple Pencil 모드 동기화 및 실시간 전환** (상단 메뉴바 및 웹 콘솔에서 선택):
+    * *Follow Client (VoidLink, 기본값)*: VoidLink의 `Pencil Mode`(`Stylus` / `Hovering Disabled` / `Touch` / `Mouse`) 설정과 자동으로 연동됩니다.
+    * *Scroll & Tap*: 데스크톱 마우스 커서 위치를 어지럽히지 않고 스크롤, 탭 클릭, 비동기 프리페치 기반 창 타이틀바 즉시 드래그, 에어 호버 포인터 표시
+    * *Drawing Tablet*: 필압, 기울기, **Apple Pencil Pro 배럴 롤(`Reverse Barrel Roll`)**, VoidLink **`Stroke Type: HD`** 스트로크 보정, **네이티브 더블탭(펜 ↔ 지우개 전환) 및 스퀴즈(우클릭·드래그)** 를 지원하는 macOS 네이티브 타블렛 입력
+  * **트랙패드 및 터치 스크롤**: Moonlight와 VoidLink(`Peripherals → Physical Mouse Wheel Scroll: Align with System`) 간 표준 스크롤 방향 통합, 120Hz 연속 스크롤, 메뉴바 **MacBook / iPadOS 관성 곡선** 선택, 가로 화면비 감도 보정 및 좌우 스크롤 유실·속도 복원 엔진 내장
   * **키보드**: iPad 매직 키보드의 `한/영`(Caps Lock) 및 지구본 키 입력 소스 전환 지원
 
 * **무드라이버 시스템 오디오**

@@ -5,6 +5,7 @@
 #include "input_validation_policy.h"
 #include "controller_speaker_pcm.h"
 #include "steam_controller_protocol.h"
+#include "voidlink_protocol.h"
 
 extern "C" {
 #include <moonlight-common-c/src/Input.h>
@@ -58,6 +59,13 @@ namespace input::validation {
           return packet_size_bounds_t {sizeof(SS_TOUCH_PACKET), sizeof(SS_TOUCH_PACKET)};
         case SS_PEN_MAGIC:
           return packet_size_bounds_t {sizeof(SS_PEN_PACKET), sizeof(SS_PEN_PACKET)};
+        case input::voidlink::pen_barrel_roll_magic:
+          return packet_size_bounds_t {sizeof(input::voidlink::pen_barrel_roll_packet_t), sizeof(input::voidlink::pen_barrel_roll_packet_t)};
+        case input::voidlink::apple_pencil_side_button_magic:
+          return packet_size_bounds_t {sizeof(input::voidlink::pencil_side_button_packet_t), sizeof(input::voidlink::pencil_side_button_packet_t)};
+        case input::voidlink::mac_magnify_magic:
+        case input::voidlink::mac_rotate_magic:
+          return packet_size_bounds_t {sizeof(input::voidlink::mac_trackpad_gesture_packet_t), sizeof(input::voidlink::mac_trackpad_gesture_packet_t)};
         case controller_speaker_pcm::binding_magic:
           return packet_size_bounds_t {controller_speaker_pcm::binding_size, controller_speaker_pcm::binding_size};
         case SS_CONTROLLER_ARRIVAL_MAGIC:

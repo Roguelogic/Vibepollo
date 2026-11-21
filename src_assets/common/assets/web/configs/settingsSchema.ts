@@ -308,6 +308,7 @@ export const settingsCategories: SettingsCategory[] = [
             option('disabled', 'config.macos_scroll_inertia_disabled'),
           ]),
           select('macos_pencil_mode', [
+            option('auto', 'config.macos_pencil_mode_auto'),
             option('scroll', 'config.macos_pencil_mode_scroll'),
             option('draw', 'config.macos_pencil_mode_draw'),
           ]),
@@ -583,7 +584,7 @@ export const settingsDefaults: Record<string, unknown> = {
   touchpad_as_ds4: true,
   high_resolution_scrolling: true,
   macos_scroll_inertia: 'macos',
-  macos_pencil_mode: 'scroll',
+  macos_pencil_mode: 'auto',
   native_pen_touch: true,
   key_repeat_delay: 500,
   key_repeat_frequency: 24.9,
