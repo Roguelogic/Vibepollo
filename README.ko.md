@@ -5,10 +5,9 @@
 **Apple Silicon 맥(`arm64`)** 전용으로 독립 경량화된 원격 데스크톱·스트리밍 호스트입니다. **iPad (VoidLink / Moonlight)**, **Magic Keyboard**, **Apple Pencil**을 이용한 원격 데스크톱 작업에 최적화되어 있습니다.  
 [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) ([Apollo](https://github.com/ClassicOldSong/Apollo) · [Sunshine](https://github.com/LizardByte/Sunshine) 기반)에서 포크하여 Windows/Linux 레거시를 제거하고 macOS 네이티브 단일 앱 구조로 재설계했습니다.
 
-## 다운로드 및 설치 (권장)
+## 다운로드 및 설치
 
-1. **[GitHub Releases](https://github.com/Roguelogic/Vibepollo/releases/latest)** 에서 최신 **`Vibepollo-macOS-arm64.dmg`** 를 다운로드합니다.  
-   *(Apple Developer ID 정식 서명 및 Apple 공증 완료 — Gatekeeper 차단 경고 없이 바로 실행 가능)*
+1. **[GitHub Releases](https://github.com/Roguelogic/Vibepollo/releases/latest)** 에서 최신 **`Vibepollo-macOS-arm64.dmg`** 를 다운로드합니다.
 2. DMG를 열고 **`Vibepollo.app`** 을 **`응용 프로그램(/Applications)`** 폴더로 옮긴 뒤 실행합니다.
 3. **시스템 설정 → 개인정보 보호 및 보안**에서 아래 두 권한을 허용합니다:
    * **화면 및 시스템 오디오 녹음**

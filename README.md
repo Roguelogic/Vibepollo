@@ -5,10 +5,9 @@
 A standalone macOS remote desktop & streaming host for **Apple Silicon Macs (`arm64`)**, built for **iPad (VoidLink / Moonlight)**, **Magic Keyboard**, and **Apple Pencil**.  
 Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [Apollo](https://github.com/ClassicOldSong/Apollo) and [Sunshine](https://github.com/LizardByte/Sunshine)) and refactored into a dedicated macOS-only codebase.
 
-## Download & Install (Recommended)
+## Download & Install
 
-1. Download **`Vibepollo-macOS-arm64.dmg`** from **[GitHub Releases](https://github.com/Roguelogic/Vibepollo/releases/latest)**.  
-   *(Signed with an Apple Developer ID certificate and notarized by Apple — runs without Gatekeeper warnings.)*
+1. Download **`Vibepollo-macOS-arm64.dmg`** from **[GitHub Releases](https://github.com/Roguelogic/Vibepollo/releases/latest)**.
 2. Open the DMG and move **`Vibepollo.app`** to **`/Applications`**.
 3. Launch **Vibepollo** and grant permissions in **System Settings → Privacy & Security**:
    * **Screen & System Audio Recording**
