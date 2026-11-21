@@ -123,6 +123,7 @@ namespace platf {
         NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
         if (event != nil) {
           [NSApp sendEvent:event];
+          [NSApp updateWindows];
         }
       }
     }

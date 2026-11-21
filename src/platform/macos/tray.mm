@@ -138,7 +138,17 @@ namespace {
       status_item.button.image = nil;
       status_item.button.title = @(state.tooltip.c_str());
     }
-    status_item.button.toolTip = @(state.tooltip.c_str());
+    // Standard macOS menu bar extras never show hover tooltips; NSToolTipWindow (layer 103) can
+    // also become stranded on screen across cursor warps or virtual display resolution changes.
+    status_item.button.toolTip = nil;
+    [status_item.button removeAllToolTips];
+    status_item.button.accessibilityLabel = @(state.tooltip.c_str());
+    for (NSWindow *window in NSApp.windows) {
+      if (window != status_item.button.window &&
+          [NSStringFromClass([window class]) containsString:@"ToolTip"]) {
+        [window orderOut:nil];
+      }
+    }
     status_item.menu = build_menu(state.menu);
   }
 
@@ -185,6 +195,7 @@ int tray_loop(int blocking) {
       NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
       if (event != nil) {
         [NSApp sendEvent:event];
+        [NSApp updateWindows];
       }
     }
   }
