@@ -2,50 +2,73 @@
 
 **[English](README.md) | [한국어](README.ko.md)**
 
-A fork of [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [Apollo](https://github.com/ClassicOldSong/Apollo) and [Sunshine](https://github.com/LizardByte/Sunshine)) focused on macOS host support for Apple Silicon Macs and iPad / Moonlight clients.
+A standalone macOS remote desktop & streaming host for **Apple Silicon Macs (`arm64`)**, built for **iPad (VoidLink / Moonlight)**, **Magic Keyboard**, and **Apple Pencil**.  
+Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [Apollo](https://github.com/ClassicOldSong/Apollo) and [Sunshine](https://github.com/LizardByte/Sunshine)) and refactored into a dedicated macOS-only codebase.
 
-## Features (macOS)
+## Download & Install (Recommended)
+
+1. Download **`Vibepollo-macOS-arm64.dmg`** from **[GitHub Releases](https://github.com/Roguelogic/Vibepollo/releases/latest)**.  
+   *(Signed with an Apple Developer ID certificate and notarized by Apple — runs without Gatekeeper warnings.)*
+2. Open the DMG and move **`Vibepollo.app`** to **`/Applications`**.
+3. Launch **Vibepollo** and grant permissions in **System Settings → Privacy & Security**:
+   * **Screen & System Audio Recording**
+   * **Accessibility**
+4. Open `https://localhost:47990` (or click **Configure** from the menu bar icon) to set your initial admin login and pair your Moonlight / VoidLink client.
+
+---
+
+## Features
 
 * **Virtual Display (`CGVirtualDisplay`)**
-  * Creates a Retina HiDPI virtual display matching the client's resolution and refresh rate (including HDR).
-  * Works on headless Macs without dummy plugs.
-  * Can turn off physical displays during a session and restore them on disconnect.
+  * Automatically creates a Retina HiDPI virtual display matching the client's exact resolution and refresh rate (up to `120Hz+`, including HDR).
+  * Works on headless Mac minis without HDMI dummy plugs.
+  * Turns off physical displays during a remote session and safely restores them on disconnect or unexpected exit.
 
-* **Capture & Encoding (`ScreenCaptureKit` + `VideoToolbox`)**
-  * Zero-copy `IOSurface` capture to hardware HEVC / H.264 encoding.
-  * 10-bit HDR10 and YUV 4:4:4 support.
-  * Reduced idle frame rate on static screens and adaptive FEC on stable networks.
+* **Low-Latency Capture & Hardware Encoding (`ScreenCaptureKit` + `VideoToolbox`)**
+  * Zero-copy `IOSurface` capture piped directly into Apple Silicon hardware HEVC / H.264 encoding (`ThroughputMode` turbo, multi-slice, tight VBV).
+  * 10-bit HDR10 (in-band `PREFIX_SEI_NUT`) and YUV 4:4:4 chroma support.
+  * Reduced idle frame rate on static desktops and adaptive FEC.
 
-* **Input (iPad, Trackpad, Apple Pencil)**
-  * **Apple Pencil modes** (selectable from the menu bar):
-    * *Scroll & Tap*: Touch/scroll navigation, tap-to-click, window dragging, and hover indicator without moving the desktop cursor.
+* **iPad, Magic Keyboard & Apple Pencil Input**
+  * **Apple Pencil modes** (live-switchable from the menu bar):
+    * *Scroll & Tap*: Smooth touch/scroll navigation, tap-to-click, window chrome dragging, and hover reticle without teleporting the desktop mouse arrow.
     * *Drawing Tablet*: Native macOS tablet events (`CGEvent` tablet proximity/point) with pressure, tilt, rotation, and hover.
-  * **Trackpad scrolling**: Continuous 120Hz scrolling with selectable MacBook or iPadOS inertia curves from the menu bar.
-  * **Keyboard**: Supports Korean/English (`한/영` Caps Lock and Globe) input source switching on iPad keyboards.
+  * **Trackpad scrolling**: Continuous 120Hz scrolling with selectable **MacBook** or **iPadOS** inertia curves, isotropic horizontal aspect scaling, and automatic horizontal travel/velocity reconstruction for unpatched VoidLink / Moonlight-iOS clients.
+  * **Keyboard**: Korean/English (`한/영` Caps Lock and Globe) input source switching on iPad keyboards.
 
-* **System Audio**
-  * Captures macOS system audio directly via CoreAudio tap without third-party virtual audio drivers.
+* **Driverless System Audio**
+  * Captures macOS system audio directly via native CoreAudio process tap (`CATapDescription`) with no third-party virtual audio driver (e.g. BlackHole) required.
 
 * **Pre-Login Access (`LoginWindow`)**
-  * Optional **Allow on Login Screen** toggle in the menu bar installs a LaunchAgent covering both `LoginWindow` and `Aqua` sessions, allowing remote password entry after a reboot.
-  * Note: If FileVault full-disk encryption is enabled, macOS waits at the EFI pre-boot unlock screen before starting `launchd` agents; unattended cold reboots require turning FileVault off or rebooting via `sudo fdesetup authrestart`.
+  * Optional **Allow on Login Screen** toggle in the menu bar registers a `LoginWindow` + `Aqua` LaunchAgent (`CGDisplayStream` pre-login fallback), allowing remote password entry right after a reboot.
+  * *Note*: If FileVault full-disk encryption is enabled, macOS waits at the pre-boot EFI unlock screen before starting `launchd` agents; unattended cold reboots require turning FileVault off or rebooting via `sudo fdesetup authrestart`.
 
-## Notes on Resolution & Refresh Rate
+---
+
+## Resolution & Refresh Rate Notes
 
 Single-engine Apple Silicon hardware encoders have a fixed pixel-rate ceiling (roughly `~895 Mpx/s` on base M4):
 
 | Mode | Notes |
 | :--- | :--- |
-| `2752 × 2064 @ 120Hz` (iPad Pro 13") | Runs at full `120 FPS` (SDR / HDR / 4:4:4) |
-| `2560 × 1440 @ 144Hz` | Runs at full `144 FPS` |
+| `2752 × 2064 @ 120Hz` (iPad Pro 13") | Sustains full `120 FPS` (SDR / HDR / 4:4:4) |
+| `2560 × 1440 @ 144Hz` | Sustains full `144 FPS` |
 | `3840 × 2160` (4K) | Sustains `90–100 FPS` locked (peaks around `~108 FPS` on base M4) |
 
-## Build (macOS Apple Silicon)
+## Platform Scope & Known Limitations
+
+* **macOS Apple Silicon (`arm64`) Only**: Windows, Linux, X11/Wayland, and NVIDIA/AMD/Intel host code paths have been removed to keep the codebase lean and macOS-native. For Windows/Linux hosting, use upstream [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) or [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo).
+* **Virtual Gamepad Input**: macOS blocks user-space virtual HID gamepads without Apple's restricted DriverKit HID entitlement (`com.apple.developer.hid.virtual.device`), so virtual controller emulation is currently unsupported.
+* **Mac App Store Horizontal Carousels**: `App Store.app` shelves require kernel multitouch hardware events (`trackSwipeEventWithOptions:`); use the `<` / `>` hover arrows on shelf edges.
+
+---
+
+## Build from Source (macOS Apple Silicon)
 
 ### Dependencies
 ```bash
 xcode-select --install
-brew install cmake ninja pkg-config openssl@3 opus miniupnpc curl icu4c
+brew install cmake ninja pkg-config openssl@3 opus miniupnpc curl icu4c libwebp
 ```
 
 ### Compile
@@ -55,21 +78,17 @@ cd Vibepollo
 
 cmake -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=OFF \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
-ninja -C build
+cmake --build build --target sunshine -j"$(sysctl -n hw.ncpu)"
 ```
 
-### Install & Permissions
-1. Copy `build/Vibepollo.app` to `/Applications/Vibepollo.app` and run it.
-2. Grant permissions in **System Settings → Privacy & Security**:
-   * **Screen & System Audio Recording**
-   * **Accessibility**
+### Sign & Notarize (Optional, Maintainers)
+```bash
+./scripts/notarize_macos.sh
+```
 
-*(Optional)* Signing the app bundle with a local self-signed certificate in Keychain Access keeps macOS from resetting permissions after rebuilds.
-
-## Windows & Linux
-
-Upstream Windows and Linux support from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) is preserved unchanged in this repository.
+---
 
 ## Credits & License
 
