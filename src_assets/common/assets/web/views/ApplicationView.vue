@@ -10,7 +10,7 @@ import { platformSupportsCommandElevation } from '@/utils/v2Parity';
 import {
   isRemoteMonitorApplication,
   preserveRemoteMonitorRouting,
-} from '../../web-legacy/utils/remoteMonitorPolicy';
+} from '@/utils/remoteMonitorPolicy';
 import { ApiError, apiGet, apiPost } from '@/api/client';
 import AppCompatibilitySettings from '@/components/app-edit/AppCompatibilitySettings.vue';
 import { parseAppExtras } from '@/utils/appCompatibility';
@@ -3619,7 +3619,11 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section class="editor-section" aria-labelledby="frame-generation-heading">
+      <section
+        v-if="isWindowsHost || isLinuxHost"
+        class="editor-section"
+        aria-labelledby="frame-generation-heading"
+      >
         <div class="editor-section__heading">
           <h2 id="frame-generation-heading">
             {{ t('ui.application.sections.frameGeneration.title') }}
@@ -4375,6 +4379,7 @@ onBeforeUnmount(() => {
             </SettingRow>
           </template>
           <SettingRow
+            v-if="isWindowsHost"
             :label="t('ui.application.fields.displayAction.label')"
             :description="t('ui.application.fields.displayAction.description')"
             control-id="app-display-configuration"

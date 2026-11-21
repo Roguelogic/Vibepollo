@@ -3,7 +3,6 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import ReleaseNotes from '@/components/settings/ReleaseNotes.vue';
-import LinuxCaptureStatus from '@/components/settings/LinuxCaptureStatus.vue';
 import { ApiError, apiDelete, apiGet, apiPost } from '@/api/client';
 import {
   AppButton,
@@ -771,22 +770,6 @@ onBeforeUnmount(() => {
     </template>
 
     <template v-else>
-      <section v-if="metadata?.platform === 'linux'" class="maintenance-section">
-        <LinuxCaptureStatus
-          :metadata="metadata"
-          :virtual-mode="
-            metadata.capture_status?.virtual_display_configured === false ? 'disabled' : undefined
-          "
-        />
-        <div class="maintenance-actions">
-          <RouterLink class="button button--secondary" to="/settings?category=display">{{
-            t('ui.maintenance.linux.display')
-          }}</RouterLink>
-          <RouterLink class="button button--secondary" to="/logs">{{
-            t('ui.maintenance.linux.logs')
-          }}</RouterLink>
-        </div>
-      </section>
       <ReleaseNotes class="maintenance-section" :installed-version="metadata?.version" />
       <section class="maintenance-section" aria-labelledby="installed-version-title">
         <div class="maintenance-section__heading">
@@ -827,13 +810,13 @@ onBeforeUnmount(() => {
         </dl>
       </section>
 
-      <section v-if="isWindows" class="maintenance-section" aria-labelledby="support-title">
+      <section class="maintenance-section" aria-labelledby="support-title">
         <div class="maintenance-section__heading">
           <div>
             <h2 id="support-title">{{ t('ui.maintenance.support.title') }}</h2>
             <p>{{ t('ui.maintenance.support.description') }}</p>
           </div>
-          <StatusBadge :label="crashState.label" :tone="crashState.tone" />
+          <StatusBadge v-if="isWindows" :label="crashState.label" :tone="crashState.tone" />
         </div>
         <div class="support-actions">
           <a class="button button--secondary" href="/api/logs/export">
@@ -841,7 +824,7 @@ onBeforeUnmount(() => {
             {{ t('ui.maintenance.support.downloadLogs') }}
           </a>
           <AppButton
-            v-if="crashDump?.available"
+            v-if="isWindows && crashDump?.available"
             icon="download"
             :label="t('ui.maintenance.support.downloadCrash')"
             variant="secondary"
@@ -857,7 +840,7 @@ onBeforeUnmount(() => {
           />
         </div>
         <div
-          v-if="crashDump?.available && (crashBundleParts.length || crashBundleError)"
+          v-if="isWindows && crashDump?.available && (crashBundleParts.length || crashBundleError)"
           class="crash-bundle"
         >
           <div class="crash-bundle__heading">
@@ -922,7 +905,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-        <div v-if="crashDump?.available" class="crash-summary">
+        <div v-if="isWindows && crashDump?.available" class="crash-summary">
           <div>
             <strong>{{ crashDump.filename || t('ui.maintenance.crash.recentDump') }}</strong>
             <span>
@@ -941,7 +924,7 @@ onBeforeUnmount(() => {
             @click="dismissCrash"
           />
         </div>
-        <p v-else class="maintenance-muted">
+        <p v-else-if="isWindows" class="maintenance-muted">
           {{ t('ui.maintenance.crash.noneFound') }}
         </p>
       </section>

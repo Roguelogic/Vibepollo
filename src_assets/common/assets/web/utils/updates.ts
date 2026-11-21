@@ -260,9 +260,10 @@ export async function fetchUpdateReleases(
   let complete = false;
   for (let page = 1; page <= 10; page++) {
     const response = await fetch(
-      `https://api.github.com/repos/Nonary/Vibepollo/releases?per_page=100&page=${page}`,
+      `https://api.github.com/repos/Roguelogic/Vibepollo/releases?per_page=100&page=${page}`,
       { headers: { Accept: 'application/vnd.github+json' }, credentials: 'omit', signal },
     );
+    if (response.status === 404) return [];
     if (!response.ok) throw new Error('releases-unavailable');
     const batch = await response.json();
     if (!Array.isArray(batch)) throw new Error('invalid-releases');

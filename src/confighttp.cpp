@@ -1615,19 +1615,10 @@ namespace confighttp {
     print_req(request);
 
     const std::string &path = request->path;
-    const std::string_view path_view {path};
     static constexpr std::array reserved_prefixes {"/api"sv, "/assets"sv, "/covers"sv, "/images"sv};
     if (std::ranges::any_of(reserved_prefixes, [&path](std::string_view prefix) {
           return std::string_view {path}.starts_with(prefix);
         })) {
-      not_found(response, request);
-      return;
-    }
-
-    const bool is_v2_route = path_view == "/v2" || path_view.starts_with("/v2/");
-    const bool is_v2_static_path = path_view == "/v2/assets" || path_view.starts_with("/v2/assets/") ||
-                                   path_view == "/v2/images" || path_view.starts_with("/v2/images/");
-    if (is_v2_static_path) {
       not_found(response, request);
       return;
     }
@@ -1638,7 +1629,7 @@ namespace confighttp {
       not_found(response, request);
       return;
     }
-    serve_web_file(std::move(response), std::move(request), is_v2_route ? "v2/index.html" : "index.html");
+    serve_web_file(std::move(response), std::move(request), "index.html");
   }
 
   /**
@@ -6398,8 +6389,7 @@ namespace confighttp {
     // Static browser assets are public; every state-changing API below still
     // passes through the existing authentication and CSRF gates.
     server.resource["^/(assets|images)/.+$"]["GET"] = getWebAsset;
-    server.resource["^/v2/(assets|images)/.+$"]["GET"] = getWebAsset;
-    server.resource["^/v2/[^/]+\\.webmanifest$"]["GET"] = getWebAsset;
+    server.resource["^/[^/]+\\.webmanifest$"]["GET"] = getWebAsset;
     server.default_resource["GET"] = getWebUi;
     thread_pool_util::ThreadPool blocking_route_pool;
     blocking_route_pool.start(1);
@@ -6599,8 +6589,6 @@ namespace confighttp {
     register_api_route("^/api/tokens$", "GET", listApiTokens);
     register_api_route("^/api/token/routes$", "GET", listApiTokenRoutes);
     register_api_route("^/api/token/([a-fA-F0-9]+)$", "DELETE", revokeApiToken);
-    // Session validation endpoint used by the web UI to detect HttpOnly session cookies
-    server.resource["^/api-tokens/?$"]["GET"] = getTokenPage;
     register_api_route("^/api/auth/login$", "POST", loginUser);
     register_api_route("^/api/auth/refresh$", "POST", refreshSession);
     register_api_route("^/api/auth/logout$", "POST", logoutUser);
@@ -6665,14 +6653,7 @@ namespace confighttp {
    * @param request The HTTP request object containing client request data.
    */
   void getTokenPage(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-    print_req(request);
-    std::string content = file_handler::read_file(WEB_DIR "api-tokens.html");
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "text/html; charset=utf-8");
-    response->write(content, headers);
+    getWebUi(std::move(response), std::move(request));
   }
 
   /**

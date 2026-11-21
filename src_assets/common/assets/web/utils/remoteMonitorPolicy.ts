@@ -20,17 +20,11 @@ const applicationDisplayRoutingKeys = [
   'display-output',
 ] as const;
 
-// The monitor coordinator selects the paired client's owned output, rather
-// than these ordinary app fields. Hidden controls must not rewrite stored
-// values or introduce defaults when saving an unrelated setting. Runtime
-// config-overrides and command-log output persistence are handled separately.
 export function preserveRemoteMonitorRouting(
   source: MonitorApplication | null | undefined,
   payload: Record<string, unknown>,
 ): void {
   if (!source || !isRemoteMonitorApplication(source)) return;
-  // Legacy saves otherwise omit unknown app properties. Keep explicit profile
-  // identity present across unrelated edits in both editor serializers.
   if (Object.prototype.hasOwnProperty.call(source, 'remote-monitor-profile')) {
     payload['remote-monitor-profile'] = source['remote-monitor-profile'];
   }

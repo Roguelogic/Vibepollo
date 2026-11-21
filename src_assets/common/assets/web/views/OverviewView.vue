@@ -2,8 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 
-import LinuxCaptureStatus from '@/components/settings/LinuxCaptureStatus.vue';
-import VirtualDisplayRecovery from '@/components/VirtualDisplayRecovery.vue';
 import { ApiError, apiGet } from '@/api/client';
 import {
   AppButton,
@@ -18,7 +16,6 @@ import type { HostInfo, HostStatsSnapshot } from '@/types/host';
 import type { SessionStatus } from '@/types/sessions';
 import { useSystemStore } from '@/stores/system';
 import { formatBytes } from '@/utils/format';
-import { displayRecoverySupported } from '@/utils/displayRecovery';
 
 interface OverviewWarning {
   key: string;
@@ -28,24 +25,12 @@ interface OverviewWarning {
   action: string;
 }
 
-interface VigemHealth {
-  status?: unknown;
-  installed?: unknown;
-  required?: unknown;
-  version?: unknown;
-}
-
 const { locale, t } = useI18n();
 const system = useSystemStore();
 const session = ref<SessionStatus | null>(null);
 const hostStats = ref<HostStatsSnapshot | null>(null);
 const statsStale = ref(false);
 const hostInfo = ref<HostInfo | null>(null);
-const hostPlatform = ref('');
-const vigemInstalled = ref<boolean | null>(null);
-const vigemRequired = ref<boolean | null>(null);
-const vigemVersion = ref('');
-const controllerEnabled = ref<boolean | null>(null);
 const loading = ref(true);
 const refreshing = ref(false);
 const fetchErrors = ref<string[]>([]);
@@ -54,65 +39,6 @@ let pollTimer: number | undefined;
 
 function errorMessage(cause: unknown, fallback: string): string {
   return cause instanceof ApiError ? fallback : cause instanceof Error ? cause.message : fallback;
-}
-
-function isWindowsPlatform(value: unknown): boolean {
-  const platform = String(value ?? '')
-    .trim()
-    .toLocaleLowerCase();
-  return platform === 'windows' || platform.startsWith('win');
-}
-
-function enabledValue(value: unknown): boolean {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') return value !== 0;
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLocaleLowerCase();
-    return ['1', 'true', 'yes', 'on', 'enabled'].includes(normalized);
-  }
-  return false;
-}
-
-async function refreshVigem(platform: string): Promise<void> {
-  // ViGEm is Windows-only. Do not request its endpoint on another host.
-  if (!isWindowsPlatform(platform)) {
-    controllerEnabled.value = null;
-    vigemInstalled.value = null;
-    vigemRequired.value = null;
-    vigemVersion.value = '';
-    return;
-  }
-
-  try {
-    const config = await apiGet<Record<string, unknown>>('/api/config');
-    if (config.status === false) throw new Error('vigem-config-rejected');
-    const enabled = enabledValue(config.controller);
-    controllerEnabled.value = enabled;
-    if (!enabled) {
-      vigemInstalled.value = null;
-      vigemRequired.value = null;
-      vigemVersion.value = '';
-      return;
-    }
-
-    const health = await apiGet<VigemHealth>('/api/health/vigem');
-    // Only a successful, explicit boolean false means the driver is absent.
-    // Auth, network, malformed, and unknown responses remain unknown.
-    if (health && health.status !== false && typeof health.installed === 'boolean') {
-      vigemInstalled.value = health.installed;
-      vigemRequired.value = typeof health.required === 'boolean' ? health.required : null;
-      vigemVersion.value = typeof health.version === 'string' ? health.version : '';
-    } else {
-      vigemInstalled.value = null;
-      vigemRequired.value = null;
-      vigemVersion.value = '';
-    }
-  } catch {
-    controllerEnabled.value = null;
-    vigemInstalled.value = null;
-    vigemRequired.value = null;
-    vigemVersion.value = '';
-  }
 }
 
 async function refresh(silent = false): Promise<void> {
@@ -149,11 +75,6 @@ async function refresh(silent = false): Promise<void> {
   } else {
     nextErrors.push(errorMessage(infoResult.reason, t('ui.overview.errors.hostInfo')));
   }
-
-  // The system store discovers metadata independently; a display-driver wait
-  // must not hold the dashboard's session status and metrics in loading state.
-  hostPlatform.value = system.metadata?.platform ?? hostPlatform.value;
-  await refreshVigem(hostPlatform.value || system.metadata?.platform || '');
 
   fetchErrors.value = [...new Set(nextErrors)];
   lastUpdatedAt.value = Date.now();
@@ -211,14 +132,6 @@ const warnings = computed<OverviewWarning[]>(() => {
   }
   return result;
 });
-
-const showVigemBanner = computed(
-  () =>
-    isWindowsPlatform(hostPlatform.value || system.metadata?.platform) &&
-    controllerEnabled.value === true &&
-    vigemInstalled.value === false &&
-    vigemRequired.value !== false,
-);
 
 const readiness = computed<{ label: string; detail: string; tone: StatusTone }>(() => {
   if (isStreaming.value) {
@@ -346,10 +259,6 @@ onBeforeUnmount(() => {
       </template>
     </PageHeader>
     <div class="visually-hidden" aria-live="polite" aria-atomic="true">{{ readiness.label }}</div>
-    <VirtualDisplayRecovery
-      v-if="displayRecoverySupported(hostPlatform || system.metadata?.platform || '')"
-      @recovered="refresh(true)"
-    />
     <template v-if="loading">
       <LoadingSkeleton variant="block" height="184px" :label="t('ui.overview.loadingReadiness')" />
       <LoadingSkeleton variant="block" height="320px" :label="t('ui.overview.loadingReadiness')" />
@@ -386,29 +295,10 @@ onBeforeUnmount(() => {
           <RouterLink class="button button--primary" :to="primaryAction.to">
             <UiIcon :name="primaryAction.icon" />{{ primaryAction.label }}
           </RouterLink>
-          <RouterLink v-if="!isStreaming" class="button button--secondary" to="/stream">
-            <UiIcon name="play" />{{ t('ui.overview.actions.startBrowserStream') }}
-          </RouterLink>
         </div>
       </section>
 
-      <div v-if="showVigemBanner || warnings.length" class="overview-notices">
-        <InlineAlert v-if="showVigemBanner" tone="warning" :title="t('config.vigem_missing_title')">
-          {{ t('config.vigem_missing_desc') }}
-          <span v-if="vigemVersion" class="overview-vigem-version">
-            ({{ t('config.vigem_detected_version') }}: {{ vigemVersion }})
-          </span>
-          <template #actions>
-            <a
-              href="https://github.com/nefarius/ViGEmBus/releases/latest"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              {{ t('config.vigem_install') }}
-              <UiIcon name="external-link" :size="14" aria-hidden="true" />
-            </a>
-          </template>
-        </InlineAlert>
+      <div v-if="warnings.length" class="overview-notices">
         <InlineAlert
           v-for="warning in warnings"
           :key="warning.key"
@@ -513,15 +403,6 @@ onBeforeUnmount(() => {
           </RouterLink>
         </section>
       </div>
-      <LinuxCaptureStatus
-        v-if="system.metadata?.platform === 'linux'"
-        :metadata="system.metadata"
-        :virtual-mode="
-          system.metadata.capture_status?.virtual_display_configured === false
-            ? 'disabled'
-            : undefined
-        "
-      />
       <footer class="overview-footer">
         <span
           >{{ t('ui.overview.installedVersion') }}
@@ -529,13 +410,13 @@ onBeforeUnmount(() => {
         >
         <nav :aria-label="t('ui.overview.support')">
           <a
-            href="https://github.com/Nonary/Vibepollo/issues/new/choose"
+            href="https://github.com/Roguelogic/Vibepollo/issues"
             target="_blank"
             rel="noopener noreferrer"
             >{{ t('ui.overview.actions.reportBug') }}<UiIcon name="external-link" :size="14"
           /></a>
           <a
-            href="https://github.com/Nonary/Vibepollo/releases/latest"
+            href="https://github.com/Roguelogic/Vibepollo/releases"
             target="_blank"
             rel="noopener noreferrer"
             >{{ t('ui.overview.actions.checkUpdates') }}<UiIcon name="external-link" :size="14"

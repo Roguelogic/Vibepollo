@@ -22,6 +22,9 @@
   "include": ["**/*.ts", "**/*.d.ts", "**/*.vue"],
   "exclude": [
     "__tests__/**",
+    "scripts/**",
+    "e2e/**",
+    "playwright*.ts",
     "vitest.config.ts",
     "types/vitest-config.d.ts",
     "types/vitest.d.ts"

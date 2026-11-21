@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { providerSupported } from '../../web/utils/providerCapabilities';
+import { providerSupported } from '@/utils/providerCapabilities';
 import { computed, nextTick, reactive, ref, watch } from 'vue';
 
 const props = defineProps<{
@@ -17,73 +17,47 @@ const emit = defineEmits<{
   (event: 'saved'): void;
   (event: 'configured', value: boolean): void;
 }>();
+
 const dialog = ref<HTMLDialogElement>();
 const busy = ref(false);
 const step = ref(1);
 const configured = ref(false);
+
 interface LibraryOptions {
   autosync_remove_uninstalled: boolean;
-  sync_all_installed?: boolean;
-  recent_games?: number;
-  recent_max_age_days?: number;
-  include_tools?: boolean;
-  include_steam?: boolean;
+  sync_all_installed: boolean;
+  recent_games: number;
+  recent_max_age_days: number;
+  include_tools: boolean;
 }
+
 const options = reactive<Record<string, LibraryOptions>>({});
 function libraryOptions(id: string): LibraryOptions {
   return options[id]!;
 }
-const selectedLibraries = computed(() => libraries.value.filter((library) => selected[library.id]));
+
 const loading = ref(false);
 const settingsLoaded = ref(false);
 const error = ref('');
 const notice = ref('');
 const config = ref<Record<string, unknown>>({});
-const playniteInstalled = ref(false);
 const selected = reactive<Record<string, boolean>>({
-  playnite: false,
   steam: false,
-  lutris: false,
 });
-const windows = computed(() => props.platform.toLowerCase().includes('windows'));
-const linux = computed(() => props.platform.toLowerCase().includes('linux'));
-const libraries = computed(() => [
-  ...(windows.value
-    ? [
-        {
-          id: 'playnite',
-          name: 'Playnite',
-          benefit:
-            'Bring games from multiple stores into one Windows library, with Playnite artwork and launch settings.',
-          detail:
-            'Requires Playnite and the Vibepollo extension. Setup installs the extension for you.',
-          recommended: true,
-        },
-      ]
-    : []),
-  {
-    id: 'steam',
-    name: 'Steam',
-    benefit: 'Sync your recent Steam games directly, with Steam box art and launch support.',
-    detail: windows.value
-      ? 'Use it instead of Playnite, or alongside it. No Playnite extension required.'
-      : 'Uses your local Steam library. No extra library manager required.',
-    recommended: false,
-  },
-  ...(linux.value
-    ? [
-        {
-          id: 'lutris',
-          name: 'Lutris',
-          benefit:
-            'Add installed Linux games from Lutris, including games using Wine and other runners.',
-          detail:
-            'Works alongside Steam. Steam games in Lutris are excluded from automatic sync by default.',
-          recommended: false,
-        },
-      ]
-    : []),
-].filter((library) => library.id === 'playnite' ? windows.value : providerSupported(props.metadata, library.id)));
+
+const libraries = computed(() =>
+  [
+    {
+      id: 'steam',
+      name: 'Steam',
+      benefit: 'Sync your installed Steam games on macOS with Steam artwork and direct launch support.',
+      detail: 'Uses your local Steam library automatically.',
+    },
+  ].filter((library) => providerSupported(props.metadata, library.id)),
+);
+
+const selectedLibraries = computed(() => libraries.value.filter((library) => selected[library.id]));
+
 function flag(value: unknown, fallback: boolean): boolean {
   if (value === undefined) return fallback;
   return (
@@ -92,36 +66,26 @@ function flag(value: unknown, fallback: boolean): boolean {
     ['true', 'on', '1', 'yes'].includes(String(value).toLowerCase())
   );
 }
+
 async function load() {
   loading.value = true;
   settingsLoaded.value = false;
   error.value = '';
   notice.value = '';
   try {
-    const [settings, playnite] = await Promise.all([
-      props.request('GET', '/api/config'),
-      windows.value ? props.request('GET', '/api/playnite/status') : Promise.resolve({}),
-    ]);
+    const settings = await props.request('GET', '/api/config');
     if (settings.status === false) throw new Error('Unable to load settings');
     config.value = settings;
-    playniteInstalled.value = playnite.installed === true || playnite.active === true;
     for (const library of libraries.value) {
       selected[library.id] =
         flag(settings[library.id + '_enabled'], true) &&
-        flag(settings[library.id + '_auto_sync'], library.id !== 'steam') &&
-        (library.id !== 'playnite' || playniteInstalled.value);
-    }
-    for (const { id } of libraries.value) {
-      options[id] = {
-        autosync_remove_uninstalled: flag(settings[id + '_autosync_remove_uninstalled'], true),
-        ...(id !== 'lutris'
-          ? {
-              sync_all_installed: flag(settings[id + '_sync_all_installed'], false),
-              recent_games: Number(settings[id + '_recent_games'] ?? 10),
-              recent_max_age_days: Number(settings[id + '_recent_max_age_days'] ?? 30),
-            }
-          : { include_steam: flag(settings.lutris_include_steam, false) }),
-        ...(id === 'steam' ? { include_tools: flag(settings.steam_include_tools, false) } : {}),
+        flag(settings[library.id + '_auto_sync'], false);
+      options[library.id] = {
+        autosync_remove_uninstalled: flag(settings[library.id + '_autosync_remove_uninstalled'], true),
+        sync_all_installed: flag(settings[library.id + '_sync_all_installed'], false),
+        recent_games: Number(settings[library.id + '_recent_games'] ?? 10),
+        recent_max_age_days: Number(settings[library.id + '_recent_max_age_days'] ?? 30),
+        include_tools: flag(settings.steam_include_tools, false),
       };
     }
     configured.value = selectedLibraries.value.length > 0;
@@ -133,28 +97,15 @@ async function load() {
     loading.value = false;
   }
 }
+
 async function save() {
   busy.value = true;
   error.value = '';
   notice.value = '';
   try {
-    let installed = false;
-    if (windows.value && selected['playnite'] && !playniteInstalled.value) {
-      const result = await props.request('POST', '/api/playnite/install', { restart: false });
-      if (result.status === false || result.success === false)
-        throw new Error(
-          result.error ||
-            'Unable to install the Playnite extension. Install Playnite, then try again.',
-        );
-      installed = true;
-      playniteInstalled.value = true;
-    }
     const patch: Record<string, unknown> = {};
     for (const library of libraries.value) {
-      // Linux always exposes Steam discovery; its synchronization is opt-in.
-      if (!(linux.value && library.id === 'steam') &&
-          (library.id !== 'playnite' || providerSupported(props.metadata, 'playnite_toggle')))
-        patch[library.id + '_enabled'] = selected[library.id];
+      patch[library.id + '_enabled'] = selected[library.id];
       patch[library.id + '_auto_sync'] = selected[library.id];
       if (selected[library.id]) {
         for (const [key, value] of Object.entries(libraryOptions(library.id))) {
@@ -166,9 +117,7 @@ async function save() {
     if (result.status === false)
       throw new Error(result.error || 'Unable to save game library settings.');
     Object.assign(config.value, patch);
-    notice.value = installed
-      ? 'Libraries saved. Open or restart Playnite to finish connecting the extension.'
-      : 'Game library settings saved.';
+    notice.value = 'Game library settings saved.';
     configured.value = selectedLibraries.value.length > 0;
     emit('configured', configured.value);
     emit('saved');
@@ -178,9 +127,9 @@ async function save() {
         if (response.status === false || response.success === false) throw new Error(library.name);
       }),
     );
-    if (results.some((result) => result.status === 'rejected')) {
+    if (results.some((item) => item.status === 'rejected')) {
       notice.value +=
-        ' Some libraries could not sync yet. Check that the library manager is running; automatic sync will retry.';
+        ' Steam could not sync yet. Check that Steam is installed; automatic sync will retry.';
     }
     emit('saved');
   } catch (cause) {
@@ -190,9 +139,11 @@ async function save() {
     busy.value = false;
   }
 }
+
 function close() {
   if (!busy.value) emit('update:open', false);
 }
+
 watch(
   () => props.open,
   async (open) => {
@@ -205,6 +156,7 @@ watch(
   },
   { immediate: true },
 );
+
 watch(
   () => props.platform,
   (platform) => {
@@ -229,11 +181,11 @@ watch(
         </h2>
         <p>
           Step {{ step }} of 2:
-          {{ step === 1 ? 'Choose your libraries' : 'Configure library settings' }}. You can change
+          {{ step === 1 ? 'Choose your library' : 'Configure sync settings' }}. You can change
           these settings any time.
         </p>
       </header>
-      <p v-if="loading" role="status">Loading your libraries…</p>
+      <p v-if="loading" role="status">Loading your library…</p>
       <fieldset v-if="step === 1" :disabled="loading || busy || !settingsLoaded">
         <legend class="game-library-setup__legend">Libraries to sync automatically</legend>
         <label
@@ -244,10 +196,7 @@ watch(
         >
           <input v-model="selected[library.id]" type="checkbox" :aria-label="library.name" />
           <span>
-            <strong
-              >{{ library.name }}
-              <small v-if="library.recommended">Recommended on Windows</small></strong
-            >
+            <strong>{{ library.name }}</strong>
             <span>{{ library.benefit }}</span>
             <span class="game-library-setup__detail">{{ library.detail }}</span>
           </span>
@@ -255,54 +204,50 @@ watch(
       </fieldset>
       <fieldset v-else :disabled="loading || busy || !settingsLoaded">
         <legend class="game-library-setup__legend">Library sync settings</legend>
-        <p v-if="!selectedLibraries.length">Automatic sync is off for all libraries.</p>
+        <p v-if="!selectedLibraries.length">Automatic sync is off.</p>
         <section
           v-for="library in selectedLibraries"
           :key="library.id"
           class="game-library-setup__settings"
         >
           <h3>{{ library.name }}</h3>
-          <template v-if="library.id !== 'lutris'">
-            <label
-              ><input v-model="libraryOptions(library.id).sync_all_installed" type="checkbox" />
-              Sync all installed games</label
-            >
-            <template v-if="!libraryOptions(library.id).sync_all_installed">
-              <label
-                >Recent games
-                <input
-                  v-model.number="libraryOptions(library.id).recent_games"
-                  type="number"
-                  min="0"
-                  step="1"
-                  required
-              /></label>
-              <label
-                >Maximum age in days (0 = no limit)
-                <input
-                  v-model.number="libraryOptions(library.id).recent_max_age_days"
-                  type="number"
-                  min="0"
-                  step="1"
-                  required
-              /></label>
-            </template>
+          <label>
+            <input v-model="libraryOptions(library.id).sync_all_installed" type="checkbox" />
+            Sync all installed games
+          </label>
+          <template v-if="!libraryOptions(library.id).sync_all_installed">
+            <label>
+              Recent games
+              <input
+                v-model.number="libraryOptions(library.id).recent_games"
+                type="number"
+                min="0"
+                step="1"
+                required
+              />
+            </label>
+            <label>
+              Maximum age in days (0 = no limit)
+              <input
+                v-model.number="libraryOptions(library.id).recent_max_age_days"
+                type="number"
+                min="0"
+                step="1"
+                required
+              />
+            </label>
           </template>
-          <label
-            ><input
+          <label>
+            <input
               v-model="libraryOptions(library.id).autosync_remove_uninstalled"
               type="checkbox"
             />
-            Remove uninstalled games from automatic sync</label
-          >
-          <label v-if="library.id === 'steam'"
-            ><input v-model="libraryOptions('steam').include_tools" type="checkbox" /> Include Steam
-            tools</label
-          >
-          <label v-if="library.id === 'lutris'"
-            ><input v-model="libraryOptions('lutris').include_steam" type="checkbox" /> Include
-            Steam games from Lutris</label
-          >
+            Remove uninstalled games from automatic sync
+          </label>
+          <label>
+            <input v-model="libraryOptions('steam').include_tools" type="checkbox" />
+            Include Steam tools
+          </label>
         </section>
       </fieldset>
       <p v-if="error" role="alert" class="game-library-setup__error">{{ error }}</p>
@@ -430,14 +375,6 @@ watch(
   gap: 8px;
   align-items: center;
   font-size: 18px;
-}
-.game-library-setup__card small {
-  padding: 3px 7px;
-  border-radius: 5px;
-  background: #365777;
-  color: #e2f1ff;
-  font-size: 11px;
-  font-weight: 500;
 }
 .game-library-setup__detail {
   color: #bdcbdd;

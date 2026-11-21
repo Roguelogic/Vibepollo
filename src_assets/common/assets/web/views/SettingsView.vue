@@ -3,7 +3,6 @@ import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, toRaw, w
 import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router';
 import { useSystemStore, type HostMetadata } from '@/stores/system';
-import LinuxCaptureStatus from '@/components/settings/LinuxCaptureStatus.vue';
 import NetworkPortDetails from '@/components/settings/NetworkPortDetails.vue';
 import {
   acknowledgeSettings,
@@ -11,15 +10,10 @@ import {
   linuxVirtualCaptureWarning,
   settingError,
 } from '@/utils/settings';
-import WindowsDisplayStatus from '@/components/settings/WindowsDisplayStatus.vue';
-import { applyDummyPlugVsyncChange, dummyPlugVsyncState } from '@/utils/displayHealth';
 
 import { ApiError, apiGet, apiPatch, apiPost } from '@/api/client';
-import DisplayModeOverrides from '@/components/settings/DisplayModeOverrides.vue';
-import DisplayRecoverySettings from '@/components/settings/DisplayRecoverySettings.vue';
 import GlobalPrepCommands from '@/components/settings/GlobalPrepCommands.vue';
 import ServerCommands from '@/components/settings/ServerCommands.vue';
-import SettingsIntegrationPath from '@/components/settings/SettingsIntegrationPath.vue';
 import {
   SettingRow,
   ConfirmDialog,
@@ -36,9 +30,6 @@ import {
   optionsForPlatform,
   settingsFields,
   settingsDestinations,
-  captureOptionsForPlatform,
-  frameGenerationOptionsForPlatform,
-  gamepadOptionsForPlatform,
   restartRequiredKeys,
   settingsCategories,
   settingsDefaults,
@@ -170,17 +161,7 @@ const preferredGpu = computed<GpuMetadata | null>(() => {
 });
 
 const preferredAutomaticEncoderFamily = computed<SettingsField['encoderFamily'] | undefined>(() => {
-  switch (numericMetadataValue(preferredGpu.value?.vendor_id)) {
-    case 0x10de:
-      return 'nvidia';
-    case 0x8086:
-      return 'intel';
-    case 0x1002:
-    case 0x1022:
-      return 'amd';
-    default:
-      return undefined;
-  }
+  return 'videotoolbox';
 });
 
 const effectiveEncoderFamily = computed<SettingsField['encoderFamily'] | undefined>(() => {
@@ -190,34 +171,9 @@ const effectiveEncoderFamily = computed<SettingsField['encoderFamily'] | undefin
     : preferredAutomaticEncoderFamily.value;
 });
 
-const automaticCaptureLabel = computed(() => {
-  const platform = String(hostMetadata.value.platform ?? '').toLocaleLowerCase();
-  if (!platform.includes('windows')) return t('_common.auto');
-  return t(
-    Number(hostMetadata.value.windows_build_number ?? 0) >= 22631
-      ? 'ui.settings.options.capture.auto_wgc'
-      : 'ui.settings.options.capture.auto_ddx',
-  );
-});
+const automaticCaptureLabel = computed(() => t('_common.auto'));
 
-const automaticEncoderLabel = computed(() => {
-  if (!isWindowsHost.value) return t('ui.settings.options.encoder.auto');
-  const family = preferredAutomaticEncoderFamily.value;
-  const gpuName = preferredGpu.value?.description?.trim() ?? '';
-  const encoderKey =
-    family === 'nvidia'
-      ? 'ui.settings.options.encoder.nvenc'
-      : family === 'intel'
-        ? 'ui.settings.options.encoder.quicksync'
-        : family === 'amd'
-          ? 'ui.settings.options.encoder.amdvce_ffmpeg'
-          : '';
-  if (!encoderKey || !gpuName) return t('ui.settings.options.encoder.auto');
-  return t('ui.settings.options.encoder.auto_selected', {
-    encoder: t(encoderKey),
-    name: gpuName,
-  });
-});
+const automaticEncoderLabel = computed(() => `${t('ui.settings.options.encoder.auto')} (VideoToolbox)`);
 
 const isWindowsHost = computed(() =>
   String(hostMetadata.value.platform ?? '')
@@ -229,20 +185,8 @@ const isLinuxHost = computed(() =>
     .toLocaleLowerCase()
     .includes('linux'),
 );
-const virtualDisplayUnavailable = computed(
-  () =>
-    isLinuxHost.value &&
-    (hostMetadata.value.virtual_display?.capable === false ||
-      hostMetadata.value.virtual_display?.ready === false),
-);
-const supportsDisplayDeviceEnumeration = computed(() => isWindowsHost.value || isLinuxHost.value);
-
-const dummyPlugVsync = computed(() =>
-  dummyPlugVsyncState(values.dd_wa_dummy_plug_hdr10, values.frame_limiter_disable_vsync),
-);
-const selectedWindowsDisplayDriver = computed(() =>
-  configBoolean(values.dd_use_sunshine_virtual_display_driver) ? 'vibeshine' : 'sudovda',
-);
+const virtualDisplayUnavailable = computed(() => false);
+const supportsDisplayDeviceEnumeration = computed(() => false);
 
 const physicalDisplaySelected = computed(
   () => String(values.virtual_display_mode ?? '') === 'disabled',
@@ -658,18 +602,13 @@ function fieldDescriptionIds(field: SettingsField): string | undefined {
     fieldDescription(field) ? `setting-${field.key}-description` : '',
     fieldWarningIsVisible(field) ? `setting-${field.key}-warning` : '',
     dependencyHint(field) ? `setting-${field.key}-dependency` : '',
-    field.key === 'frame_limiter_disable_vsync' && dummyPlugVsync.value.active
-      ? `setting-${field.key}-dummy-plug-dependency`
-      : '',
   ].filter(Boolean);
   return ids.length ? ids.join(' ') : undefined;
 }
 
-function syncDummyPlugTracking(source: Record<string, unknown>): void {
-  const dummyPlugEnabled = configBoolean(source.dd_wa_dummy_plug_hdr10);
-  const vsyncDisabled = configBoolean(source.frame_limiter_disable_vsync);
-  dummyPlugUnderlyingVsync.value = vsyncDisabled;
-  dummyPlugForcedVsync.value = dummyPlugEnabled && !vsyncDisabled;
+function syncDummyPlugTracking(_source: Record<string, unknown>): void {
+  dummyPlugUnderlyingVsync.value = false;
+  dummyPlugForcedVsync.value = false;
 }
 
 function selectCategory(id: string): void {
@@ -683,22 +622,7 @@ function updateCategory(event: Event): void {
 }
 
 function updateBoolean(key: string, event: Event): void {
-  const checked = (event.target as HTMLInputElement).checked;
-  if (key === 'dd_wa_dummy_plug_hdr10') {
-    const wasActive = dummyPlugVsync.value.active;
-    const wasForced = dummyPlugForcedVsync.value;
-    Object.assign(values, applyDummyPlugVsyncChange(values, checked));
-    if (!checked && wasActive && wasForced) {
-      values.frame_limiter_disable_vsync = dummyPlugUnderlyingVsync.value;
-    }
-    dummyPlugForcedVsync.value = checked && !dummyPlugUnderlyingVsync.value;
-    return;
-  }
-  values[key] = checked;
-  if (key === 'frame_limiter_disable_vsync' && !dummyPlugVsync.value.active) {
-    dummyPlugUnderlyingVsync.value = checked;
-    dummyPlugForcedVsync.value = false;
-  }
+  values[key] = (event.target as HTMLInputElement).checked;
 }
 
 function updateValue(key: string, event: Event, field?: SettingsField): void {
@@ -872,10 +796,7 @@ async function refreshDisplayStatus(): Promise<void> {
 }
 
 function fieldDependencyLocked(field: SettingsField): boolean {
-  return (
-    (field.key === 'frame_limiter_disable_vsync' && dummyPlugVsync.value.locked) ||
-    (field.key === 'system_tray' && machineHostTrayUnavailable.value)
-  );
+  return field.key === 'system_tray' && machineHostTrayUnavailable.value;
 }
 
 async function save(): Promise<void> {
@@ -1146,20 +1067,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
               >{{ t(item.labelKey) }} →</RouterLink
             >
           </nav>
-          <LinuxCaptureStatus
-            v-if="isLinuxHost && !isSearching && ['everyday', 'display'].includes(activeCategory)"
-            :metadata="hostMetadata"
-            :virtual-mode="String(values.virtual_display_mode ?? '')"
-          />
-          <WindowsDisplayStatus
-            v-if="isWindowsHost && !isSearching && ['everyday', 'display'].includes(activeCategory)"
-            :metadata="hostMetadata"
-            :selected-driver="selectedWindowsDisplayDriver"
-            :loading="loading"
-            :refreshing="displayStatusRefreshing"
-            :error="displayStatusError"
-            @refresh="refreshDisplayStatus"
-          />
 
           <section
             v-for="group in filteredGroups"
@@ -1198,13 +1105,9 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                   :key="field.key"
                   :label="fieldLabel(field)"
                   :control-id="
-                    ['display-recovery', 'mode-remapping', 'command-preparations'].includes(
-                      field.kind,
-                    )
-                      ? undefined
-                      : `setting-${field.key}`
+                    field.kind === 'command-preparations' ? undefined : `setting-${field.key}`
                   "
-                  :stacked="field.stacked || field.kind === 'display-recovery'"
+                  :stacked="field.stacked"
                   :disabled="fieldIsInactive(field) || fieldDependencyLocked(field)"
                   :restart-required="field.restartRequired"
                 >
@@ -1226,12 +1129,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                     <span v-if="dependencyHint(field)" :id="`setting-${field.key}-dependency`">{{
                       dependencyHint(field)
                     }}</span>
-                    <span
-                      v-if="field.key === 'frame_limiter_disable_vsync' && dummyPlugVsync.active"
-                      id="setting-frame_limiter_disable_vsync-dummy-plug-dependency"
-                      class="settings-row__warning"
-                      >{{ t('ui.settings.windows_display.vsync_forced') }}</span
-                    >
                   </template>
 
                   <label v-if="field.kind === 'boolean'" class="vs-switch">
@@ -1241,9 +1138,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                       :checked="
                         field.key === 'system_tray' && machineHostTrayUnavailable
                           ? false
-                          : field.key === 'frame_limiter_disable_vsync'
-                            ? dummyPlugVsync.effectiveVsyncDisabled
-                            : isTrue(values[field.key])
+                          : isTrue(values[field.key])
                       "
                       :disabled="fieldIsInactive(field) || fieldDependencyLocked(field)"
                       :aria-labelledby="`setting-${field.key}-label`"
@@ -1290,28 +1185,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                     @input="updateValue(field.key, $event, field)"
                   />
 
-                  <DisplayModeOverrides
-                    v-else-if="field.kind === 'mode-remapping'"
-                    :model-value="values[field.key]"
-                    :resolution-mode="String(values.dd_resolution_option ?? 'auto')"
-                    :refresh-mode="String(values.dd_refresh_rate_option ?? 'auto')"
-                    :simple="field.simple"
-                    @update:model-value="values[field.key] = $event"
-                    @validity-change="displayOverridesValid = $event"
-                  />
-
-                  <DisplayRecoverySettings
-                    v-else-if="field.kind === 'display-recovery'"
-                    :maintenance-available="displayMaintenanceAvailable"
-                    :hotkey="values.dd_snapshot_restore_hotkey"
-                    :modifiers="values.dd_snapshot_restore_hotkey_modifiers"
-                    :prefer-golden="values.dd_always_restore_from_golden"
-                    @maintenance-status="displayMaintenanceAvailable = $event"
-                    @update:hotkey="values.dd_snapshot_restore_hotkey = $event"
-                    @update:modifiers="values.dd_snapshot_restore_hotkey_modifiers = $event"
-                    @update:prefer-golden="values.dd_always_restore_from_golden = $event"
-                  />
-
                   <GlobalPrepCommands
                     v-else-if="field.kind === 'command-preparations'"
                     :model-value="values[field.key]"
@@ -1323,14 +1196,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                     v-else-if="field.kind === 'server-commands'"
                     :model-value="values[field.key]"
                     :platform="hostPlatform"
-                    @update:model-value="values[field.key] = $event"
-                  />
-
-                  <SettingsIntegrationPath
-                    v-else-if="field.kind === 'integration-path'"
-                    :kind="field.integration ?? 'rtss'"
-                    :input-id="`setting-${field.key}`"
-                    :model-value="values[field.key]"
                     @update:model-value="values[field.key] = $event"
                   />
 
@@ -1365,15 +1230,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
                   />
                 </SettingRow>
               </div>
-              <InlineAlert
-                v-if="group.id === 'display_driver' && isWindowsHost && dummyPlugVsync.active"
-                class="settings-section__alert"
-                tone="warning"
-                announce="polite"
-                :title="t('ui.settings.windows_display.dummy_plug_title')"
-              >
-                {{ t('ui.settings.windows_display.dummy_plug_description') }}
-              </InlineAlert>
               <div
                 v-if="
                   activeCategory === 'everyday' &&

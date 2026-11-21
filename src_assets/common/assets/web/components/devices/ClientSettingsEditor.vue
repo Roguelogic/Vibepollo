@@ -602,7 +602,7 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
         </SettingRow>
 
         <SettingRow
-          v-if="draft.displaySelection === 'physical'"
+          v-if="isWindows && draft.displaySelection === 'physical'"
           :label="t('config.dd_config_label')"
           :description="t('config.dd_config_hint')"
           :control-id="`${controlIdPrefix}-display-configuration`"
@@ -674,6 +674,28 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
               </option>
             </select>
           </SettingRow>
+          <SettingRow
+            :label="t('clients.virtual_display_scale_label')"
+            :description="t('clients.virtual_display_scale_desc')"
+            :control-id="`${controlIdPrefix}-display-scale`"
+          >
+            <select
+              :id="`${controlIdPrefix}-display-scale`"
+              class="vs-select"
+              :value="displayScale"
+              :disabled="busy"
+              @change="setDisplayScale"
+            >
+              <option value="">{{ globalVirtualDisplayScaleLabel }}</option>
+              <option
+                v-for="option in virtualDisplayScaleOptions"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}
+              </option>
+            </select>
+          </SettingRow>
 
           <p class="client-settings-helper">
             {{
@@ -684,6 +706,29 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
             }}
           </p>
         </template>
+      </div>
+      <div class="vs-settings-group">
+        <SettingRow
+          class="client-setting-row--switch"
+          :label="t('config.prefer_10bit_sdr')"
+          :description="t('ui.devices.editor.prefer_10bit_description')"
+          :control-id="`${controlIdPrefix}-prefer-10bit`"
+        >
+          <label class="vs-switch">
+            <input
+              :id="`${controlIdPrefix}-prefer-10bit`"
+              v-model="draft.prefer10BitSdr"
+              type="checkbox"
+              :disabled="busy"
+            />
+            <span class="vs-switch__track" aria-hidden="true" />
+            <span class="vs-sr-only">{{ t('config.prefer_10bit_sdr_label') }}</span>
+          </label>
+        </SettingRow>
+      </div>
+      <div v-if="sharedVirtualDisplay" class="client-settings-warning" role="note">
+        <UiIcon name="warning" :size="16" aria-hidden="true" />
+        <span>{{ t('clients.shared_display_hdr_warning') }}</span>
       </div>
     </section>
 
@@ -789,50 +834,6 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
             @input="setPeakBrightness"
           />
         </SettingRow>
-        <SettingRow
-          v-if="draft.displaySelection === 'virtual'"
-          :label="t('clients.virtual_display_scale_label')"
-          :description="t('clients.virtual_display_scale_desc')"
-          :control-id="`${controlIdPrefix}-display-scale`"
-        >
-          <select
-            :id="`${controlIdPrefix}-display-scale`"
-            class="vs-select"
-            :value="displayScale"
-            :disabled="busy"
-            @change="setDisplayScale"
-          >
-            <option value="">{{ globalVirtualDisplayScaleLabel }}</option>
-            <option
-              v-for="option in virtualDisplayScaleOptions"
-              :key="option.value"
-              :value="option.value"
-            >
-              {{ option.label }}
-            </option>
-          </select>
-        </SettingRow>
-        <SettingRow
-          class="client-setting-row--switch"
-          :label="t('config.prefer_10bit_sdr')"
-          :description="t('ui.devices.editor.prefer_10bit_description')"
-          :control-id="`${controlIdPrefix}-prefer-10bit`"
-        >
-          <label class="vs-switch">
-            <input
-              :id="`${controlIdPrefix}-prefer-10bit`"
-              v-model="draft.prefer10BitSdr"
-              type="checkbox"
-              :disabled="busy"
-            />
-            <span class="vs-switch__track" aria-hidden="true" />
-            <span class="vs-sr-only">{{ t('config.prefer_10bit_sdr_label') }}</span>
-          </label>
-        </SettingRow>
-      </div>
-      <div v-if="sharedVirtualDisplay" class="client-settings-warning" role="note">
-        <UiIcon name="warning" :size="16" aria-hidden="true" />
-        <span>{{ t('clients.shared_display_hdr_warning') }}</span>
       </div>
     </section>
 

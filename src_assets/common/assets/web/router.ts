@@ -3,7 +3,6 @@ import OverviewView from '@/views/OverviewView.vue';
 
 const ApplicationView = () => import('@/views/ApplicationView.vue');
 const ApiTokensView = () => import('@/views/ApiTokensView.vue');
-const BrowserStreamView = () => import('@/views/BrowserStreamView.vue');
 const DevicesView = () => import('@/views/DevicesView.vue');
 const IntegrationsView = () => import('@/views/IntegrationsView.vue');
 const LibraryView = () => import('@/views/LibraryView.vue');
@@ -15,23 +14,13 @@ const SettingsView = () => import('@/views/SettingsView.vue');
 const StatsView = () => import('@/views/StatsView.vue');
 
 const router = createRouter({
-  history: createWebHistory('/v2/'),
+  history: createWebHistory('/'),
   routes: [
     {
       path: '/',
       name: 'overview',
       component: OverviewView,
       meta: { titleKey: 'ui.nav.overview' },
-    },
-    {
-      path: '/stream',
-      name: 'browser-stream',
-      component: BrowserStreamView,
-      meta: { titleKey: 'ui.nav.browser_stream' },
-    },
-    {
-      path: '/webrtc',
-      redirect: '/stream',
     },
     {
       path: '/library',
@@ -70,10 +59,6 @@ const router = createRouter({
       meta: { titleKey: 'ui.nav.stats' },
     },
     {
-      path: '/sessions',
-      redirect: '/stats',
-    },
-    {
       path: '/integrations',
       name: 'integrations',
       component: IntegrationsView,
@@ -102,6 +87,24 @@ const router = createRouter({
       name: 'maintenance',
       component: MaintenanceView,
       meta: { titleKey: 'ui.nav.maintenance' },
+    },
+    // Backwards-compatible route redirects from legacy & /v2 paths
+    { path: '/clients', redirect: '/devices' },
+    { path: '/applications', redirect: '/library' },
+    { path: '/apps', redirect: '/library' },
+    { path: '/pin', redirect: '/pair' },
+    { path: '/config', redirect: '/settings' },
+    { path: '/troubleshooting', redirect: '/maintenance' },
+    { path: '/sessions', redirect: '/stats' },
+    { path: '/v2', redirect: '/' },
+    {
+      path: '/v2/:pathMatch(.*)*',
+      redirect: (to) => {
+        const raw = Array.isArray(to.params.pathMatch)
+          ? to.params.pathMatch.join('/')
+          : String(to.params.pathMatch ?? '');
+        return { path: `/${raw}`, query: to.query, hash: to.hash };
+      },
     },
     {
       path: '/:pathMatch(.*)*',
