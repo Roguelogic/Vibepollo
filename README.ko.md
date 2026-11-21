@@ -56,7 +56,6 @@
 
 * **macOS Apple Silicon (`arm64`) 전용**: 코드 경량화와 유지보수성을 위해 Windows, Linux 및 타 GPU 인코더 코드는 모두 제거되었습니다. Windows/Linux 호스트는 상위 프로젝트인 [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) 또는 [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo)를 사용해 주세요.
 * **가상 게임패드 미지원**: macOS 커널 보안 정책상 별도의 DriverKit 가상 HID 특별 권한 없이는 소프트웨어 가상 컨트롤러 생성이 차단되어 있어 게임패드 입력은 지원하지 않습니다.
-* **macOS 앱 스토어 가로 선반**: `App Store.app` 내부 배너/선반은 실물 멀티터치 하드웨어 제스처(`trackSwipeEvent`)만 허용하므로 커서를 올려 양쪽 `<` / `>` 화살표 버튼으로 넘겨 주세요.
 
 ---
 

@@ -56,7 +56,6 @@ Single-engine Apple Silicon hardware encoders have a fixed pixel-rate ceiling (r
 
 * **macOS Apple Silicon (`arm64`) Only**: Windows, Linux, X11/Wayland, and NVIDIA/AMD/Intel host code paths have been removed to keep the codebase lean and macOS-native. For Windows/Linux hosting, use upstream [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) or [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo).
 * **Virtual Gamepad Input**: macOS blocks user-space virtual HID gamepads without Apple's restricted DriverKit HID entitlement (`com.apple.developer.hid.virtual.device`), so virtual controller emulation is currently unsupported.
-* **Mac App Store Horizontal Carousels**: `App Store.app` shelves require kernel multitouch hardware events (`trackSwipeEventWithOptions:`); use the `<` / `>` hover arrows on shelf edges.
 
 ---
 

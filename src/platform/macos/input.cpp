@@ -96,7 +96,6 @@ namespace platf {
     double scroll_target_y {};
     std::int64_t scroll_emitted_x {};
     std::int64_t scroll_emitted_y {};
-    wheel_scroll_policy::horizontal_reconstructor_t horizontal_reconstructor;
     double scroll_gesture_abs_x {};
     double scroll_gesture_abs_y {};
     double scroll_vx {};  ///< Pixels/sec horizontal velocity
@@ -1426,7 +1425,6 @@ const KeyCodeMap kKeyCodesMap[] = {
         macos_input->scroll_target_y = 0;
         macos_input->scroll_emitted_x = 0;
         macos_input->scroll_emitted_y = 0;
-        macos_input->horizontal_reconstructor = {};
         if (!same_dir_continuation) {
           macos_input->scroll_gesture_abs_x = 0;
           macos_input->scroll_gesture_abs_y = 0;
@@ -1457,79 +1455,43 @@ const KeyCodeMap kKeyCodesMap[] = {
         raw_dx = 0.0;
       }
 
-      bool hold_initial_dy = false;
-      if (!target_loc) {
-        const auto res = macos_input->horizontal_reconstructor.observe(now, raw_dx, raw_dy);
-        if (res.cancel_unemitted_dy) {
-          macos_input->scroll_target_y = static_cast<double>(macos_input->scroll_emitted_y);
-          macos_input->scroll_gesture_abs_y = 0.0;
-          macos_input->scroll_vy = 0.0;
-        }
-        if (res.eff_dy != 0.0) {
-          update_axis_velocity(
-            macos_input->scroll_vy,
-            macos_input->scroll_peel_used_y,
-            macos_input->scroll_last_y_event,
-            now,
-            res.eff_dy,
-            starting,
-            macos_input->scroll_sample_count
-          );
-        } else if (res.horizontal_locked) {
-          macos_input->scroll_vy = 0.0;
-        }
-        if (res.has_vx_update) {
-          macos_input->scroll_vx = res.vx;
-          macos_input->scroll_last_x_event = now;
-        }
-        macos_input->scroll_gesture_abs_y += std::abs(res.eff_dy);
-        macos_input->scroll_gesture_abs_x += std::abs(res.eff_dx);
-        macos_input->scroll_target_y += res.eff_dy;
-        macos_input->scroll_target_x += res.eff_dx;
-        hold_initial_dy = res.hold_initial_dy && !macos_input->scroll_began_posted;
-      } else {
-        macos_input->scroll_gesture_abs_y += std::abs(raw_dy);
-        macos_input->scroll_gesture_abs_x += std::abs(raw_dx);
-        update_axis_velocity(
-          macos_input->scroll_vy,
-          macos_input->scroll_peel_used_y,
-          macos_input->scroll_last_y_event,
-          now,
-          raw_dy,
-          starting,
-          macos_input->scroll_sample_count
-        );
-        update_axis_velocity(
-          macos_input->scroll_vx,
-          macos_input->scroll_peel_used_x,
-          macos_input->scroll_last_x_event,
-          now,
-          raw_dx,
-          starting,
-          macos_input->scroll_sample_count
-        );
-        double eff_dy = raw_dy;
-        double eff_dx = raw_dx;
-        if (macos_input->scroll_gesture_abs_x > 8.0 &&
-            macos_input->scroll_gesture_abs_x > 2.5 * macos_input->scroll_gesture_abs_y &&
-            std::abs(eff_dy) <= 3.0) {
-          eff_dy = 0.0;
-        } else if (macos_input->scroll_gesture_abs_y > 8.0 &&
-                   macos_input->scroll_gesture_abs_y > 2.5 * macos_input->scroll_gesture_abs_x &&
-                   std::abs(eff_dx) <= 3.0) {
-          eff_dx = 0.0;
-        }
-        macos_input->scroll_target_y += eff_dy;
-        macos_input->scroll_target_x += eff_dx;
+      macos_input->scroll_gesture_abs_y += std::abs(raw_dy);
+      macos_input->scroll_gesture_abs_x += std::abs(raw_dx);
+      update_axis_velocity(
+        macos_input->scroll_vy,
+        macos_input->scroll_peel_used_y,
+        macos_input->scroll_last_y_event,
+        now,
+        raw_dy,
+        starting,
+        macos_input->scroll_sample_count
+      );
+      update_axis_velocity(
+        macos_input->scroll_vx,
+        macos_input->scroll_peel_used_x,
+        macos_input->scroll_last_x_event,
+        now,
+        raw_dx,
+        starting,
+        macos_input->scroll_sample_count
+      );
+      double eff_dy = raw_dy;
+      double eff_dx = raw_dx;
+      if (macos_input->scroll_gesture_abs_x > 8.0 &&
+          macos_input->scroll_gesture_abs_x > 2.5 * macos_input->scroll_gesture_abs_y &&
+          std::abs(eff_dy) <= 3.0) {
+        eff_dy = 0.0;
+      } else if (macos_input->scroll_gesture_abs_y > 8.0 &&
+                 macos_input->scroll_gesture_abs_y > 2.5 * macos_input->scroll_gesture_abs_x &&
+                 std::abs(eff_dx) <= 3.0) {
+        eff_dx = 0.0;
       }
+      macos_input->scroll_target_y += eff_dy;
+      macos_input->scroll_target_x += eff_dx;
 
-      if (hold_initial_dy) {
+      const bool began = macos_input->scroll_began_posted;
+      if ((!began || now >= macos_input->scroll_next_drag_tick) && post_pending_drag_locked(macos_input, began)) {
         macos_input->scroll_next_drag_tick = now + drag_tick_interval;
-      } else {
-        const bool began = macos_input->scroll_began_posted;
-        if ((!began || now >= macos_input->scroll_next_drag_tick) && post_pending_drag_locked(macos_input, began)) {
-          macos_input->scroll_next_drag_tick = now + drag_tick_interval;
-        }
       }
       macos_input->scroll_cv.notify_one();
     }
@@ -1766,7 +1728,7 @@ const KeyCodeMap kKeyCodesMap[] = {
     return false;
   }
 
-  // Convert wheel packets to macOS pixels and restore isotropic horizontal trackpad gain.
+  // Convert wheel packets to macOS pixels.
   // Synthetic CGEvents (`[NSEvent _hidEvent] == NULL`) are NOT inverted by macOS's
   // `com.apple.swipescrolldirection` preference: negative wheel1 always scrolls down (matching
   // Windows WM_MOUSEWHEEL / Moonlight vertical scroll), while negative wheel2 scrolls right
@@ -1777,21 +1739,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     const double sign = horizontal ? -1.0 : 1.0;
     const double base_pixels = scroll_pixels_exact(macos_input, high_res_distance) * sign;
     if (is_continuous_trackpad_scroll(macos_input, high_res_distance)) {
-      double dx = 0.0;
-      double dy = 0.0;
-      if (horizontal) {
-        // VoidLink/Moonlight-iOS divides vertical pan translation by StreamView.bounds.height and
-        // horizontal translation by StreamView.bounds.width, attenuating horizontal trackpad speed
-        // by height/width (e.g. 9/16 on 1080p, 3/4 on 4:3). Restore 1:1 isotropic finger sensitivity.
-        current_display(macos_input);
-        const double aspect_gain =
-          (macos_input->displayBounds.size.width > 0.0 && macos_input->displayBounds.size.height > 0.0) ?
-            std::clamp(double(macos_input->displayBounds.size.width) / double(macos_input->displayBounds.size.height), 1.0, 2.2) :
-            (4.0 / 3.0);
-        dx = base_pixels * aspect_gain;
-      } else {
-        dy = base_pixels;
-      }
+      const double dx = horizontal ? base_pixels : 0.0;
+      const double dy = horizontal ? 0.0 : base_pixels;
       continuous_scroll_delta(macos_input, dy, dx);
     } else {
       cancel_scroll_momentum(macos_input);
