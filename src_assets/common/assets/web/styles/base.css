@@ -332,8 +332,8 @@ hr {
 
 .vs-switch__track {
   position: relative;
-  inline-size: 2.75rem;
-  block-size: 1.5rem;
+  inline-size: 2.125rem;
+  block-size: 1.1875rem;
   flex: none;
   border: var(--vs-border-width, 1px) solid var(--vs-color-border-strong);
   border-radius: var(--vs-radius-pill);
@@ -347,9 +347,9 @@ hr {
   content: '';
   position: absolute;
   inset-block-start: 50%;
-  inset-inline-start: 0.2rem;
-  inline-size: 1rem;
-  block-size: 1rem;
+  inset-inline-start: 0.175rem;
+  inline-size: 0.75rem;
+  block-size: 0.75rem;
   border-radius: 50%;
   background: var(--vs-color-text-secondary);
   translate: 0 -50%;
@@ -365,7 +365,7 @@ hr {
 
 .vs-switch > input:checked + .vs-switch__track::after {
   background: var(--vs-color-text-on-accent);
-  translate: 1.2rem -50%;
+  translate: 0.925rem -50%;
 }
 
 .vs-switch > input:focus-visible + .vs-switch__track {

@@ -438,7 +438,7 @@
 
 .vs-setting-row__description,
 .vs-setting-row__disabled-reason {
-  max-inline-size: 52rem;
+  max-inline-size: 46rem;
   color: var(--vs-color-text-secondary);
   font-size: var(--vs-type-size-metadata);
   line-height: var(--vs-type-line-height-metadata);
@@ -458,7 +458,7 @@
 
 .vs-setting-row__control {
   display: flex;
-  min-inline-size: min(100%, 15rem);
+  min-inline-size: min(100%, 12.5rem);
   align-items: center;
   justify-content: flex-end;
   gap: var(--vs-space-8);
