@@ -2,7 +2,7 @@
 
 **[English](README.md) | [한국어](README.ko.md)**
 
-**Apple Silicon 맥(`arm64`)** 전용으로 독립 경량화된 원격 데스크톱·스트리밍 호스트입니다. **iPad (VoidLink / Moonlight)**, **Magic Keyboard**, **Apple Pencil**을 이용한 원격 데스크톱 작업에 최적화되어 있습니다.  
+**Apple Silicon 맥(`arm64`)** 전용으로 독립 경량화된 네이티브 원격 데스크톱 및 스트리밍 호스트입니다.  
 [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) ([Apollo](https://github.com/ClassicOldSong/Apollo) · [Sunshine](https://github.com/LizardByte/Sunshine) 기반)에서 포크하여 Windows/Linux 레거시를 제거하고 macOS 네이티브 단일 앱 구조로 재설계했습니다.
 
 ## 다운로드 및 설치
@@ -12,7 +12,8 @@
 3. **시스템 설정 → 개인정보 보호 및 보안**에서 아래 두 권한을 허용합니다:
    * **화면 및 시스템 오디오 녹음**
    * **손쉬운 사용 (Accessibility)**
-4. 상단 메뉴바 아이콘에서 **Configure**를 누르거나 브라우저에서 `https://localhost:47990` 에 접속해 초기 관리자 계정을 설정하고 iPad(VoidLink / Moonlight)와 페어링합니다.
+4. 상단 메뉴바 아이콘에서 **Open Vibepollo**를 누르거나 브라우저에서 `https://localhost:47990` 에 접속해 초기 관리자 계정을 설정하고 클라이언트와 페어링합니다.
+   * *클라이언트 참고*: iPadOS / iOS 환경에서는 **VoidLink** 사용을 권장합니다 (일반 Moonlight 앱은 네이티브 터치 및 펜 확장 프로토콜을 지원하지 않습니다).
 
 ---
 
@@ -28,20 +29,16 @@
   * 10-bit HDR10 (`PREFIX_SEI_NUT`) 및 YUV 4:4:4 크로마 서브샘플링 지원
   * 정지 화면 유휴 프레임 절감 및 적응형 FEC
 
-* **iPad · 매직 키보드 · Apple Pencil 특화 입력**
-  * **Apple Pencil 모드 동기화 및 실시간 전환** (상단 메뉴바 및 웹 콘솔에서 선택):
-    * *Follow Client (VoidLink, 기본값)*: VoidLink의 `Pencil Mode`(`Stylus` / `Hovering Disabled` / `Touch` / `Mouse`) 설정과 자동으로 연동됩니다.
-    * *Scroll & Tap*: 데스크톱 마우스 커서 위치를 어지럽히지 않고 스크롤, 탭 클릭, 비동기 프리페치 기반 창 타이틀바 즉시 드래그, 에어 호버 포인터 표시
-    * *Drawing Tablet*: 필압, 기울기, **Apple Pencil Pro 배럴 롤(`Reverse Barrel Roll`)**, VoidLink **`Stroke Type: HD`** 스트로크 보정, **네이티브 더블탭(펜 ↔ 지우개 전환) 및 스퀴즈(우클릭·드래그)** 를 지원하는 macOS 네이티브 타블렛 입력
-  * **트랙패드 및 터치 스크롤**: Moonlight와 VoidLink(`Peripherals → Physical Mouse Wheel Scroll: Align with System`) 간 표준 스크롤 방향 통합, 120Hz 연속 스크롤, 메뉴바 **MacBook / iPadOS 관성 곡선** 선택, 가로 화면비 감도 보정 및 좌우 스크롤 유실·속도 복원 엔진 내장
-  * **키보드**: iPad 매직 키보드의 `한/영`(Caps Lock) 및 지구본 키 입력 소스 전환 지원
-
-* **무드라이버 시스템 오디오**
+* **무드라이버 시스템 오디오 (`CoreAudio`)**
   * BlackHole 등 별도 가상 오디오 드라이버 설치 없이 macOS 내장 CoreAudio 탭(`CATapDescription`)으로 시스템 오디오 즉시 캡처
 
 * **재부팅 직후 로그인 화면 접속 (`LoginWindow`)**
   * 상단 메뉴바의 **Allow on Login Screen** 옵션으로 `LoginWindow` 및 `Aqua` 세션을 함께 담당하는 LaunchAgent 등록 지원
   * *참고*: FileVault 디스크 암호화가 켜져 있으면 부팅 초기 EFI 잠금 해제 단계에서 대기하므로, 완전 무인 재부팅 시에도 원격 접속하려면 FileVault를 끄거나 `sudo fdesetup authrestart`로 재부팅해야 합니다.
+
+* **macOS 네이티브 입력 처리**
+  * 저지연 마우스·키보드(`한/영` 전환 포함) 입력 및 상단 메뉴바에서 관성 곡선을 선택할 수 있는 120Hz 연속 스크롤 지원
+  * VoidLink 등 확장 클라이언트의 네이티브 멀티터치 및 스타일러스 타블렛 입력(필압·기울기·배럴 롤·사이드 제스처) 연동 지원
 
 ---
 
@@ -51,7 +48,7 @@
 
 | 해상도 / 주사율 | 비고 |
 | :--- | :--- |
-| `2752 × 2064 @ 120Hz` (iPad Pro 13") | `120 FPS` 풀 프레임 유지 (SDR / HDR / 4:4:4) |
+| `2752 × 2064 @ 120Hz` | `120 FPS` 풀 프레임 유지 (SDR / HDR / 4:4:4) |
 | `2560 × 1440 @ 144Hz` | `144 FPS` 풀 프레임 유지 |
 | `3840 × 2160` (4K) | `90–100 FPS` 안정 유지 (기본형 M4 기준 최대 약 `108 FPS`) |
 

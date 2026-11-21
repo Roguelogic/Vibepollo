@@ -915,7 +915,7 @@ onBeforeUnmount(() => {
 }
 .metric-chart__event-labels .metric-chart__event-label {
   position: absolute;
-  top: 0.25rem;
+  top: 1.35rem;
   max-width: 9rem;
   overflow: hidden;
   color: var(--vs-color-text-secondary);

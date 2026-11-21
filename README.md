@@ -2,7 +2,7 @@
 
 **[English](README.md) | [한국어](README.ko.md)**
 
-A standalone macOS remote desktop & streaming host for **Apple Silicon Macs (`arm64`)**, built for **iPad (VoidLink / Moonlight)**, **Magic Keyboard**, and **Apple Pencil**.  
+A lightweight, standalone remote desktop and streaming host built natively for **Apple Silicon Macs (`arm64`)**.  
 Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [Apollo](https://github.com/ClassicOldSong/Apollo) and [Sunshine](https://github.com/LizardByte/Sunshine)) and refactored into a dedicated macOS-only codebase.
 
 ## Download & Install
@@ -12,7 +12,8 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
 3. Launch **Vibepollo** and grant permissions in **System Settings → Privacy & Security**:
    * **Screen & System Audio Recording**
    * **Accessibility**
-4. Open `https://localhost:47990` (or click **Configure** from the menu bar icon) to set your initial admin login and pair your Moonlight / VoidLink client.
+4. Open `https://localhost:47990` (or click **Open Vibepollo** from the menu bar icon) to create your admin login and pair your client.
+   * *Client note*: On iPadOS / iOS, **VoidLink** is recommended (standard Moonlight lacks native touch and stylus protocol support).
 
 ---
 
@@ -20,28 +21,24 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
 
 * **Virtual Display (`CGVirtualDisplay`)**
   * Automatically creates a Retina HiDPI virtual display matching the client's exact resolution and refresh rate (up to `120Hz+`, including HDR).
-  * Works on headless Mac minis without HDMI dummy plugs.
-  * Turns off physical displays during a remote session and safely restores them on disconnect or unexpected exit.
+  * Runs on headless Mac minis without HDMI dummy plugs.
+  * Blanks physical displays during a remote session and safely restores them on disconnect or unexpected exit.
 
 * **Low-Latency Capture & Hardware Encoding (`ScreenCaptureKit` + `VideoToolbox`)**
-  * Zero-copy `IOSurface` capture piped directly into Apple Silicon hardware HEVC / H.264 encoding (`ThroughputMode` turbo, multi-slice, tight VBV).
+  * Zero-copy `IOSurface` capture piped directly into Apple Silicon hardware HEVC / H.264 encoding (`ThroughputMode` turbo, multi-slice, low-latency VBV).
   * 10-bit HDR10 (in-band `PREFIX_SEI_NUT`) and YUV 4:4:4 chroma support.
   * Reduced idle frame rate on static desktops and adaptive FEC.
 
-* **iPad, Magic Keyboard & Apple Pencil Input**
-  * **Apple Pencil modes** (live-switchable from the menu bar & web console):
-    * *Follow Client (VoidLink, Default)*: Automatically follows VoidLink's `Pencil Mode` (`Stylus` / `Hovering Disabled` / `Touch` / `Mouse`).
-    * *Scroll & Tap*: Smooth touch/scroll navigation, tap-to-click, background-prefetched window chrome dragging, and hover reticle without teleporting the desktop mouse arrow.
-    * *Drawing Tablet*: Native macOS tablet events (`CGEvent` tablet proximity/point) with pressure, tilt, **Apple Pencil Pro barrel roll** (`Reverse Barrel Roll`), VoidLink **`Stroke Type: HD`** hook-filter support, and native **Double-Tap (Pen ↔ Eraser)** / **Squeeze (right-click & drag)** gestures.
-  * **Trackpad & touch scrolling**: Continuous 120Hz scrolling with standardized scroll polarity across Moonlight and VoidLink (`Peripherals → Physical Mouse Wheel Scroll: Align with System`), selectable **MacBook** or **iPadOS** inertia curves, isotropic horizontal aspect scaling, and automatic horizontal travel/velocity reconstruction.
-  * **Keyboard**: Korean/English (`한/영` Caps Lock and Globe) input source switching on iPad keyboards.
-
-* **Driverless System Audio**
+* **Driverless System Audio (`CoreAudio`)**
   * Captures macOS system audio directly via native CoreAudio process tap (`CATapDescription`) with no third-party virtual audio driver (e.g. BlackHole) required.
 
 * **Pre-Login Access (`LoginWindow`)**
   * Optional **Allow on Login Screen** toggle in the menu bar registers a `LoginWindow` + `Aqua` LaunchAgent (`CGDisplayStream` pre-login fallback), allowing remote password entry right after a reboot.
   * *Note*: If FileVault full-disk encryption is enabled, macOS waits at the pre-boot EFI unlock screen before starting `launchd` agents; unattended cold reboots require turning FileVault off or rebooting via `sudo fdesetup authrestart`.
+
+* **Native macOS Input**
+  * Low-latency mouse, keyboard (including Korean/English input source switching), and 120Hz continuous scrolling with selectable inertia curves in the menu bar.
+  * Supports native multi-touch and stylus tablet protocols (pressure, tilt, barrel roll, and side gestures) for VoidLink clients.
 
 ---
 
@@ -51,7 +48,7 @@ Single-engine Apple Silicon hardware encoders have a fixed pixel-rate ceiling (r
 
 | Mode | Notes |
 | :--- | :--- |
-| `2752 × 2064 @ 120Hz` (iPad Pro 13") | Sustains full `120 FPS` (SDR / HDR / 4:4:4) |
+| `2752 × 2064 @ 120Hz` | Sustains full `120 FPS` (SDR / HDR / 4:4:4) |
 | `2560 × 1440 @ 144Hz` | Sustains full `144 FPS` |
 | `3840 × 2160` (4K) | Sustains `90–100 FPS` locked (peaks around `~108 FPS` on base M4) |
 
