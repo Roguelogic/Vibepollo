@@ -454,19 +454,149 @@ const KeyCodeMap kKeyCodesMap[] = {
     }
   }
 
+  namespace {
+    void ensure_event_sources(macos_input_t *macos_input) {
+      if (!macos_input->source) {
+        macos_input->source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+        if (macos_input->source) {
+          CGEventSourceSetLocalEventsSuppressionInterval(macos_input->source, 0.0);
+        }
+      }
+      if (!macos_input->keyboard_source) {
+        macos_input->keyboard_source = CGEventSourceCreate(kCGEventSourceStatePrivate);
+        if (macos_input->keyboard_source) {
+          CGEventSourceSetLocalEventsSuppressionInterval(macos_input->keyboard_source, 0.0);
+        }
+      }
+      if (!macos_input->mouse_event) {
+        macos_input->mouse_event = CGEventCreate(macos_input->source);
+      }
+    }
+
+    int64_t effective_keyboard_type() {
+      const UInt8 lm_type = LMGetKbdType();
+      // Headless Macs with zero physical keyboards attached report LMGetKbdType() == 0 (or default
+      // CGEvent field 3); default to US ANSI (40) so shifted symbols match standard ANSI keyboards.
+      return lm_type != 0 ? static_cast<int64_t>(lm_type) : 40;
+    }
+
+    bool is_non_character_key(int key) {
+      switch (key) {
+        case kVK_Return:
+        case kVK_ANSI_KeypadEnter:
+        case kVK_Tab:
+        case 0x21E4:
+        case kVK_Delete:
+        case kVK_ForwardDelete:
+        case kVK_Escape:
+        case kVK_Home:
+        case kVK_End:
+        case kVK_PageUp:
+        case kVK_PageDown:
+        case kVK_LeftArrow:
+        case kVK_RightArrow:
+        case kVK_DownArrow:
+        case kVK_UpArrow:
+        case kVK_Help:
+        case kVK_ANSI_KeypadClear:
+        case kVK_CapsLock:
+        case kVK_JIS_Kana:
+        case kVK_F1:
+        case kVK_F2:
+        case kVK_F3:
+        case kVK_F4:
+        case kVK_F5:
+        case kVK_F6:
+        case kVK_F7:
+        case kVK_F8:
+        case kVK_F9:
+        case kVK_F10:
+        case kVK_F11:
+        case kVK_F12:
+        case kVK_F13:
+        case kVK_F14:
+        case kVK_F15:
+        case kVK_F16:
+        case kVK_F17:
+        case kVK_F18:
+        case kVK_F19:
+        case kVK_F20:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    // CGEventCreateKeyboardEvent populates the event's internal Unicode string BEFORE CGEventSetFlags
+    // runs (leaving Shift+A as 'a' and Shift+2 as '2' inside the CGEvent), and LoginWindow on a
+    // Korean Mac may also have 2SetKorean selected in /Library/Preferences/com.apple.HIToolbox.plist
+    // with zero physical HID keyboards attached. Stamp the exact ASCII character from HIToolbox's
+    // ASCII-capable layout onto pre-login key events so SecurityAgent always receives exact Shift/symbols.
+    void stamp_loginwindow_ascii_unicode(CGEventRef event, int key, CGEventFlags kb_flags) {
+      if (is_non_character_key(key) ||
+          (kb_flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) != 0) {
+        return;
+      }
+      TISInputSourceRef ascii_src = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
+      if (!ascii_src) {
+        return;
+      }
+      const auto layout_data = static_cast<CFDataRef>(
+        TISGetInputSourceProperty(ascii_src, kTISPropertyUnicodeKeyLayoutData)
+      );
+      if (layout_data) {
+        const auto *uchr = reinterpret_cast<const UCKeyboardLayout *>(CFDataGetBytePtr(layout_data));
+        if (uchr) {
+          UInt32 mod_state = 0;
+          if ((kb_flags & kCGEventFlagMaskShift) != 0) {
+            mod_state |= (shiftKey >> 8);
+          }
+          if ((kb_flags & kCGEventFlagMaskAlternate) != 0) {
+            mod_state |= (optionKey >> 8);
+          }
+          if ((kb_flags & kCGEventFlagMaskAlphaShift) != 0) {
+            mod_state |= (alphaLock >> 8);
+          }
+          UInt32 dead_key_state = 0;
+          UniChar chars[4] {};
+          UniCharCount actual_len = 0;
+          const OSStatus st = UCKeyTranslate(
+            uchr,
+            static_cast<UInt16>(key),
+            kUCKeyActionDown,
+            mod_state,
+            static_cast<UInt32>(effective_keyboard_type()),
+            kUCKeyTranslateNoDeadKeysMask,
+            &dead_key_state,
+            4,
+            &actual_len,
+            chars
+          );
+          if (st == noErr && actual_len > 0) {
+            CGEventKeyboardSetUnicodeString(event, actual_len, chars);
+          }
+        }
+      }
+      CFRelease(ascii_src);
+    }
+  }  // namespace
+
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
+    (void) flags;
     auto macos_input = ((macos_input_t *) input.get());
+    ensure_event_sources(macos_input);
+    const bool secure_password_input = is_loginwindow_session() || IsSecureEventInputEnabled();
 
     // Globe / Language key (0xFF in VoidLink/Moonlight-iOS) or VK_HANGUL (0x15)
     if (modcode == 0xFF || modcode == 0x15) {
-      if (!release) {
+      if (!release && !secure_password_input) {
         toggle_input_source(macos_input);
       }
       return;
     }
 
     // Caps Lock / 한영 key (0x14) without Shift: toggle input source (Shift+CapsLock keeps real CapsLock)
-    if (modcode == 0x14 && (macos_input->kb_flags & kCGEventFlagMaskShift) == 0) {
+    if (modcode == 0x14 && (macos_input->kb_flags & kCGEventFlagMaskShift) == 0 && !secure_password_input) {
       const auto now = std::chrono::steady_clock::now();
       if (!release) {
         macos_input->capslock_down_time = now;
@@ -492,6 +622,7 @@ const KeyCodeMap kKeyCodesMap[] = {
 
     CGEventRef event = nullptr;
     modifier_flags_t modifier_flags;
+    const int64_t kbd_type = effective_keyboard_type();
 
     if (modifier_flags_for_key(key, modifier_flags)) {
       event = CGEventCreateKeyboardEvent(macos_input->keyboard_source, key, !release);
@@ -500,6 +631,7 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
 
       CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, key);
+      CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, kbd_type);
 
       if (release) {
         macos_input->kb_flags &= ~modifier_flags.device;
@@ -521,17 +653,51 @@ const KeyCodeMap kKeyCodesMap[] = {
         return;
       }
 
+      CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, kbd_type);
       CGEventSetType(event, release ? kCGEventKeyUp : kCGEventKeyDown);
+      if (secure_password_input) {
+        stamp_loginwindow_ascii_unicode(event, key, macos_input->kb_flags);
+      }
     }
 
     CGEventSetFlags(event, macos_input->kb_flags);
     CGEventSetTimestamp(event, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-    CGEventPost(is_loginwindow_session() ? kCGHIDEventTap : kCGSessionEventTap, event);
+    CGEventPost(secure_password_input ? kCGHIDEventTap : kCGSessionEventTap, event);
     CFRelease(event);
   }
 
   void unicode(input_t &input, char *utf8, int size) {
-    BOOST_LOG(info) << "unicode: Unicode input not yet implemented for MacOS."sv;
+    if (!utf8 || size <= 0) {
+      return;
+    }
+    auto *macos_input = static_cast<macos_input_t *>(input.get());
+    ensure_event_sources(macos_input);
+
+    CFStringRef cf_str = CFStringCreateWithBytes(
+      kCFAllocatorDefault,
+      reinterpret_cast<const UInt8 *>(utf8),
+      size,
+      kCFStringEncodingUTF8,
+      false
+    );
+    if (!cf_str) {
+      return;
+    }
+    const CFIndex utf16_len = CFStringGetLength(cf_str);
+    if (utf16_len > 0) {
+      std::vector<UniChar> buf(static_cast<std::size_t>(utf16_len));
+      CFStringGetCharacters(cf_str, CFRangeMake(0, utf16_len), buf.data());
+      const CGEventTapLocation tap = is_loginwindow_session() ? kCGHIDEventTap : kCGSessionEventTap;
+      for (const bool down : {true, false}) {
+        if (CGEventRef ev = CGEventCreateKeyboardEvent(macos_input->keyboard_source, 0, down)) {
+          CGEventKeyboardSetUnicodeString(ev, static_cast<UniCharCount>(buf.size()), buf.data());
+          CGEventSetTimestamp(ev, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+          CGEventPost(tap, ev);
+          CFRelease(ev);
+        }
+      }
+    }
+    CFRelease(cf_str);
   }
 
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
@@ -2765,20 +2931,10 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_input->displayScaling = display_scaling(macos_input->display);
     macos_input->displayGeneration = macos_virtual_display::display_state_generation();
 
-    CGEventSourceSetLocalEventsSuppressionInterval(nullptr, 0.0);
-    macos_input->source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    if (macos_input->source) {
-      CGEventSourceSetLocalEventsSuppressionInterval(macos_input->source, 0.0);
-    }
-    macos_input->keyboard_source = CGEventSourceCreate(kCGEventSourceStatePrivate);
-    if (macos_input->keyboard_source) {
-      CGEventSourceSetLocalEventsSuppressionInterval(macos_input->keyboard_source, 0.0);
-    }
+    ensure_event_sources(macos_input);
     macos_input->scroll_lines_per_detent = get_scroll_lines_per_detent(macos_input->scrollwheel_scaling);
 
     macos_input->kb_flags = 0;
-
-    macos_input->mouse_event = CGEventCreate(macos_input->source);
     macos_input->mouse_down[0] = false;
     macos_input->mouse_down[1] = false;
     macos_input->mouse_down[2] = false;
@@ -2790,7 +2946,7 @@ const KeyCodeMap kKeyCodesMap[] = {
 
     macos_input->scroll_thread = std::thread(run_scroll_momentum_worker, macos_input);
 
-    BOOST_LOG(debug) << "macOS scroll speed: com.apple.scrollwheel.scaling="sv << macos_input->scrollwheel_scaling << ", lines per detent="sv << macos_input->scroll_lines_per_detent << ", pixels per line="sv << CGEventSourceGetPixelsPerLine(macos_input->source);
+    BOOST_LOG(debug) << "macOS scroll speed: com.apple.scrollwheel.scaling="sv << macos_input->scrollwheel_scaling << ", lines per detent="sv << macos_input->scroll_lines_per_detent << ", pixels per line="sv << (macos_input->source ? CGEventSourceGetPixelsPerLine(macos_input->source) : 10.0);
     BOOST_LOG(debug) << "Display "sv << macos_input->display << ", pixel dimension: " << CGDisplayPixelsWide(macos_input->display) << "x"sv << CGDisplayPixelsHigh(macos_input->display);
 
     return result;
@@ -2810,9 +2966,15 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_pen_hover_cursor_hide();
     macos_sc_set_cursor_visible(true);
 
-    CFRelease(input->source);
-    CFRelease(input->keyboard_source);
-    CFRelease(input->mouse_event);
+    if (input->source) {
+      CFRelease(input->source);
+    }
+    if (input->keyboard_source) {
+      CFRelease(input->keyboard_source);
+    }
+    if (input->mouse_event) {
+      CFRelease(input->mouse_event);
+    }
 
     delete input;
   }

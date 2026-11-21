@@ -27,6 +27,7 @@
 // platform includes
 #include <AppKit/AppKit.h>
 #include <arpa/inet.h>
+#import <Carbon/Carbon.h>
 #include <crt_externs.h>
 #include <dlfcn.h>
 #include <Foundation/Foundation.h>
@@ -67,6 +68,11 @@ namespace fs = std::filesystem;
 namespace bp = boost_process_shim;
 namespace v2 = boost::process::v2;
 
+// Required by macOS SkyLight's `app_permitted_to_connect_or_launch()` (`getsectdata("__CGPreLoginApp", "__cgpreloginapp", ...)`)
+// so the LaunchAgent is permitted to connect to WindowServer, create CGEventSources, and capture displays before login.
+__attribute__((used, section("__CGPreLoginApp,__cgpreloginapp")))
+static unsigned char s_macos_cg_prelogin_app = 0;
+
 namespace platf {
 
 // Even though the following two functions are available starting in macOS 10.15, they weren't
@@ -90,6 +96,17 @@ namespace platf {
   void ensure_appkit_session() {
     static std::once_flag once;
     std::call_once(once, []() {
+      if (is_loginwindow_session()) {
+        // Wait up to 10s on early cold boot for WindowServer's LoginWindow session to accept connections.
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < deadline) {
+          if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
+            CFRelease(session);
+            break;
+          }
+          std::this_thread::sleep_for(100ms);
+        }
+      }
       [NSApplication sharedApplication];
       // Never steal keyboard focus from SecurityAgent's password box on the LoginWindow screen
       // or show a Dock icon when running as a background/tray host.
@@ -161,6 +178,10 @@ namespace platf {
       if (geteuid() != 0) {
         return false;
       }
+      if (const char *lw_env = std::getenv("VIBEPOLLO_LOGINWINDOW");
+          lw_env != nullptr && lw_env[0] == '1') {
+        return true;
+      }
       bool is_prelogin = false;
       if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
         const auto login_done = static_cast<CFBooleanRef>(CFDictionaryGetValue(session, kCGSessionLoginDoneKey));
@@ -169,9 +190,6 @@ namespace platf {
           is_prelogin = true;
         }
         CFRelease(session);
-      } else if (const char *lw_env = std::getenv("VIBEPOLLO_LOGINWINDOW");
-                 lw_env != nullptr && lw_env[0] == '1') {
-        is_prelogin = true;
       }
       return is_prelogin;
     }
@@ -776,6 +794,13 @@ namespace platf {
 
   std::unique_ptr<deinit_t> init() {
     if (is_loginwindow_session()) {
+      ensure_appkit_session();
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (TISInputSourceRef ascii = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()) {
+          TISSelectInputSource(ascii);
+          CFRelease(ascii);
+        }
+      });
       // Pre-login LoginWindow sessions have no interactive TCC approval dialogs; rely on the
       // system-level TCC entries already granted to the signed app bundle.
       screen_capture_allowed = true;

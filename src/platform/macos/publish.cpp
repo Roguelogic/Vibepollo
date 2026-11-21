@@ -4,8 +4,11 @@
  */
 // standard includes
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -38,21 +41,63 @@ namespace platf::publish {
       }
     };
 
+    std::vector<uint32_t> resolve_publish_interface_indices();
+    void registrationCallback(DNSServiceRef, DNSServiceFlags, DNSServiceErrorType, const char *, const char *, const char *, void *);
+
+    std::vector<DNSServiceRef> register_for_indices(const std::vector<uint32_t> &indices) {
+      std::vector<DNSServiceRef> refs;
+      refs.reserve(indices.size());
+      for (const uint32_t iface_idx : indices) {
+        DNSServiceRef serviceRef {};
+        const auto status = DNSServiceRegister(
+          &serviceRef,
+          0,
+          iface_idx,
+          nullptr,
+          platf::SERVICE_TYPE.data(),
+          nullptr,
+          nullptr,
+          htons(net::map_port(nvhttp::PORT_HTTP)),
+          0,
+          nullptr,
+          registrationCallback,
+          nullptr
+        );
+        if (status != kDNSServiceErr_NoError) {
+          BOOST_LOG(error) << "Failed immediately to register DNS service on if="sv << iface_idx << ": Error "sv << status;
+          continue;
+        }
+        refs.push_back(serviceRef);
+      }
+      return refs;
+    }
+
     /** @brief This class encapsulates the polling and deinitialization of our connection with
-     *         the mDNS service. Implements the `::platf::deinit_t` interface.
+     *         the mDNS service, and refreshes registrations if interfaces (DHCP / VPN tunnels)
+     *         come up after cold boot.
      */
     class deinit_t: public ::platf::deinit_t {
     public:
-      explicit deinit_t(std::vector<DNSServiceRef> serviceRefs):
+      deinit_t(std::vector<uint32_t> indices, std::vector<DNSServiceRef> serviceRefs):
+          _indices(std::move(indices)),
           _refs(std::move(serviceRefs)) {
         _thread = std::thread {[this]() {
           platf::set_thread_name("publish::mdns");
           std::vector<bool> done(_refs.size(), false);
-          while (!_stopRequested) {
+          auto next_if_check = std::chrono::steady_clock::now() + 5s;
+
+          for (;;) {
+            {
+              std::unique_lock lock {_mutex};
+              if (_stopRequested) {
+                break;
+              }
+            }
+
+            bool any_pending = false;
             auto fdset = fd_set {};
             FD_ZERO(&fdset);
             int max_fd = -1;
-            bool any_pending = false;
             for (std::size_t i = 0; i < _refs.size(); ++i) {
               if (done[i] || !_refs[i]) {
                 continue;
@@ -64,23 +109,43 @@ namespace platf::publish {
                 any_pending = true;
               }
             }
-            if (!any_pending) {
-              break;
-            }
-            auto timeout = timeval {.tv_sec = 3, .tv_usec = 0};
-            const auto ready = select(max_fd + 1, &fdset, nullptr, nullptr, &timeout);
-            if (ready == -1) {
-              BOOST_LOG(error) << "Failed to obtain response from DNS service."sv;
-              break;
-            } else if (ready > 0) {
-              for (std::size_t i = 0; i < _refs.size(); ++i) {
-                if (done[i] || !_refs[i]) {
-                  continue;
+
+            if (any_pending) {
+              auto timeout = timeval {.tv_sec = 1, .tv_usec = 0};
+              const auto ready = select(max_fd + 1, &fdset, nullptr, nullptr, &timeout);
+              if (ready > 0) {
+                for (std::size_t i = 0; i < _refs.size(); ++i) {
+                  if (done[i] || !_refs[i]) {
+                    continue;
+                  }
+                  const int sock = DNSServiceRefSockFD(_refs[i]);
+                  if (sock >= 0 && FD_ISSET(sock, &fdset)) {
+                    DNSServiceProcessResult(_refs[i]);
+                    done[i] = true;
+                  }
                 }
-                const int sock = DNSServiceRefSockFD(_refs[i]);
-                if (sock >= 0 && FD_ISSET(sock, &fdset)) {
-                  DNSServiceProcessResult(_refs[i]);
-                  done[i] = true;
+              }
+            } else {
+              std::unique_lock lock {_mutex};
+              if (_cv.wait_for(lock, 5s, [this] { return _stopRequested; })) {
+                break;
+              }
+            }
+
+            if (std::chrono::steady_clock::now() >= next_if_check) {
+              next_if_check = std::chrono::steady_clock::now() + 5s;
+              auto latest = resolve_publish_interface_indices();
+              if (latest != _indices) {
+                auto new_refs = register_for_indices(latest);
+                if (!new_refs.empty()) {
+                  for (auto ref : _refs) {
+                    if (ref) {
+                      DNSServiceRefDeallocate(ref);
+                    }
+                  }
+                  _indices = std::move(latest);
+                  _refs = std::move(new_refs);
+                  done.assign(_refs.size(), false);
                 }
               }
             }
@@ -89,7 +154,11 @@ namespace platf::publish {
       }
 
       ~deinit_t() override {
-        _stopRequested = true;
+        {
+          std::lock_guard lock {_mutex};
+          _stopRequested = true;
+        }
+        _cv.notify_all();
         if (_thread.joinable()) {
           _thread.join();
         }
@@ -107,9 +176,12 @@ namespace platf::publish {
       deinit_t &operator=(const deinit_t &) = delete;
 
     private:
+      std::mutex _mutex;
+      std::condition_variable _cv;
+      std::vector<uint32_t> _indices;
       std::vector<DNSServiceRef> _refs;
       std::thread _thread;
-      std::atomic<bool> _stopRequested = false;
+      bool _stopRequested = false;
     };
 
     /** @brief Callback that will be invoked when the mDNS service finishes registering our service.
@@ -220,34 +292,11 @@ namespace platf::publish {
   }  // anonymous namespace
 
   [[nodiscard]] std::unique_ptr<::platf::deinit_t> start() {
-    const auto indices = resolve_publish_interface_indices();
-    std::vector<DNSServiceRef> refs;
-    refs.reserve(indices.size());
-    for (const uint32_t iface_idx : indices) {
-      DNSServiceRef serviceRef {};
-      const auto status = DNSServiceRegister(
-        &serviceRef,
-        0,  // flags
-        iface_idx,  // interfaceIndex
-        nullptr,  // name
-        platf::SERVICE_TYPE.data(),
-        nullptr,  // domain
-        nullptr,  // host
-        htons(net::map_port(nvhttp::PORT_HTTP)),
-        0,  // txtLen
-        nullptr,  // txtRecord
-        registrationCallback,
-        nullptr  // context
-      );
-      if (status != kDNSServiceErr_NoError) {
-        BOOST_LOG(error) << "Failed immediately to register DNS service on if="sv << iface_idx << ": Error "sv << status;
-        continue;
-      }
-      refs.push_back(serviceRef);
-    }
+    auto indices = resolve_publish_interface_indices();
+    auto refs = register_for_indices(indices);
     if (refs.empty()) {
       return nullptr;
     }
-    return std::make_unique<deinit_t>(std::move(refs));
+    return std::make_unique<deinit_t>(std::move(indices), std::move(refs));
   }
 }  // namespace platf::publish
