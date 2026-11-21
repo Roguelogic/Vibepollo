@@ -5967,64 +5967,6 @@ launch_session->exact_target_hold.reset();
       // The display should be restored in case something fails as there are no other sessions.
       if (no_active_sessions && !launch_session->input_only) {
         revert_display_configuration = true;
-
-
-#ifdef _WIN32
-        disarm_startup_restore();
-        auto request = display_helper_integration::helpers::build_request_from_session(
-          config::video,
-          *launch_session,
-          dispatch::include_request_identity_log_fields(trace_id)
-        );
-        launch_session->display_config_preapply_attempted = true;
-        if (!request) {
-          BOOST_LOG(warning) << "Display helper: no display configuration request; using the existing display.";
-        }
-
-        if (request) {
-          // Wait for display setup when possible, but keep locked-desktop access
-          // available when setup fails, times out, or is deferred until unlock.
-          const bool applied = display_helper_integration::apply(
-            *request,
-            nullptr,
-            display_startup_cancelled,
-            display_helper_integration::ApplyRetryPolicy::StreamStart,
-            display_startup_deadline);
-          launch_session->display_config_preapplied = applied;
-          if (!applied) {
-            BOOST_LOG(warning) << "Display helper: display setup did not complete; continuing stream startup with the existing display.";
-          }
-        }
-
-        // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
-        const auto physical_hdr_profile_policy = display_helper_integration::request_policy::evaluate({
-          .virtual_display = launch_session->virtual_display,
-          .virtual_display_failed = launch_session->virtual_display_failed,
-          .hdr_profile_selected = launch_session->hdr_profile && !launch_session->hdr_profile->empty(),
-        });
-        if (physical_hdr_profile_policy.apply_hdr_profile_to_physical) {
-          const auto active_output = config::get_active_output_name();
-          VDISPLAY::applyHdrProfileToOutput(
-            launch_session->client_name.c_str(),
-            launch_session->hdr_profile ? launch_session->hdr_profile->c_str() : nullptr,
-            active_output.empty() ? nullptr : active_output.c_str()
-          );
-        }
-#else
-      display_helper_integration::DisplayApplyBuilder noop_builder;
-      noop_builder.set_session(*launch_session);
-      if (!display_helper_integration::apply(noop_builder.build())) {
-        if (launch_session->virtual_display) {
-          const std::string status_message = "Failed to activate the Linux private streaming display.";
-          BOOST_LOG(error) << status_message;
-          tree.put("root.<xmlattr>.status_code", 503);
-          tree.put("root.<xmlattr>.status_message", status_message);
-          tree.put("root.gamesession", 0);
-          return;
-        }
-        BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
-      }
-#endif
 #ifdef __APPLE__
       // Bring the client's virtual display up before the encoder probe.
       if (launch_session->role != remote_session::role_e::input) {
@@ -6863,72 +6805,6 @@ launch_session->exact_target_hold.reset();
           BOOST_LOG(debug) << "NVHTTP Resume trace #" << trace_id << " applying session display request.";
         }
         revert_display_configuration = allow_session_display_changes || launch_session->virtual_display_failed;
-
-#ifdef _WIN32
-        disarm_startup_restore();
-        auto request = display_helper_integration::helpers::build_request_from_session(
-          config::video,
-          *launch_session,
-          dispatch::include_request_identity_log_fields(trace_id)
-        );
-        if (!request) {
-          BOOST_LOG(warning) << "Display helper: no display configuration request; using the existing display.";
-        }
-
-        if (request) {
-          // Display setup is best effort; a locked desktop must remain reachable.
-          const bool applied = display_helper_integration::apply(
-            *request,
-            nullptr,
-            display_startup_cancelled,
-            display_helper_integration::ApplyRetryPolicy::StreamStart,
-            display_startup_deadline);
-          if (!applied) {
-            BOOST_LOG(warning) << "Display helper: display setup did not complete; continuing stream resume with the existing display.";
-          }
-        }
-
-        // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
-        const auto physical_hdr_profile_policy = display_helper_integration::request_policy::evaluate({
-          .virtual_display = launch_session->virtual_display,
-          .virtual_display_failed = launch_session->virtual_display_failed,
-          .hdr_profile_selected = launch_session->hdr_profile && !launch_session->hdr_profile->empty(),
-        });
-        if (physical_hdr_profile_policy.apply_hdr_profile_to_physical) {
-          const auto active_output = config::get_active_output_name();
-          VDISPLAY::applyHdrProfileToOutput(
-            launch_session->client_name.c_str(),
-            launch_session->hdr_profile ? launch_session->hdr_profile->c_str() : nullptr,
-            active_output.empty() ? nullptr : active_output.c_str()
-          );
-        }
-#else
-      display_helper_integration::DisplayApplyBuilder noop_builder;
-      noop_builder.set_session(*launch_session);
-      if (!display_helper_integration::apply(noop_builder.build())) {
-        BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
-      }
-#endif
-      }
-
-      else {
-#ifdef _WIN32
-        BOOST_LOG(debug) << "Display helper: skipping resume apply; only deferrals are allowed.";
-#else
-        display_helper_integration::DisplayApplyBuilder noop_builder;
-        noop_builder.set_session(*launch_session);
-        if (!display_helper_integration::apply(noop_builder.build())) {
-          if (launch_session->virtual_display) {
-            const std::string status_message = "Failed to activate the Linux private streaming display.";
-            BOOST_LOG(error) << status_message;
-            tree.put("root.resume", 0);
-            tree.put("root.<xmlattr>.status_code", 503);
-            tree.put("root.<xmlattr>.status_message", status_message);
-            return;
-          }
-          BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
-        }
-#endif
       }
 #ifdef __APPLE__
       // Bring the client's virtual display up before the encoder probe.

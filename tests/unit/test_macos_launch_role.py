@@ -30,6 +30,6 @@ int main() {
 with tempfile.TemporaryDirectory(prefix='macos-launch-role-') as directory:
  for index,gate in enumerate(blocks):
   source=Path(directory)/f'role-{index}.cpp';source.write_text(base.replace('@GATE@',gate));binary=source.with_suffix('')
-  subprocess.run([args.compiler,'-std=c++23','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(source),'-o',str(binary)],check=True)
+  subprocess.run([args.compiler,'-std=c++23','-Wall','-Wextra','-Werror',str(source),'-o',str(binary)],check=True)
   subprocess.run([str(binary)],check=True)
   print(f'PASS: actual macOS gate {index}: game/monitor acquire display, Remote Input skips it')

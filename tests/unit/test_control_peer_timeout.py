@@ -48,7 +48,7 @@ hot_entry = between(config, "  void apply_config_now(const display_transition::b
 hot_install = between(config, "      auto install_effective_configuration = [&] {", "        if (sunshine.session_history_enabled")
 default_stream = between(config, "    const stream_t default_stream =", "    const input_t default_input =")
 reset = function(config, "    void reset_runtime_config_to_defaults() {")
-apply_entry = between(config, "  void apply_config(std::unordered_map<std::string, std::string> &&vars) {", "    nv::normalize_split_encode_alias(vars);")
+apply_entry = between(config, "  void apply_config(std::unordered_map<std::string, std::string> &&vars) {", "    log_config_settings(vars, true);")
 helpers = between(config, "  void string_f(", "  void string_restricted_f(")
 parse = between(config, '    generic_f(vars, "control_peer_timeout",', '    int_between_f(vars, "lan_encryption_mode",')
 iterate = between(stream, "  void control_server_t::iterate(", "  namespace fec {")
@@ -92,9 +92,9 @@ struct stream_t { std::chrono::milliseconds ping_timeout; };
 };
 ''' + default_stream + r'''
 // Unrelated config fields only satisfy the production reset helper's interface.
-int video, audio, input, frame_limiter, rtss, lossless_scaling;
+int video, audio, input, frame_limiter, lossless_scaling;
 constexpr int default_video = 0, default_audio = 0, default_input = 0,
-  default_frame_limiter = 0, default_rtss = 0, default_lossless_scaling = 0;
+  default_frame_limiter = 0, default_lossless_scaling = 0;
 struct sunshine_t { std::string username, password, salt, config_file, cmd; } sunshine;
 const sunshine_t default_sunshine;
 ''' + reset + r'''
@@ -136,6 +136,7 @@ ENetEvent next_event {};
 int disconnects = 0, callbacks = 0, input_resets = 0;
 int termination_sends = 0, control_flushes = 0;
 int enet_host_service(host_t *, ENetEvent *out, enet_uint32) { *out = next_event; return 1; }
+int enet_host_check_events(host_t *, ENetEvent *) { return 0; }
 void enet_peer_timeout(ENetPeer *peer, enet_uint32 limit, enet_uint32 minimum, enet_uint32 maximum) {
   ++peer->calls; peer->limit = limit; peer->minimum = minimum; peer->maximum = maximum;
 }

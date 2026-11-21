@@ -153,6 +153,7 @@ jobs:
           cmake \
             -B build \
             -S . \
+            -DBUILD_TESTS=ON \
             -DBUILD_WERROR=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DICU_ROOT="$(brew --prefix icu4c@78 2>/dev/null)" \
@@ -160,8 +161,8 @@ jobs:
             -DOPENSSL_USE_STATIC_LIBS=ON \
             -DOpus_ROOT_DIR="$(brew --prefix opus 2>/dev/null)" \
             -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/Nonary/Vibepollo" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/Nonary/Vibepollo/issues" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/Roguelogic/Vibepollo" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/Roguelogic/Vibepollo/issues" \
             -DAPPLE_CODESIGN_IDENTITY="${APPLE_CODESIGN_IDENTITY:--}"
 
       - name: Build
@@ -169,6 +170,10 @@ jobs:
           echo "::add-matcher::.github/matchers/gcc.json"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
           echo "::remove-matcher owner=gcc::"
+
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure -j "$(sysctl -n hw.ncpu)"
 
       - name: Package DMG
         env:

@@ -50,16 +50,12 @@ def main():
         "web-extra/keep.txt": b"not a browser source directory",
     })
     browser_sources = {
-        "web/index.html": b"unbuilt v2 source",
-        "web/src/main.js": b"v2 source code",
-        "web-legacy/index.html": b"unbuilt legacy source",
-        "web-legacy/src/main.js": b"legacy source code",
+        "web/index.html": b"unbuilt web source",
+        "web/src/main.js": b"web source code",
     }
     built_web = {
-        "web/index.html": b"built legacy page",
-        "web/assets/legacy.js": b"built legacy script",
-        "web/v2/index.html": b"built v2 page",
-        "web/v2/assets/v2.js": b"built v2 script",
+        "web/index.html": b"built web page",
+        "web/assets/app.js": b"built web script",
     }
 
     # Spaces in the source, build and destination paths exercise CMake quoting.

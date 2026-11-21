@@ -49,7 +49,7 @@ tuple_macro = between(utility, "#define TUPLE_2D_REF(", "#define TUPLE_3D(")
 state = between(config, "    hardware_metrics_config_t g_hardware_metrics_config;", "\n\n")
 getter = function(config, "  hardware_metrics_settings_t get_hardware_metrics_settings() {")
 reset = function(config, "    void reset_runtime_config_to_defaults() {")
-entry = between(config, "  void apply_config(std::unordered_map<std::string, std::string> &&vars) {", "    nv::normalize_split_encode_alias(vars);")
+entry = between(config, "  void apply_config(std::unordered_map<std::string, std::string> &&vars) {", "    log_config_settings(vars, true);")
 parser = between(config, '    bool_f(vars, "hardware_metrics",', '    bool_f(vars, "realtime_stats_enabled",')
 publication = between(config, "    g_hardware_metrics_config.publish(", "\n") + "\n"
 hot_entry = between(config, "  void apply_config_now(const display_transition::before_mutation_f &before_display_mutation) {", "    try {")
@@ -108,9 +108,9 @@ struct sunshine_t {
 ''' + defaults + r'''
 } sunshine;
 const sunshine_t default_sunshine;
-int video, audio, stream, input, frame_limiter, rtss, lossless_scaling;
+int video, audio, stream, input, frame_limiter, lossless_scaling;
 constexpr int default_video = 0, default_audio = 0, default_stream = 0,
-  default_input = 0, default_frame_limiter = 0, default_rtss = 0, default_lossless_scaling = 0;
+  default_input = 0, default_frame_limiter = 0, default_lossless_scaling = 0;
 ''' + reset + helpers + entry + r'''
   apply_test_hook(1); // real reset is complete; old publication must survive
 ''' + parser + r'''

@@ -20,7 +20,6 @@ def main():
     args = parser.parse_args()
     root = args.root
     provider = (root / 'src/provider_scan_protocol.cpp').read_text()
-    lutris = (root / 'src/lutris_integration.cpp').read_text()
     autosync = (root / 'src/steam_auto_sync_policy.cpp').read_text()
     artwork = (root / 'src/steam_artwork.cpp').read_text()
     code = r'''
@@ -62,8 +61,6 @@ clock_time last_write_time(const path &, std::error_code &ec) {
 namespace fs = testfs;
 '''
     code += function(provider, 'std::string artwork_revision(')
-    code += function(lutris, 'void hash_bytes(')
-    code += function(lutris, 'void hash_path(').replace('std::filesystem', 'testfs')
     code += 'constexpr std::string_view separator {"\\x1f", 1};\n'
     code += function(autosync, 'void mix(')
     code += function(autosync, 'template<typename T>')
@@ -97,13 +94,10 @@ int main(int argc, char **argv) {
     assert(artwork_revision({path}) == std::to_string(expected));
     assert(artwork_revision({}) == "");
     expected = 123;
-    hash_bytes(expected, "cover.png"); hash_bytes(expected, "42"); hash_bytes(expected, text);
-    std::uint64_t actual = 123; hash_path(actual, path); assert(actual == expected);
-    expected = 123;
     mix(expected, "cover.png"); mix(expected, separator);
     mix(expected, "42"); mix(expected, separator);
     mix(expected, text); mix(expected, separator);
-    actual = 123; mix_path(actual, path); assert(actual == expected);
+    std::uint64_t actual = 123; mix_path(actual, path); assert(actual == expected);
     const auto result = fingerprint(path);
     assert(result && result->mtime == text && result->size == 42 && result->path == "cover.png");
   }
@@ -121,7 +115,7 @@ int main(int argc, char **argv) {
     {minimum, "-170141183460469231731687303715884105728"}
   };
   std::set<std::string> revisions, mtimes;
-  std::set<std::uint64_t> lutris_hashes, autosync_hashes;
+  std::set<std::uint64_t> autosync_hashes;
   for (const auto &[tick, text] : cases) {
     testfs::ticks = tick;
     assert(file_clock::count_string(tick) == text);
@@ -130,13 +124,9 @@ int main(int argc, char **argv) {
     const auto revision = artwork_revision({path});
     assert(revision == std::to_string(expected) && revisions.insert(revision).second);
     expected = 123;
-    hash_bytes(expected, "cover.png"); hash_bytes(expected, "42"); hash_bytes(expected, text);
-    std::uint64_t actual = 123; hash_path(actual, path);
-    assert(actual == expected && lutris_hashes.insert(actual).second);
-    expected = 123;
     mix(expected, "cover.png"); mix(expected, separator);
     mix(expected, "42"); mix(expected, separator); mix(expected, text); mix(expected, separator);
-    actual = 123; mix_path(actual, path);
+    std::uint64_t actual = 123; mix_path(actual, path);
     assert(actual == expected && autosync_hashes.insert(actual).second);
     const auto result = fingerprint(path);
     assert(result && result->mtime == text && mtimes.insert(result->mtime).second);
@@ -156,12 +146,8 @@ int main(int argc, char **argv) {
   assert(artwork_revision({path}).empty());
   assert(!fingerprint(path));
   std::uint64_t expected = 123, actual = 123;
-  hash_bytes(expected, "cover.png"); hash_bytes(expected, "missing"); hash_bytes(expected, "unstatable");
-  hash_path(actual, path); assert(actual == expected);
-  expected = actual = 123;
   mix(expected, "cover.png"); mix(expected, separator); mix(expected, "missing"); mix(expected, "unstatable");
   mix_path(actual, path); assert(actual == expected);
-  actual = 123; hash_path(actual, {}); expected = 123; hash_bytes(expected, ""); assert(actual == expected);
   actual = 123; mix_path(actual, {}); expected = 123; mix(expected, ""); mix(expected, separator); assert(actual == expected);
 }
 '''
@@ -172,7 +158,7 @@ int main(int argc, char **argv) {
         subprocess.run([args.compiler, '-std=c++23', '-Wall', '-Wextra', '-Werror',
                         '-I', str(root), str(source), '-o', str(binary)], check=True)
         subprocess.run([str(binary), str(Path(temp) / "artwork.meta")], check=True)
-    print('Four production fingerprint functions passed with signed 128-bit clock counts')
+    print('Three production fingerprint functions passed with signed 128-bit clock counts')
 
 
 if __name__ == '__main__':

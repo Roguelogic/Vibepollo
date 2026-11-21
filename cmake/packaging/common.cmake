@@ -39,7 +39,9 @@ install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}/web"
         COMPONENT assets)
 
-include(${CMAKE_MODULE_PATH}/packaging/unix.cmake)
-include(${CMAKE_MODULE_PATH}/packaging/macos.cmake)
+if(APPLE)
+    include(${CMAKE_MODULE_PATH}/packaging/unix.cmake)
+    include(${CMAKE_MODULE_PATH}/packaging/macos.cmake)
+endif()
 
 include(CPack)

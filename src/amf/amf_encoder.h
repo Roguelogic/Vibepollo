@@ -4,7 +4,6 @@
  */
 #pragma once
 
-#include "amf_config.h"
 #include "amf_encoded_frame.h"
 
 #include "src/platform/common.h"
@@ -12,8 +11,27 @@
 #include "src/video_colorspace.h"
 
 #include <chrono>
+#include <cstdint>
+#include <optional>
 
 namespace amf {
+
+  struct amf_hdr_metadata {
+    struct {
+      uint16_t x;
+      uint16_t y;
+    } displayPrimaries[3];
+
+    struct {
+      uint16_t x;
+      uint16_t y;
+    } whitePoint;
+
+    uint16_t maxDisplayLuminance;
+    uint16_t minDisplayLuminance;
+    uint16_t maxContentLightLevel;
+    uint16_t maxFrameAverageLightLevel;
+  };
 
   /**
    * @brief Standalone AMF encoder interface.
@@ -21,20 +39,6 @@ namespace amf {
   class amf_encoder {
   public:
     virtual ~amf_encoder() = default;
-
-    /**
-     * @brief Create the encoder.
-     * @param config AMF encoder configuration.
-     * @param client_config Stream configuration requested by the client.
-     * @param colorspace YUV colorspace.
-     * @param buffer_format Platform-agnostic input surface format.
-     * @return `true` on success, `false` on error
-     */
-    virtual bool
-    create_encoder(const amf_config &config,
-      const video::config_t &client_config,
-      const video::sunshine_colorspace_t &colorspace,
-      platf::pix_fmt_e buffer_format) = 0;
 
     /**
      * @brief Destroy the encoder.

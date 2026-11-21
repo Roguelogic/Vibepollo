@@ -68,8 +68,13 @@ static void handshakeProbe(const char* address) {
   receiver.send_to(buffer(wrong), target);
   receiver.send_to(buffer(token.data(), token.size() - 1), target);
   if (local.is_v4()) {
-    ip::udp::socket stranger(io, {ip::make_address("127.0.0.2"), 0});
-    stranger.send_to(buffer(token), target);
+    ip::udp::socket stranger(io);
+    stranger.open(ip::udp::v4());
+    boost::system::error_code bind_ec;
+    stranger.bind({ip::make_address("127.0.0.2"), 0}, bind_ec);
+    if (!bind_ec) {
+      stranger.send_to(buffer(token), target);
+    }
   }
   const auto warmup_until = steady_clock::now() + milliseconds(250);
   unsigned warmups = 0;

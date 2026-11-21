@@ -20,7 +20,6 @@
 #include "config_display_transition.h"
 #include "hardware_metrics_config.h"
 #include "input_session_config.h"
-#include "nvenc/nvenc_config.h"
 
 namespace config {
   constexpr int SUNSHINE_VIRTUAL_DISPLAY_MAX_PERMANENT_COUNT = 4;
@@ -76,70 +75,12 @@ namespace config {
       std::optional<int> svtav1_preset;
     } sw;
 
-    nvenc::nvenc_config nv;
-    bool nv_realtime_hags;
-    bool nv_opengl_vulkan_on_dxgi;
-    bool nv_sunshine_high_power_mode;
-
-    struct {
-      int preset;
-      int multipass;
-      int h264_coder;
-      int aq;
-      int vbv_percentage_increase;
-      int split_encode_mode;
-    } nv_legacy;
-
-    struct {
-      std::optional<int> qsv_preset;
-      std::optional<int> qsv_cavlc;
-      bool qsv_slow_hevc;
-    } qsv;
-
-    struct {
-      std::optional<int> amd_usage_h264;
-      std::optional<int> amd_usage_hevc;
-      std::optional<int> amd_usage_av1;
-      std::optional<int> amd_rc_h264;
-      std::optional<int> amd_rc_hevc;
-      std::optional<int> amd_rc_av1;
-      std::optional<int> amd_qvbr_quality_level;
-      std::optional<int> amd_enforce_hrd;
-      std::optional<int> amd_quality_h264;  // nullopt = follow usage-preset default
-      std::optional<int> amd_quality_hevc;  // nullopt = follow usage-preset default
-      std::optional<int> amd_quality_av1;  // nullopt = follow usage-preset default
-      std::optional<int> amd_preanalysis;
-      std::optional<int> amd_vbaq;  // nullopt = follow usage-preset default
-      int amd_coder;
-      // Native AMF encoder (amdvce_experimental) tuning knobs.
-      int amd_ltr_frames;  // Long-term reference frames for RFI (0 = off)
-      int amd_input_queue_size;  // AMF input queue depth (0 = driver default)
-      // Curated tri-state native-AMF feature knobs. nullopt (auto) leaves the
-      // AMF driver default untouched; 1 forces the property on and 0 forces it
-      // off — both explicit values are applied and read back like any other.
-      std::optional<int> amd_smart_access_video;  // Multi-VCN encode (Smart Access Video): 1=on, 0=off
-      std::optional<int> amd_lowlatency_mode;  // AMF LOWLATENCY_MODE (H.264/HEVC): 1=on, 0=off
-      std::optional<int> amd_high_motion_quality_boost;  // High-motion quality boost: 1=on, 0=off
-      std::optional<int> amd_av1_screen_content;  // AV1 screen-content tools: 1=on, 0=off
-      std::optional<int> amd_av1_latency_mode;  // AV1 encoding-latency mode (0-3)
-      int amd_av1_tiles;  // Native AV1 tile override (0=auto; experimental 1/2/4)
-    } amd;
-
     struct {
       int vt_allow_sw;
       int vt_require_sw;
       int vt_realtime;
       int vt_coder;
     } vt;
-
-    struct {
-      bool strict_rc_buffer;
-    } vaapi;
-
-    struct {
-      int tune;  // 0=default, 1=hq, 2=ll, 3=ull, 4=lossless
-      int rc_mode;  // 0=driver, 1=cqp, 2=cbr, 4=vbr
-    } vk;
 
     // NVIDIA TrueHDR (RTX HDR) SDR->HDR synthesis. Conversion is opt-in per app via
     // runtime overrides.
@@ -430,21 +371,6 @@ namespace config {
     }
   };
 
-  // Windows-only: RTSS integration settings
-  struct rtss_t {
-    // RTSS install path. If empty, defaults to "%PROGRAMFILES%/RivaTuner Statistics Server"
-    std::string install_path;
-
-    // SyncLimiter mode. One of: "async", "front edge sync", "back edge sync", "nvidia reflex".
-    // If empty or unrecognized, SyncLimiter is not modified.
-    std::string frame_limit_type;
-
-    // When enabled, the configured SyncLimiter mode may replace the automatic NVIDIA Reflex
-    // policy for virtual-display streams. Game-provided frame generation still selects Reflex
-    // unless the app/client supplies an explicit RTSS mode override.
-    bool allow_virtual_display_override {false};
-  };
-
   struct lossless_scaling_t {
     std::string exe_path;
     bool legacy_auto_detect {false};
@@ -546,7 +472,6 @@ namespace config {
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern frame_limiter_t frame_limiter;
-  extern rtss_t rtss;
   extern lossless_scaling_t lossless_scaling;
   extern sunshine_t sunshine;
 

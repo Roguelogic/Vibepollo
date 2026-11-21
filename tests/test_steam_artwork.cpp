@@ -153,6 +153,7 @@ TEST(SteamArtwork, MissingSourceDoesNotClaimAClientCover) {
   fs::remove_all(root, ec);
 }
 
+#ifdef VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS
 TEST(SteamArtwork, ConvertsWebpCoverWithStaleJpegExtension) {
   // A lossless red pixel, as stored in Steam's local artwork cache.
   constexpr unsigned char webp[] {
@@ -171,7 +172,6 @@ TEST(SteamArtwork, ConvertsWebpCoverWithStaleJpegExtension) {
   fs::remove_all(root, ec);
 }
 
-#ifdef VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS
 TEST(SteamArtwork, ConvertsJpegWithoutFFmpegImageCodecs) {
   jpeg_compress_struct compressor {};
   jpeg_error_mgr error {};

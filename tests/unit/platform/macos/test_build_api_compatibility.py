@@ -129,6 +129,7 @@ DNSServiceErrorType DNSServiceRegister(DNSServiceRef *ref, DNSServiceFlags flags
 int main() {
   // data() is safe only because this particular view spans the complete literal.
   static_assert(platf::SERVICE_TYPE.data()[platf::SERVICE_TYPE.size()] == '\\0');
+  const std::uint32_t iface_idx = 0;
   auto serviceRef = DNSServiceRef{};
   CALL
   assert(status == 0 && calls == 1);

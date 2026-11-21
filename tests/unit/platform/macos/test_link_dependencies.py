@@ -64,7 +64,7 @@ endfunction()
             raise AssertionError('Expected exactly one Darwin arm64 FFmpeg pin')
         (fragments / 'ffmpeg-release.cmake').write_text(release)
 
-        for mode in ('automatic', 'supplied', 'override', 'linux', 'windows'):
+        for mode in ('automatic', 'supplied', 'override'):
             source = directory / mode
             source.mkdir()
             build = source / 'build'

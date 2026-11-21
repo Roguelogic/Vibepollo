@@ -45,9 +45,6 @@ extern "C" {
 #include "input.h"
 #include "input_geometry_policy.h"
 #include "logging.h"
-#if !defined(__APPLE__)
-  #include "nvenc/nvenc_base.h"
-#endif
 #include "platform/common.h"
 #include "process.h"
 #include "pyrowave_host.h"
@@ -758,47 +755,14 @@ namespace video {
       // Keep encoder configuration separate from the exact selected adapter.
       // Output identifiers and the whole-machine GPU inventory are deliberately
       // excluded: neither changes the selected GPU's codec capability.
-      auto append_optional = [&](std::string_view name, const std::optional<int> &value) {
-        oss << '|' << name << '=';
-        if (value) {
-          oss << *value;
-        } else {
-          oss << "auto";
-        }
-      };
       oss << "encoder=" << config::video.encoder
           << "|hevc=" << config::video.hevc_mode
           << "|av1=" << config::video.av1_mode
           << "|pyrowave=" << (config::video.pyrowave ? 1 : 0)
-          << "|amd_coder=" << config::video.amd.amd_coder
-          << "|amd_ltr=" << config::video.amd.amd_ltr_frames
-          << "|amd_queue=" << config::video.amd.amd_input_queue_size
-          << "|amd_av1_tiles=" << config::video.amd.amd_av1_tiles;
-      append_optional("amd_usage_h264", config::video.amd.amd_usage_h264);
-      append_optional("amd_usage_hevc", config::video.amd.amd_usage_hevc);
-      append_optional("amd_usage_av1", config::video.amd.amd_usage_av1);
-      append_optional("amd_rc_h264", config::video.amd.amd_rc_h264);
-      append_optional("amd_rc_hevc", config::video.amd.amd_rc_hevc);
-      append_optional("amd_rc_av1", config::video.amd.amd_rc_av1);
-      append_optional("amd_quality_h264", config::video.amd.amd_quality_h264);
-      append_optional("amd_quality_hevc", config::video.amd.amd_quality_hevc);
-      append_optional("amd_quality_av1", config::video.amd.amd_quality_av1);
-      append_optional("amd_qvbr_quality", config::video.amd.amd_qvbr_quality_level);
-      append_optional("amd_vbaq", config::video.amd.amd_vbaq);
-      append_optional("amd_preanalysis", config::video.amd.amd_preanalysis);
-      append_optional("amd_enforce_hrd", config::video.amd.amd_enforce_hrd);
-      append_optional("amd_lowlatency", config::video.amd.amd_lowlatency_mode);
-      append_optional("amd_motion_boost", config::video.amd.amd_high_motion_quality_boost);
-      append_optional("amd_sav", config::video.amd.amd_smart_access_video);
-      append_optional("amd_av1_screen", config::video.amd.amd_av1_screen_content);
-      append_optional("amd_av1_latency", config::video.amd.amd_av1_latency_mode);
-      // Quarantine changes encoder selection, so it belongs in the key. Once the
-      // gate latches, `amdvce_experimental` can no longer build a session; a cached success
-      // from before the quarantine would keep handing back `chosen_encoder =
-      // &amdvce_experimental` and every later stream would end before its first packet, even
-      // though the software encoder would have validated. Re-key so the next
-      // probe re-runs and selection can degrade to software as designed.
-      oss << "|amf_quarantined=" << (native_amf_lifecycle_gate.is_quarantined() ? 1 : 0);
+          << "|vt_coder=" << config::video.vt.vt_coder
+          << "|vt_allow_sw=" << config::video.vt.vt_allow_sw
+          << "|vt_require_sw=" << config::video.vt.vt_require_sw
+          << "|vt_realtime=" << config::video.vt.vt_realtime;
       const auto adapter_identity = probe_target ?
                                       probe_target->adapter_identity :
                                       resolve_probe_target(false).adapter_identity;
@@ -3984,12 +3948,6 @@ namespace video {
           ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
         } else {
           ctx->rc_buffer_size = bitrate / config.framerate;
-
-#ifndef __APPLE__
-          if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
-            ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
-          }
-#endif
         }
       }
 
@@ -7203,12 +7161,6 @@ namespace video {
     });
 
     auto encoder_list = encoders;
-#if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
-    const auto nvenc_selection_policy = nvenc::encoder_selection_policy(config::video.encoder);
-    if (!nvenc_selection_policy.include_native) {
-      encoder_list.erase(std::remove(encoder_list.begin(), encoder_list.end(), &nvenc), encoder_list.end());
-    }
-#endif
 #ifdef _WIN32
     const auto amf_selection_policy = amf::lifecycle::encoder_selection_policy(config::video.encoder);
     // Prefer native AMD automatically; explicit implementation choices remain strict.
@@ -7281,12 +7233,6 @@ namespace video {
 
       if (new_encoder == nullptr) {
         BOOST_LOG(error) << "Couldn't find any working encoder matching ["sv << config::video.encoder << ']';
-#if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
-        if (nvenc_selection_policy.fail_closed) {
-          BOOST_LOG(error) << "Native NVENC was explicitly selected; refusing automatic fallback to legacy FFmpeg NVENC or another encoder"sv;
-          return -1;
-        }
-#endif
 #ifdef _WIN32
         if (amf_selection_policy.fail_closed) {
           BOOST_LOG(error) << "An AMD implementation was explicitly selected; refusing automatic fallback to another encoder"sv;
