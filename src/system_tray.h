@@ -93,4 +93,7 @@ namespace system_tray {
    * Clicking it opens the Web UI Dashboard for more information.
    */
   void update_tray_vigem_missing();
+#if defined(__APPLE__) || defined(__MACH__)
+  void refresh_macos_tray_checks();
+#endif
 }  // namespace system_tray

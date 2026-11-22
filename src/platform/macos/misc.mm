@@ -338,9 +338,6 @@ namespace platf {
   }
 
   bool opens_at_login() {
-    if (loginscreen_agent_enabled()) {
-      return true;
-    }
     if (@available(macOS 13.0, *)) {
       return login_agent().status == SMAppServiceStatusEnabled;
     }
@@ -393,7 +390,6 @@ namespace platf {
       "  </dict>\n"
       "  <key>LimitLoadToSessionType</key>\n"
       "  <array>\n"
-      "    <string>Aqua</string>\n"
       "    <string>LoginWindow</string>\n"
       "  </array>\n"
       "  <key>RunAtLoad</key>\n"
@@ -445,17 +441,6 @@ namespace platf {
     const std::string canon_exec = fs::weakly_canonical(fs::path {executable}, ec).string();
     const std::string &exe = (!ec && !canon_exec.empty()) ? canon_exec : std::string {executable};
     const std::string cfg_dir = appdata().string();
-
-    if (enabled) {
-      // Unregister duplicate per-user SMAppService agent if active so Aqua only runs one agent.
-      if (@available(macOS 13.0, *)) {
-        SMAppService *agent = login_agent();
-        if (agent.status == SMAppServiceStatusEnabled) {
-          NSError *err = nil;
-          (void) [agent unregisterAndReturnError:&err];
-        }
-      }
-    }
 
     using AuthRef = struct AuthorizationOpaqueRef *;
     struct AuthItem {
@@ -519,8 +504,9 @@ namespace platf {
       std::fclose(pipe_fp);
     }
     if (exec_status == errSecSuccess) {
-      int wait_status = 0;
-      (void) wait(&wait_status);
+      for (int i = 0; i < 40 && loginscreen_agent_enabled() != enabled; ++i) {
+        std::this_thread::sleep_for(25ms);
+      }
     }
     auth_free(auth, 0);
     dlclose(sec);
@@ -529,16 +515,10 @@ namespace platf {
   }
 
   bool set_opens_at_login(bool enabled) {
-    if (!enabled && loginscreen_agent_enabled()) {
-      (void) set_loginscreen_agent_enabled(false);
-    }
     if (@available(macOS 13.0, *)) {
       SMAppService *agent = login_agent();
       NSError *error = nil;
       if (enabled) {
-        if (loginscreen_agent_enabled()) {
-          return true;
-        }
         // launchd starts the agent right away, and it takes over from this copy.
         if (![agent registerAndReturnError:&error]) {
           BOOST_LOG(warning) << "Couldn't turn on Open at Login: "sv << error.localizedDescription.UTF8String;
@@ -605,8 +585,7 @@ namespace platf {
       return false;
     }
 
-    const std::string label = loginscreen_agent_enabled() ? std::string {loginscreen_label} : std::string {PROJECT_FQDN};
-    auto service = "gui/"s + std::to_string(getuid()) + "/" + label;
+    auto service = "gui/"s + std::to_string(getuid()) + "/" + std::string {PROJECT_FQDN};
     if (!start_login_agent(service)) {
       // launchd only starts the agent for the build that registered it, so an update can leave it
       // unable to. Turning Open at Login off and on again registers it for this build.

@@ -6,6 +6,9 @@
 
 // standard includes
 #include <atomic>
+#include <functional>
+#include <optional>
+#include <string>
 #include <string_view>
 
 // local includes
@@ -13,8 +16,14 @@
 #include "thread_safe.h"
 
 /**
- * @brief Launch the Web UI.
- * @param path Optional path to append to the base URL.
+ * @brief Register a platform-native UI launcher (e.g. macOS SwiftUI Settings window).
+ *        When set and returning true, `launch_ui()` opens the native UI instead of a browser URL.
+ */
+void set_native_ui_launcher(std::function<bool(std::string_view)> launcher);
+
+/**
+ * @brief Launch the UI (native window on macOS when available, otherwise Web UI).
+ * @param path Optional path to append to the base URL or route into the native UI.
  * @examples
  * launch_ui();
  * launch_ui("/pin");

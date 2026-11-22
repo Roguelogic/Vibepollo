@@ -157,6 +157,7 @@ namespace stream {
     int dynamic_range;  // Encoder bit depth: 0=8-bit, 1=10-bit
     bool hdr;
     bool yuv444;
+    bool direct_usb = false;
     int audio_channels;
     std::string stream_gpu_model;
     std::string state;

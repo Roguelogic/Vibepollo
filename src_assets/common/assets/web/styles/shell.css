@@ -152,6 +152,23 @@
 }
 .host-health__refresh {
   margin-left: auto;
+  opacity: 0.72;
+  transition:
+    opacity var(--vs-motion-duration-control),
+    color var(--vs-motion-duration-control);
+}
+.host-health:hover .host-health__refresh {
+  opacity: 1;
+  color: var(--vs-color-text-primary);
+}
+.host-health[aria-busy='true'] .host-health__refresh {
+  opacity: 1;
+  animation: vs-spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .host-health[aria-busy='true'] .host-health__refresh {
+    animation-duration: 0.01ms;
+  }
 }
 .theme-picker {
   display: flex;

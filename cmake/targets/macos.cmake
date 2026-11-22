@@ -41,3 +41,20 @@ endif()
 
 # Tell linker to dynamically load these symbols at runtime, in case they're unavailable:
 target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,-U,_CGRequestScreenCaptureAccess)
+
+if(SUNSHINE_ENABLE_TRAY)
+    add_library(vibepollo_macos_ui STATIC
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/Localization.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/Models.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/HostStore.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/SettingsWindowController.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeSettingsViews.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeAdvancedSheets.swift")
+    set_target_properties(vibepollo_macos_ui PROPERTIES
+            SWIFT_LANGUAGE_VERSION 5)
+    target_compile_options(vibepollo_macos_ui PRIVATE
+            -import-objc-header "${CMAKE_SOURCE_DIR}/src/platform/macos/settings_bridge.h")
+    set_target_properties(sunshine PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_directories(sunshine PRIVATE ${CMAKE_Swift_IMPLICIT_LINK_DIRECTORIES})
+    target_link_libraries(sunshine vibepollo_macos_ui "-framework SwiftUI")
+endif()

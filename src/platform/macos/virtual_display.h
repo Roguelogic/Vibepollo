@@ -116,6 +116,16 @@ namespace platf::macos_virtual_display {
   bool display_changes_settled();
 
   /**
+   * @brief Re-apply config::video.dd.virtual_display_scale_percent to active virtual displays live.
+   */
+  void reapply_scale();
+
+  /**
+   * @brief Monotonic counter incremented when reapply_scale() changes a virtual display's backing pixels.
+   */
+  std::uint64_t scale_reinit_epoch();
+
+  /**
    * @brief Turn back on displays left off: by a previous run, or by a stream that ended with the lid closed.
    * @details Schedules the work on the main event loop. Does nothing while a virtual display is up, as
    *          during a stream or a paused session: removing it turns the displays back on.

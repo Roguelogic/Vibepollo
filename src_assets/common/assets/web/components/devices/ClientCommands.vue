@@ -102,34 +102,50 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
       </div>
     </div>
 
-    <SettingRow
-      class="client-command-editor__allow client-setting-row--switch"
-      :label="t('pin.allow_client_commands')"
-      :description="t('pin.allow_client_commands_desc')"
-      :control-id="`${controlIdPrefix}-allow`"
-    >
-      <label class="vs-switch">
-        <input
-          :id="`${controlIdPrefix}-allow`"
-          type="checkbox"
-          :checked="allowClientCommands"
-          :disabled="disabled"
-          @change="
-            emit(
-              'update:allowClientCommands',
-              ($event.target as HTMLInputElement).checked,
-            )
-          "
-        />
-        <span class="vs-switch__track" aria-hidden="true" />
-        <span class="vs-sr-only">{{ t('pin.allow_client_commands') }}</span>
-      </label>
-    </SettingRow>
+    <div class="vs-settings-group">
+      <SettingRow
+        class="client-command-editor__allow client-setting-row--switch"
+        :label="t('pin.allow_client_commands')"
+        :description="t('pin.allow_client_commands_desc')"
+        :control-id="`${controlIdPrefix}-allow`"
+      >
+        <label class="vs-switch">
+          <input
+            :id="`${controlIdPrefix}-allow`"
+            type="checkbox"
+            :checked="allowClientCommands"
+            :disabled="disabled"
+            @change="
+              emit('update:allowClientCommands', ($event.target as HTMLInputElement).checked)
+            "
+          />
+          <span class="vs-switch__track" aria-hidden="true" />
+          <span class="vs-sr-only">{{ t('pin.allow_client_commands') }}</span>
+        </label>
+      </SettingRow>
+    </div>
 
     <div v-if="allowClientCommands" class="client-command-editor__lists">
-      <fieldset v-for="section in commandSections" :key="section.key">
-        <legend>{{ t(section.labelKey) }}</legend>
-        <p>{{ t(section.descriptionKey) }}</p>
+      <div
+        v-for="section in commandSections"
+        :key="section.key"
+        class="client-command-editor__group"
+        role="group"
+        :aria-labelledby="`${controlIdPrefix}-${section.key}-title`"
+      >
+        <div class="client-command-editor__group-heading">
+          <div>
+            <h4 :id="`${controlIdPrefix}-${section.key}-title`">{{ t(section.labelKey) }}</h4>
+            <p>{{ t(section.descriptionKey) }}</p>
+          </div>
+          <AppButton
+            :label="t('_common.add')"
+            icon="plus"
+            size="compact"
+            :disabled="disabled"
+            @click="addCommand(section.key)"
+          />
+        </div>
         <div v-if="commandsFor(section.key).length" class="client-command-editor__list">
           <div
             v-for="(entry, index) in commandsFor(section.key)"
@@ -147,11 +163,7 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
                 :value="entry.command"
                 :disabled="disabled"
                 @input="
-                  updateCommand(
-                    section.key,
-                    index,
-                    ($event.target as HTMLTextAreaElement).value,
-                  )
+                  updateCommand(section.key, index, ($event.target as HTMLTextAreaElement).value)
                 "
               />
             </SettingRow>
@@ -162,11 +174,7 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
                   :checked="entry.elevated === true"
                   :disabled="disabled"
                   @change="
-                    updateElevated(
-                      section.key,
-                      index,
-                      ($event.target as HTMLInputElement).checked,
-                    )
+                    updateElevated(section.key, index, ($event.target as HTMLInputElement).checked)
                   "
                 />
                 {{ t('_common.elevated') }}
@@ -186,14 +194,7 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
         <p v-else class="client-command-editor__empty">
           {{ t('ui.devices.editor.commands_empty') }}
         </p>
-        <AppButton
-          :label="t('_common.add')"
-          icon="plus"
-          size="compact"
-          :disabled="disabled"
-          @click="addCommand(section.key)"
-        />
-      </fieldset>
+      </div>
     </div>
   </section>
 </template>
@@ -211,43 +212,51 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
 .client-command-editor__heading,
 .client-command-editor__lists,
 .client-command-editor__list,
-.client-command-editor fieldset {
+.client-command-editor__group {
   display: grid;
   gap: var(--vs-space-12);
 }
 
-.client-command-editor__heading h3,
-.client-command-editor fieldset legend {
-  margin: 0;
-  color: var(--vs-color-text-primary);
-  font-weight: var(--vs-type-weight-semibold);
+.client-command-editor__group-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--vs-space-12);
 }
 
-.client-command-editor__heading h3 {
+.client-command-editor__heading h3,
+.client-command-editor__group-heading h4 {
+  margin: 0;
+  color: var(--vs-color-text-primary);
   font-size: var(--vs-type-size-control);
+  font-weight: var(--vs-type-weight-semibold);
   line-height: var(--vs-type-line-height-control);
 }
 
 .client-command-editor__heading p,
-.client-command-editor fieldset p,
+.client-command-editor__group-heading p,
 .client-command-editor__empty {
-  margin: 0;
+  margin: var(--vs-space-4) 0 0;
   color: var(--vs-color-text-secondary);
   font-size: var(--vs-type-size-metadata);
   line-height: var(--vs-type-line-height-metadata);
 }
 
-.client-command-editor fieldset {
+.client-command-editor__group {
   min-inline-size: 0;
   margin: 0;
-  padding: var(--vs-space-12);
+  padding: var(--vs-space-16);
   border: 1px solid var(--vs-color-border-subtle);
   border-radius: var(--vs-radius-card);
-  background: var(--vs-color-bg-raised);
+  background: var(--vs-color-bg-subtle);
 }
 
-.client-command-editor fieldset legend {
-  padding-inline: var(--vs-space-4);
+.client-command-editor__empty {
+  margin: 0;
+  padding: var(--vs-space-12);
+  border: 1px dashed var(--vs-color-border-subtle);
+  border-radius: var(--vs-radius-control);
+  background: var(--vs-color-bg-surface);
 }
 
 .client-command-editor__row {
@@ -277,7 +286,7 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
 }
 
 .client-command-editor > :deep(.vs-button),
-.client-command-editor fieldset > :deep(.vs-button) {
+.client-command-editor__group > :deep(.vs-button) {
   justify-self: start;
 }
 
@@ -301,11 +310,15 @@ function updateElevated(key: CommandList, index: number, value: boolean): void {
     min-inline-size: 0;
     justify-content: flex-start;
   }
+
+  .client-command-editor__group-heading {
+    flex-wrap: wrap;
+  }
 }
 
 @container client-settings (max-width: 20rem) {
   .client-command-editor,
-  .client-command-editor fieldset {
+  .client-command-editor__group {
     padding: var(--vs-space-12);
   }
 

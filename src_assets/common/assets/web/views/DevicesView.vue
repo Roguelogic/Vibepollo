@@ -1012,7 +1012,7 @@ onBeforeUnmount(() => {
                 <code>{{ device.uuid }}</code>
               </div>
               <div class="device-row__actions">
-                <label class="vs-button vs-button--tertiary">
+                <label class="vs-button vs-button--tertiary vs-button--compact">
                   <input type="checkbox" :checked="device.enabled" :disabled="Boolean(busyUuid)"
                     @change="toggleEnabled(device, $event)" />
                   {{ t('_common.enabled') }}

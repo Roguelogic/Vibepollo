@@ -12,6 +12,7 @@ import {
 } from '@/utils/settings';
 
 import { ApiError, apiGet, apiPatch, apiPost } from '@/api/client';
+import { setVibepolloLocale } from '@/i18n';
 import GlobalPrepCommands from '@/components/settings/GlobalPrepCommands.vue';
 import ServerCommands from '@/components/settings/ServerCommands.vue';
 import {
@@ -819,6 +820,9 @@ async function save(): Promise<void> {
     const patch = Object.fromEntries(Object.keys(submitted).map((key) => [key, saveValue(key)]));
     const result = await apiPatch<SaveResult>('/api/config', patch);
     if (result.status === false) throw new Error('save-rejected');
+    if ('locale' in patch) {
+      await setVibepolloLocale(String(values.locale || 'en'));
+    }
     original.value = acknowledgeSettings(original.value, submitted);
     syncDummyPlugTracking(original.value);
     await loadDisplayMaintenanceStatus();

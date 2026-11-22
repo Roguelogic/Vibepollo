@@ -425,6 +425,7 @@ namespace platf {
       std::mutex mutex;
       bool stopped = false;
       bool delivered = false;
+      bool scale_reinit = false;
       std::chrono::steady_clock::time_point last_frame = std::chrono::steady_clock::now();
     };
 
@@ -568,12 +569,21 @@ namespace platf {
         IOPMAssertionRelease(keep_awake);
       });
 
+      const std::uint64_t initial_scale_epoch = macos_virtual_display::scale_reinit_epoch();
       auto state = std::make_shared<capture_state_t>();
       // Copied to the heap: the capture can hold on to it after this function returns.
       FrameCallbackBlock on_frame = [^bool(CMSampleBufferRef sampleBuffer) {
         std::lock_guard lock {state->mutex};
         if (state->stopped) {
           return false;
+        }
+        if (macos_virtual_display::scale_reinit_epoch() != initial_scale_epoch) {
+          const auto pixels = mode_pixels(display_id);
+          if (pixels.first != 0 && captured_pixels.first != 0 && pixels != captured_pixels) {
+            state->stopped = true;
+            state->scale_reinit = true;
+            return false;
+          }
         }
 
         if (need_bootstrap_sample.load(std::memory_order_relaxed) &&
@@ -637,7 +647,7 @@ namespace platf {
         if (change) {
           state->stopped = true;
           BOOST_LOG(info) << "Display "sv << display_id << ' ' << *change << "; setting up capture again"sv;
-          return restart_status();
+          return macos_virtual_display::scale_reinit_epoch() != initial_scale_epoch ? capture_e::reinit : restart_status();
         }
         if (std::chrono::steady_clock::now() - state->last_frame < 1s) {
           continue;  // a frame arrived while waiting
@@ -653,6 +663,10 @@ namespace platf {
       // The capture signals when a callback stops it, or when it stops by itself: ScreenCaptureKit
       // ends a stream on errors, such as its display going away. Start over in that case.
       std::lock_guard lock {state->mutex};
+      if (state->scale_reinit) {
+        BOOST_LOG(info) << "Display "sv << display_id << " backing scale changed; setting up capture again"sv;
+        return capture_e::reinit;
+      }
       if (!state->stopped) {
         state->stopped = true;
         BOOST_LOG(warning) << "Capture of display "sv << display_id << " stopped by itself ("sv << stop_reason() << "); restarting it"sv;

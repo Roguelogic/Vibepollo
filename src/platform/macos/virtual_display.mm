@@ -293,14 +293,14 @@ namespace platf::macos_virtual_display {
      * @brief Map Vibepollo's display scale setting onto what macOS offers: Retina (2x) or standard (1x).
      * @details -1 (resolution-based) picks Retina above 1920x1200, where a standard-density desktop
      *          would have tiny text (phones at native resolution, 1440p, 4K); 0 keeps macOS's
-     *          default (standard); otherwise 150% and up is Retina.
+     *          default (standard); otherwise 125% and up uses Retina HiDPI backing modes.
      */
     bool use_hidpi(const int width, const int height) {
       const int scale = config::video.dd.virtual_display_scale_percent;
       if (scale < 0) {
         return width > 1920 || height > 1200;
       }
-      return scale >= 150;
+      return scale >= 125;
     }
 
     bool same_mode(const CGDisplayModeRef a, const CGDisplayModeRef b) {
@@ -394,6 +394,8 @@ namespace platf::macos_virtual_display {
       ///< Target Retina mode when explicit scaling is configured, or default 2x fallback.
       bool hidpi = false;
       bool explicit_scale = false;
+      unsigned int max_pixels_wide = 0;
+      unsigned int max_pixels_high = 0;
       std::size_t default_mode_width = 0;
       std::size_t default_mode_height = 0;
       std::size_t default_pixel_width = 0;
@@ -678,7 +680,14 @@ namespace platf::macos_virtual_display {
     }
 
     void ensure_retina_mode(virtual_display_t &display) {
-      if (!display.hidpi || !is_active(display.id)) {
+      if (!is_active(display.id)) {
+        sync_recorded_mode(display);
+        return;
+      }
+      if (!display.hidpi) {
+        if (display.explicit_scale && display.default_mode_width > 0 && display.default_pixel_width > 0) {
+          select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
+        }
         sync_recorded_mode(display);
         return;
       }
@@ -702,6 +711,122 @@ namespace platf::macos_virtual_display {
         select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
       }
       sync_recorded_mode(display);
+    }
+
+    struct scale_geometry_t {
+      bool hidpi = false;
+      bool explicit_scale = false;
+      unsigned int mode_width = 0;
+      unsigned int mode_height = 0;
+      unsigned int pixel_width = 0;
+      unsigned int pixel_height = 0;
+    };
+
+    scale_geometry_t compute_scale_geometry(
+      const int width,
+      const int height,
+      const unsigned int max_pixels_wide,
+      const unsigned int max_pixels_high,
+      const int configured_scale
+    ) {
+      const unsigned int base_w = std::max(2u, static_cast<unsigned int>(width) & ~1u);
+      const unsigned int base_h = std::max(2u, static_cast<unsigned int>(height) & ~1u);
+      const bool auto_hidpi = (width > 1920 || height > 1200);
+      const bool hidpi = configured_scale <= 0 ? auto_hidpi : (configured_scale >= 125);
+      const bool explicit_scale = configured_scale >= 100;
+
+      scale_geometry_t g;
+      g.hidpi = hidpi;
+      g.explicit_scale = explicit_scale;
+
+      if (!hidpi) {
+        g.mode_width = g.pixel_width = base_w;
+        g.mode_height = g.pixel_height = base_h;
+        return g;
+      }
+
+      if (configured_scale <= 0 || configured_scale == 200) {
+        const auto size = macos_display_policy::virtual_display_size(width, height, true);
+        g.mode_width = size.width;
+        g.mode_height = size.height;
+        g.pixel_width = size.pixel_width;
+        g.pixel_height = size.pixel_height;
+        return g;
+      }
+
+      const double factor = configured_scale / 100.0;
+      const unsigned int cap_lw = std::max(640u, max_pixels_wide / 2);
+      const unsigned int cap_lh = std::max(480u, max_pixels_high / 2);
+      unsigned int lw = std::clamp(round_even(base_w / factor), 640u, cap_lw);
+      unsigned int lh = std::clamp(round_even(static_cast<double>(lw) * base_h / base_w), 480u, cap_lh);
+      if (lh * 2 > max_pixels_high) {
+        lh = (max_pixels_high / 2) & ~1u;
+        lw = std::clamp(round_even(static_cast<double>(lh) * base_w / base_h), 640u, cap_lw);
+      }
+      g.mode_width = lw;
+      g.mode_height = lh;
+      g.pixel_width = lw * 2;
+      g.pixel_height = lh * 2;
+      return g;
+    }
+
+    bool apply_virtual_display_settings(
+      CGVirtualDisplay *display,
+      const int width,
+      const int height,
+      const unsigned int max_pixels_wide,
+      const unsigned int max_pixels_high,
+      const double refresh,
+      const bool make_hdr,
+      const scale_geometry_t &geom
+    ) {
+      const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
+      const Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
+      if (!display || !settings_class || !mode_class) {
+        return false;
+      }
+
+      CGVirtualDisplaySettings *settings = [[settings_class alloc] init];
+      settings.hiDPI = geom.hidpi ? 1 : 0;
+      NSMutableArray *modes = [NSMutableArray array];
+      std::vector<std::pair<unsigned int, unsigned int>> added_dims;
+      const auto add_mode = [&](const unsigned int w, const unsigned int h) {
+        if (w == 0 || h == 0 || w > max_pixels_wide || h > max_pixels_high) {
+          return;
+        }
+        if (std::find(added_dims.begin(), added_dims.end(), std::pair {w, h}) != added_dims.end()) {
+          return;
+        }
+        added_dims.emplace_back(w, h);
+        CGVirtualDisplayMode *m = make_hdr ?
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh transferFunction:hdr_transfer_function] :
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh];
+        if (m) {
+          [modes addObject:m];
+        }
+      };
+
+      const auto base_size = macos_display_policy::virtual_display_size(width, height, geom.hidpi);
+      if (geom.hidpi) {
+        add_mode(base_size.pixel_width, base_size.pixel_height);
+        add_mode(base_size.width, base_size.height);
+        add_mode(geom.pixel_width, geom.pixel_height);
+        add_mode(geom.mode_width, geom.mode_height);
+        constexpr double scale_factors[] = {1.25, 1.50, 1.75, 2.15, 2.25, 2.3888889, 2.50, 2.6875, 3.00};
+        for (const double factor : scale_factors) {
+          const unsigned int lw = round_even(base_size.pixel_width / factor);
+          const unsigned int lh = round_even(static_cast<double>(lw) * base_size.pixel_height / base_size.pixel_width);
+          if (lw >= 640 && lh >= 480 && lw * 2 <= max_pixels_wide && lh * 2 <= max_pixels_high) {
+            add_mode(lw * 2, lh * 2);
+            add_mode(lw, lh);
+          }
+        }
+      } else {
+        add_mode(geom.pixel_width, geom.pixel_height);
+      }
+
+      settings.modes = modes;
+      return [display applySettings:settings] == YES;
     }
 
     /**
@@ -737,25 +862,14 @@ namespace platf::macos_virtual_display {
       platf::wake_displays();
       const saved_modes_t other_modes;
 
-      const int configured_scale = config::video.dd.virtual_display_scale_percent;
-      const bool hidpi = configured_scale == 0 ? (width > 1920 || height > 1200) : use_hidpi(width, height);
-      // HiDPI modes are sized in points; their backing store, which is what gets captured, is 2x.
-      const auto size = macos_display_policy::virtual_display_size(width, height, hidpi);
-      const unsigned int max_pixel_width = size.pixel_width;
-      const unsigned int max_pixel_height = size.pixel_height;
+      const unsigned int base_w = std::max(2u, static_cast<unsigned int>(width) & ~1u);
+      const unsigned int base_h = std::max(2u, static_cast<unsigned int>(height) & ~1u);
+      const double headroom_factor = std::min({1.6, 7680.0 / base_w, 4320.0 / base_h});
+      const unsigned int max_pixel_width = std::max(base_w, round_even(base_w * std::max(1.0, headroom_factor)));
+      const unsigned int max_pixel_height = std::max(base_h, round_even(base_h * std::max(1.0, headroom_factor)));
 
-      unsigned int target_mode_width = size.width;
-      unsigned int target_mode_height = size.height;
-      unsigned int target_pixel_width = max_pixel_width;
-      unsigned int target_pixel_height = max_pixel_height;
-      const bool explicit_scale = hidpi && configured_scale >= 150;
-      if (hidpi && configured_scale >= 200) {
-        const double factor = configured_scale / 100.0;
-        target_mode_width = std::clamp(round_even(max_pixel_width / factor), 800u, std::max(800u, max_pixel_width / 2));
-        target_mode_height = std::clamp(round_even(static_cast<double>(target_mode_width) * max_pixel_height / max_pixel_width), 600u, std::max(600u, max_pixel_height / 2));
-        target_pixel_width = target_mode_width * 2;
-        target_pixel_height = target_mode_height * 2;
-      }
+      const int configured_scale = config::video.dd.virtual_display_scale_percent;
+      const auto geom = compute_scale_geometry(width, height, max_pixel_width, max_pixel_height, configured_scale);
 
       CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
       descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
@@ -763,8 +877,8 @@ namespace platf::macos_virtual_display {
       descriptor.maxPixelsWide = max_pixel_width;
       descriptor.maxPixelsHigh = max_pixel_height;
       // Only informs macOS's defaults: a Retina or a standard pixel density to match the mode.
-      const double ppi = hidpi ? 220.0 : 110.0;
-      descriptor.sizeInMillimeters = CGSizeMake(max_pixel_width / ppi * 25.4, max_pixel_height / ppi * 25.4);
+      const double ppi = geom.hidpi ? 220.0 : 110.0;
+      descriptor.sizeInMillimeters = CGSizeMake(base_w / ppi * 25.4, base_h / ppi * 25.4);
       descriptor.vendorID = vendor_id;
       descriptor.productID = product_id;
       descriptor.serialNum = serial;
@@ -786,59 +900,23 @@ namespace platf::macos_virtual_display {
         return nullptr;
       }
 
-      CGVirtualDisplaySettings *settings = [[settings_class alloc] init];
-      settings.hiDPI = hidpi ? 1 : 0;
-      NSMutableArray *modes = [NSMutableArray array];
-      std::vector<std::pair<unsigned int, unsigned int>> added_dims;
-      const auto add_mode = [&](const unsigned int w, const unsigned int h) {
-        if (w == 0 || h == 0 || w > max_pixel_width || h > max_pixel_height) {
-          return;
-        }
-        if (std::find(added_dims.begin(), added_dims.end(), std::pair {w, h}) != added_dims.end()) {
-          return;
-        }
-        added_dims.emplace_back(w, h);
-        CGVirtualDisplayMode *m = make_hdr ?
-                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh transferFunction:hdr_transfer_function] :
-                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh];
-        if (m) {
-          [modes addObject:m];
-        }
-      };
-
-      if (hidpi) {
-        add_mode(max_pixel_width, max_pixel_height);
-        add_mode(size.width, size.height);
-        add_mode(target_pixel_width, target_pixel_height);
-        add_mode(target_mode_width, target_mode_height);
-        // Expose Retina HiDPI scaling steps ("More Space" <-> "Larger Text") in System Settings > Displays
-        constexpr double scale_factors[] = {2.15, 2.25, 2.3888889, 2.50, 2.6875, 3.00};
-        for (const double factor : scale_factors) {
-          const unsigned int lw = round_even(max_pixel_width / factor);
-          const unsigned int lh = round_even(static_cast<double>(lw) * max_pixel_height / max_pixel_width);
-          if (lw >= 800 && lh >= 600 && lw * 2 <= max_pixel_width && lh * 2 <= max_pixel_height) {
-            add_mode(lw * 2, lh * 2);
-            add_mode(lw, lh);
-          }
-        }
-      } else {
-        add_mode(size.width, size.height);
-      }
-
-      settings.modes = modes;
-      if (![result->display applySettings:settings]) {
-        BOOST_LOG(error) << "Virtual display: macOS rejected "sv << target_mode_width << 'x' << target_mode_height << '@' << refresh << "Hz"sv;
+      if (!apply_virtual_display_settings(result->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
+        BOOST_LOG(error) << "Virtual display: macOS rejected "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
         return nullptr;
       }
       result->id = result->display.displayID;
+      result->width = width;
+      result->height = height;
+      result->max_pixels_wide = max_pixel_width;
+      result->max_pixels_high = max_pixel_height;
       result->refresh = refresh;
       result->hdr = make_hdr;
-      result->hidpi = hidpi;
-      result->explicit_scale = explicit_scale;
-      result->default_mode_width = target_mode_width;
-      result->default_mode_height = target_mode_height;
-      result->default_pixel_width = target_pixel_width;
-      result->default_pixel_height = target_pixel_height;
+      result->hidpi = geom.hidpi;
+      result->explicit_scale = geom.explicit_scale;
+      result->default_mode_width = geom.mode_width;
+      result->default_mode_height = geom.mode_height;
+      result->default_pixel_width = geom.pixel_width;
+      result->default_pixel_height = geom.pixel_height;
 
       if (!wait_until([id = result->id]() {
             return is_active(id);
@@ -856,7 +934,7 @@ namespace platf::macos_virtual_display {
       }
       BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << result->pixel_width << 'x' << result->pixel_height << '@' << refresh << "Hz"sv
                       << (make_hdr ? " HDR"sv : ""sv)
-                      << (hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
+                      << (geom.hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
                       << ", display id "sv << result->id;
       return result;
     }
@@ -1470,6 +1548,104 @@ namespace platf::macos_virtual_display {
 
   bool display_changes_settled() {
     return settled_generation.load() == change_generation.load();
+  }
+
+  namespace {
+    std::atomic<std::uint64_t> scale_reinit_counter {0};
+
+    bool reapply_scale_to_display(virtual_display_t &vd, const int configured_scale) {
+      if (!vd.display || vd.id == kCGNullDirectDisplay || !is_active(vd.id) || vd.width <= 0 || vd.height <= 0) {
+        return false;
+      }
+      if (configured_scale == 0) {
+        sync_recorded_mode(vd);
+        return false;
+      }
+
+      const unsigned int max_w = vd.max_pixels_wide > 0 ? vd.max_pixels_wide : static_cast<unsigned int>(vd.width);
+      const unsigned int max_h = vd.max_pixels_high > 0 ? vd.max_pixels_high : static_cast<unsigned int>(vd.height);
+      const auto geom = compute_scale_geometry(vd.width, vd.height, max_w, max_h, configured_scale);
+
+      sync_recorded_mode(vd);
+      if (vd.mode_width == geom.mode_width &&
+          vd.mode_height == geom.mode_height &&
+          vd.pixel_width == geom.pixel_width &&
+          vd.pixel_height == geom.pixel_height) {
+        vd.hidpi = geom.hidpi;
+        vd.explicit_scale = geom.explicit_scale;
+        vd.default_mode_width = geom.mode_width;
+        vd.default_mode_height = geom.mode_height;
+        vd.default_pixel_width = geom.pixel_width;
+        vd.default_pixel_height = geom.pixel_height;
+        return false;
+      }
+
+      const std::size_t prev_pixel_w = vd.pixel_width;
+      const std::size_t prev_pixel_h = vd.pixel_height;
+
+      // Record the intended target mode before reconfiguring so concurrent display callbacks keep it.
+      vd.hidpi = geom.hidpi;
+      vd.explicit_scale = geom.explicit_scale;
+      vd.default_mode_width = geom.mode_width;
+      vd.default_mode_height = geom.mode_height;
+      vd.default_pixel_width = geom.pixel_width;
+      vd.default_pixel_height = geom.pixel_height;
+      vd.mode_width = geom.mode_width;
+      vd.mode_height = geom.mode_height;
+      vd.pixel_width = geom.pixel_width;
+      vd.pixel_height = geom.pixel_height;
+
+      if (!apply_virtual_display_settings(vd.display, vd.width, vd.height, max_w, max_h, vd.refresh, vd.hdr, geom)) {
+        BOOST_LOG(warning) << "Virtual display: couldn't apply live scale "sv << configured_scale << '%' << " on display "sv << vd.id;
+        sync_recorded_mode(vd);
+        return false;
+      }
+
+      select_mode(vd.id, geom.mode_width, geom.mode_height, geom.pixel_width, geom.pixel_height, vd.refresh);
+      using layout_e = config::video_t::virtual_display_layout_e;
+      const auto layout = config::video.virtual_display_layout;
+      if (!vd.exclusive && (layout == layout_e::extended_primary || layout == layout_e::extended_primary_isolated)) {
+        make_main(vd.id);
+      }
+      sync_recorded_mode(vd);
+
+      const auto gen = ++change_generation;
+      settled_generation.store(gen, std::memory_order_release);
+      BOOST_LOG(info) << "Virtual display: applied live scale ("sv << configured_scale << "%) on display "sv << vd.id
+                      << " -> looks like "sv << vd.mode_width << 'x' << vd.mode_height
+                      << " (pixels "sv << vd.pixel_width << 'x' << vd.pixel_height << ')';
+      return vd.pixel_width != prev_pixel_w || vd.pixel_height != prev_pixel_h;
+    }
+  }  // namespace
+
+  void reapply_scale() {
+    dispatch_async(reconcile_queue(), ^{
+      @autoreleasepool {
+        const int configured_scale = config::video.dd.virtual_display_scale_percent;
+        bool backing_pixels_changed = false;
+        {
+          std::lock_guard lock {state_mutex};
+          if (current) {
+            backing_pixels_changed |= reapply_scale_to_display(*current, configured_scale);
+          }
+        }
+        {
+          std::lock_guard lock {remote_mutex};
+          for (auto &[_, remote] : remote_displays) {
+            if (remote.display) {
+              backing_pixels_changed |= reapply_scale_to_display(*remote.display, configured_scale);
+            }
+          }
+        }
+        if (backing_pixels_changed) {
+          scale_reinit_counter.fetch_add(1, std::memory_order_release);
+        }
+      }
+    });
+  }
+
+  std::uint64_t scale_reinit_epoch() {
+    return scale_reinit_counter.load(std::memory_order_acquire);
   }
 
   std::uint64_t display_state_generation() {

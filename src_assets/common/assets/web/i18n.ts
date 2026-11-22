@@ -69,6 +69,30 @@ function browserLocaleTag(locale: string): string {
   return locale.replace(/_/g, '-');
 }
 
+function normalizeLocaleCode(locale: string): string {
+  const trimmed = locale.trim();
+  return /^[a-z]{2}(?:_[A-Z]{2})?$/.test(trimmed) ? trimmed : 'en';
+}
+
+type VibepolloI18n = Awaited<ReturnType<typeof createVibepolloI18n>>;
+
+let activeI18nInstance: VibepolloI18n | null = null;
+
+export async function setVibepolloLocale(nextLocale: string): Promise<void> {
+  if (!activeI18nInstance) return;
+  const normalized = normalizeLocaleCode(nextLocale);
+  const targetTag = normalized === 'en' ? 'en' : browserLocaleTag(normalized);
+  try {
+    const loaded = await loadMessages(normalized);
+    activeI18nInstance.global.setLocaleMessage(targetTag, loaded);
+    activeI18nInstance.global.locale.value = targetTag;
+    document.documentElement.lang = targetTag;
+  } catch {
+    activeI18nInstance.global.locale.value = 'en';
+    document.documentElement.lang = 'en';
+  }
+}
+
 export async function createVibepolloI18n() {
   const configured = await configuredLocale();
   let activeLocale = 'en';
@@ -86,7 +110,7 @@ export async function createVibepolloI18n() {
   }
 
   document.documentElement.lang = activeLocale;
-  return createI18n({
+  const instance = createI18n({
     legacy: false,
     locale: activeLocale,
     fallbackLocale: 'en',
@@ -94,4 +118,6 @@ export async function createVibepolloI18n() {
     missingWarn: false,
     messages,
   });
+  activeI18nInstance = instance;
+  return instance;
 }

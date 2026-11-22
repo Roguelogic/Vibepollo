@@ -20,7 +20,9 @@
 #import <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/IOLLEvent.h>
+#include <dispatch/dispatch.h>
 #include <mach/mach.h>
+#include <pthread.h>
 #include <pthread/qos.h>
 
 // local includes
@@ -541,14 +543,11 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
     }
 
-    // CGEventCreateKeyboardEvent populates the event's internal Unicode string BEFORE CGEventSetFlags
-    // runs (leaving Shift+A as 'a' and Shift+2 as '2' inside the CGEvent), and LoginWindow on a
-    // Korean Mac may also have 2SetKorean selected in /Library/Preferences/com.apple.HIToolbox.plist
-    // with zero physical HID keyboards attached. Stamp the exact ASCII character from HIToolbox's
-    // ASCII-capable layout onto pre-login key events so SecurityAgent always receives exact Shift/symbols.
-    void stamp_loginwindow_ascii_unicode(CGEventRef event, int key, CGEventFlags kb_flags) {
-      if (is_non_character_key(key) ||
-          (kb_flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) != 0) {
+    std::atomic<CFDataRef> g_ascii_uchr_data {nullptr};
+    std::atomic<bool> g_ascii_uchr_requested {false};
+
+    void load_ascii_keyboard_layout_on_main(void *) {
+      if (g_ascii_uchr_data.load(std::memory_order_acquire) != nullptr) {
         return;
       }
       TISInputSourceRef ascii_src = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
@@ -558,6 +557,98 @@ const KeyCodeMap kKeyCodesMap[] = {
       const auto layout_data = static_cast<CFDataRef>(
         TISGetInputSourceProperty(ascii_src, kTISPropertyUnicodeKeyLayoutData)
       );
+      if (layout_data) {
+        if (CFDataRef copy = CFDataCreateCopy(kCFAllocatorDefault, layout_data)) {
+          CFDataRef expected = nullptr;
+          if (!g_ascii_uchr_data.compare_exchange_strong(expected, copy, std::memory_order_acq_rel)) {
+            CFRelease(copy);
+          }
+        }
+      }
+      CFRelease(ascii_src);
+    }
+
+    // HIToolbox's TIS* APIs assert dispatch_get_main_queue() on macOS Tahoe whenever the input
+    // source list refreshes (such as entering a SecureEventInput password field). Cache an
+    // immutable CFData copy of the ASCII keyboard layout on the main thread and never call TIS*
+    // from worker threads.
+    void ensure_ascii_keyboard_layout_cached() {
+      if (g_ascii_uchr_data.load(std::memory_order_acquire) != nullptr) {
+        return;
+      }
+      if (pthread_main_np() != 0) {
+        load_ascii_keyboard_layout_on_main(nullptr);
+      } else if (!g_ascii_uchr_requested.exchange(true, std::memory_order_acq_rel)) {
+        dispatch_async_f(dispatch_get_main_queue(), nullptr, &load_ascii_keyboard_layout_on_main);
+      }
+    }
+
+    UniChar fallback_us_ansi_ascii(int key, bool shifted) {
+      switch (key) {
+        case kVK_ANSI_A: return shifted ? 'A' : 'a';
+        case kVK_ANSI_B: return shifted ? 'B' : 'b';
+        case kVK_ANSI_C: return shifted ? 'C' : 'c';
+        case kVK_ANSI_D: return shifted ? 'D' : 'd';
+        case kVK_ANSI_E: return shifted ? 'E' : 'e';
+        case kVK_ANSI_F: return shifted ? 'F' : 'f';
+        case kVK_ANSI_G: return shifted ? 'G' : 'g';
+        case kVK_ANSI_H: return shifted ? 'H' : 'h';
+        case kVK_ANSI_I: return shifted ? 'I' : 'i';
+        case kVK_ANSI_J: return shifted ? 'J' : 'j';
+        case kVK_ANSI_K: return shifted ? 'K' : 'k';
+        case kVK_ANSI_L: return shifted ? 'L' : 'l';
+        case kVK_ANSI_M: return shifted ? 'M' : 'm';
+        case kVK_ANSI_N: return shifted ? 'N' : 'n';
+        case kVK_ANSI_O: return shifted ? 'O' : 'o';
+        case kVK_ANSI_P: return shifted ? 'P' : 'p';
+        case kVK_ANSI_Q: return shifted ? 'Q' : 'q';
+        case kVK_ANSI_R: return shifted ? 'R' : 'r';
+        case kVK_ANSI_S: return shifted ? 'S' : 's';
+        case kVK_ANSI_T: return shifted ? 'T' : 't';
+        case kVK_ANSI_U: return shifted ? 'U' : 'u';
+        case kVK_ANSI_V: return shifted ? 'V' : 'v';
+        case kVK_ANSI_W: return shifted ? 'W' : 'w';
+        case kVK_ANSI_X: return shifted ? 'X' : 'x';
+        case kVK_ANSI_Y: return shifted ? 'Y' : 'y';
+        case kVK_ANSI_Z: return shifted ? 'Z' : 'z';
+        case kVK_ANSI_1: return shifted ? '!' : '1';
+        case kVK_ANSI_2: return shifted ? '@' : '2';
+        case kVK_ANSI_3: return shifted ? '#' : '3';
+        case kVK_ANSI_4: return shifted ? '$' : '4';
+        case kVK_ANSI_5: return shifted ? '%' : '5';
+        case kVK_ANSI_6: return shifted ? '^' : '6';
+        case kVK_ANSI_7: return shifted ? '&' : '7';
+        case kVK_ANSI_8: return shifted ? '*' : '8';
+        case kVK_ANSI_9: return shifted ? '(' : '9';
+        case kVK_ANSI_0: return shifted ? ')' : '0';
+        case kVK_ANSI_Minus: return shifted ? '_' : '-';
+        case kVK_ANSI_Equal: return shifted ? '+' : '=';
+        case kVK_ANSI_LeftBracket: return shifted ? '{' : '[';
+        case kVK_ANSI_RightBracket: return shifted ? '}' : ']';
+        case kVK_ANSI_Backslash: return shifted ? '|' : '\\';
+        case kVK_ANSI_Semicolon: return shifted ? ':' : ';';
+        case kVK_ANSI_Quote: return shifted ? '"' : '\'';
+        case kVK_ANSI_Grave: return shifted ? '~' : '`';
+        case kVK_ANSI_Comma: return shifted ? '<' : ',';
+        case kVK_ANSI_Period: return shifted ? '>' : '.';
+        case kVK_ANSI_Slash: return shifted ? '?' : '/';
+        case kVK_Space: return ' ';
+        default: return 0;
+      }
+    }
+
+    // CGEventCreateKeyboardEvent populates the event's internal Unicode string BEFORE CGEventSetFlags
+    // runs (leaving Shift+A as 'a' and Shift+2 as '2' inside the CGEvent), and LoginWindow on a
+    // Korean Mac may also have 2SetKorean selected in /Library/Preferences/com.apple.HIToolbox.plist
+    // with zero physical HID keyboards attached. Stamp the exact ASCII character from the cached
+    // ASCII-capable layout onto secure/pre-login key events without touching TIS* off the main queue.
+    void stamp_loginwindow_ascii_unicode(CGEventRef event, int key, CGEventFlags kb_flags) {
+      if (is_non_character_key(key) ||
+          (kb_flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) != 0) {
+        return;
+      }
+      ensure_ascii_keyboard_layout_cached();
+      const CFDataRef layout_data = g_ascii_uchr_data.load(std::memory_order_acquire);
       if (layout_data) {
         const auto *uchr = reinterpret_cast<const UCKeyboardLayout *>(CFDataGetBytePtr(layout_data));
         if (uchr) {
@@ -588,10 +679,16 @@ const KeyCodeMap kKeyCodesMap[] = {
           );
           if (st == noErr && actual_len > 0) {
             CGEventKeyboardSetUnicodeString(event, actual_len, chars);
+            return;
           }
         }
       }
-      CFRelease(ascii_src);
+
+      const bool shifted = ((kb_flags & kCGEventFlagMaskShift) != 0) ^
+                           ((kb_flags & kCGEventFlagMaskAlphaShift) != 0);
+      if (const UniChar ch = fallback_us_ansi_ascii(key, shifted); ch != 0) {
+        CGEventKeyboardSetUnicodeString(event, 1, &ch);
+      }
     }
   }  // namespace
 
@@ -2984,6 +3081,7 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_input->displayGeneration = macos_virtual_display::display_state_generation();
 
     ensure_event_sources(macos_input);
+    ensure_ascii_keyboard_layout_cached();
     macos_input->scroll_lines_per_detent = get_scroll_lines_per_detent(macos_input->scrollwheel_scaling);
 
     macos_input->kb_flags = 0;

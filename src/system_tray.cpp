@@ -137,7 +137,10 @@ namespace system_tray {
   }
 
   #if defined(__APPLE__) || defined(__MACH__)
+  static void tray_pair_pin_cb(struct tray_menu *item);
+  static void tray_check_update_cb(struct tray_menu *item);
   static void tray_open_at_login_cb(struct tray_menu *item);
+  static void tray_allow_login_screen_cb(struct tray_menu *item);
   static void tray_scroll_inertia_macos_cb(struct tray_menu *item);
   static void tray_scroll_inertia_ipados_cb(struct tray_menu *item);
   static void tray_scroll_inertia_disabled_cb(struct tray_menu *item);
@@ -146,6 +149,14 @@ namespace system_tray {
   static void tray_pencil_mode_draw_cb(struct tray_menu *item);
   static void sync_scroll_inertia_tray_checks();
   static void sync_pencil_mode_tray_checks();
+  static void sync_macos_tray_localization();
+
+  static bool is_macos_tray_korean() {
+    const auto &loc = config::sunshine.locale;
+    return loc.size() >= 2 &&
+           (loc[0] == 'k' || loc[0] == 'K') &&
+           (loc[1] == 'o' || loc[1] == 'O');
+  }
 
   static struct tray_menu scroll_inertia_submenu[] = {
     {.text = "MacBook Trackpad", .checked = 1, .checkbox = 1, .cb = tray_scroll_inertia_macos_cb},
@@ -168,42 +179,26 @@ namespace system_tray {
     .tooltip = PROJECT_NAME,
     .menu =
       (struct tray_menu[]) {
-        // todo - use boost/locale to translate menu strings
         {.text = "Open Vibepollo", .cb = tray_open_ui_cb},
+  #if defined(__APPLE__) || defined(__MACH__)
+        {.text = "Pair Device (PIN)...", .cb = tray_pair_pin_cb},
+  #endif
         {.text = "-"},
-        // { .text = "-" },
-        // { .text = "Donate",
-        //   .submenu =
-        //   (struct tray_menu[]) {
-        //   { .text = "GitHub Sponsors", .cb = tray_donate_github_cb },
-        //   { .text = "MEE6", .cb = tray_donate_mee6_cb },
-        //   { .text = "Patreon", .cb = tray_donate_patreon_cb },
-        //   { .text = "PayPal", .cb = tray_donate_paypal_cb },
-        //   { .text = nullptr } } },
-        // { .text = "-" },
         {.text = TRAY_MSG_NO_APP_RUNNING, .cb = tray_force_stop_cb},
+  #if defined(__APPLE__) || defined(__MACH__)
+        {.text = "Check for Update", .cb = tray_check_update_cb},
+        {.text = "-"},
+        {.text = "Scroll Inertia", .submenu = scroll_inertia_submenu},
+        {.text = "Apple Pencil", .submenu = pencil_mode_submenu},
+        {.text = "Open at Login", .checkbox = 1, .cb = tray_open_at_login_cb},
+        {.text = "Allow on Login Screen", .checkbox = 1, .cb = tray_allow_login_screen_cb},
+        {.text = "-"},
+  #else
         {.text = "Check for Update", .cb = [](tray_menu *) {
            BOOST_LOG(info) << "Manual update check requested from tray"sv;
            update::trigger_check(true);
          }},
-  #if defined(__APPLE__) || defined(__MACH__)
-        {.text = "Scroll Inertia", .submenu = scroll_inertia_submenu},
-        {.text = "Apple Pencil", .submenu = pencil_mode_submenu},
-        {.text = "Open at Login", .checkbox = 1, .cb = tray_open_at_login_cb},
-        {.text = "Allow on Login Screen", .checkbox = 1, .cb = [](struct tray_menu *item) {
-           const bool enable = !item->checked;
-           BOOST_LOG(info) << (enable ? "Enabling"sv : "Disabling"sv) << " LoginWindow agent from system tray"sv;
-           (void) platf::set_loginscreen_agent_enabled(enable);
-           item->checked = platf::loginscreen_agent_enabled();
-           for (auto *m = tray.menu; m->text != nullptr; ++m) {
-             if (m->cb == tray_open_at_login_cb) {
-               m->checked = platf::opens_at_login();
-             }
-           }
-           tray_update(&tray);
-         }},
   #endif
-
         {.text = "Restart", .cb = tray_restart_cb},
         {.text = "Quit", .cb = tray_quit_cb},
         {.text = nullptr}
@@ -296,6 +291,20 @@ namespace system_tray {
     platf::set_opens_at_login(enable);
     // Show what actually happened: the user may still need to approve it in System Settings.
     item->checked = platf::opens_at_login();
+    tray_update(&tray);
+  }
+
+  void refresh_macos_tray_checks() {
+    sync_scroll_inertia_tray_checks();
+    sync_pencil_mode_tray_checks();
+    sync_macos_tray_localization();
+    for (auto *m = tray.menu; m->text != nullptr; ++m) {
+      if (m->cb == tray_open_at_login_cb) {
+        m->checked = platf::opens_at_login();
+      } else if (m->cb == tray_allow_login_screen_cb) {
+        m->checked = platf::loginscreen_agent_enabled();
+      }
+    }
     tray_update(&tray);
   }
   #endif
@@ -519,12 +528,13 @@ namespace system_tray {
     for (auto *item = tray.menu; item->text != nullptr; ++item) {
       if (item->cb == tray_open_at_login_cb) {
         item->checked = platf::opens_at_login();
-      } else if (std::string_view {item->text} == "Allow on Login Screen"sv) {
+      } else if (item->cb == tray_allow_login_screen_cb) {
         item->checked = platf::loginscreen_agent_enabled();
       }
     }
     sync_scroll_inertia_tray_checks();
     sync_pencil_mode_tray_checks();
+    sync_macos_tray_localization();
 
     // AppKit only runs the menu bar on the main thread, which is where main() calls this from.
     // main() then runs the AppKit event loop there once startup is done.
@@ -589,6 +599,80 @@ namespace system_tray {
   static std::string s_tooltip;
   static std::string s_notification_text;
   static std::string s_last_playing_app;
+  static char s_force_close_msg[256] = {};
+
+  static struct tray_menu *find_force_stop_menu_item() {
+    for (auto *m = tray.menu; m != nullptr && m->text != nullptr; ++m) {
+      if (m->cb == tray_force_stop_cb) {
+        return m;
+      }
+    }
+    return nullptr;
+  }
+
+  #if defined(__APPLE__) || defined(__MACH__)
+  static void tray_pair_pin_cb(struct tray_menu *) {
+    BOOST_LOG(info) << "Opening PIN pairing from system tray"sv;
+    launch_ui("/pin"s);
+  }
+
+  static void tray_check_update_cb(struct tray_menu *) {
+    BOOST_LOG(info) << "Manual update check requested from tray"sv;
+    update::trigger_check(true);
+  }
+
+  static void tray_allow_login_screen_cb(struct tray_menu *item) {
+    const bool enable = !item->checked;
+    BOOST_LOG(info) << (enable ? "Enabling"sv : "Disabling"sv) << " LoginWindow agent from system tray"sv;
+    (void) platf::set_loginscreen_agent_enabled(enable);
+    refresh_macos_tray_checks();
+  }
+
+  static void sync_macos_tray_localization() {
+    const bool ko = is_macos_tray_korean();
+    scroll_inertia_submenu[0].text = ko ? "MacBook 트랙패드 네이티브" : "MacBook Trackpad";
+    scroll_inertia_submenu[1].text = ko ? "iPad 모멘텀 관성" : "iPad Momentum";
+    scroll_inertia_submenu[2].text = ko ? "관성 없음" : "Disabled";
+
+    pencil_mode_submenu[0].text = ko ? "클라이언트 설정 따름 (VoidLink)" : "Follow Client (VoidLink)";
+    pencil_mode_submenu[1].text = ko ? "스크롤 및 탭 (iPad 조작 방식)" : "Scroll & Tap (iPad Style)";
+    pencil_mode_submenu[2].text = ko ? "드로잉 태블릿 (필압 펜 입력)" : "Drawing Tablet (Pen Input)";
+
+    for (auto *m = tray.menu; m != nullptr && m->text != nullptr; ++m) {
+      if (m->cb == tray_open_ui_cb) {
+        m->text = ko ? "Vibepollo 설정..." : "Open Vibepollo";
+      } else if (m->cb == tray_pair_pin_cb) {
+        m->text = ko ? "새 기기 페어링 (PIN)..." : "Pair Device (PIN)...";
+      } else if (m->cb == tray_force_stop_cb) {
+        if (!s_last_playing_app.empty()) {
+          snprintf(
+            s_force_close_msg,
+            sizeof(s_force_close_msg),
+            ko ? "[%s] 강제 종료" : "Force close [%s]",
+            s_last_playing_app.c_str()
+          );
+          m->text = s_force_close_msg;
+        } else {
+          m->text = ko ? "실행 중인 앱 강제 종료" : TRAY_MSG_NO_APP_RUNNING;
+        }
+      } else if (m->cb == tray_check_update_cb) {
+        m->text = ko ? "업데이트 확인" : "Check for Update";
+      } else if (m->submenu == scroll_inertia_submenu) {
+        m->text = ko ? "스크롤 관성" : "Scroll Inertia";
+      } else if (m->submenu == pencil_mode_submenu) {
+        m->text = "Apple Pencil";
+      } else if (m->cb == tray_open_at_login_cb) {
+        m->text = ko ? "로그인 시 Vibepollo 열기" : "Open at Login";
+      } else if (m->cb == tray_allow_login_screen_cb) {
+        m->text = ko ? "Mac 잠금 및 로그인 화면에서 허용" : "Allow on Login Screen";
+      } else if (m->cb == tray_restart_cb) {
+        m->text = ko ? "Vibepollo 재시작" : "Restart";
+      } else if (m->cb == tray_quit_cb) {
+        m->text = ko ? "Vibepollo 종료" : "Quit";
+      }
+    }
+  }
+  #endif
 
   void update_tray_playing(std::string app_name) {
     run_on_tray_thread([app_name = std::move(app_name)]() mutable {
@@ -603,16 +687,24 @@ namespace system_tray {
       tray.icon = TRAY_ICON_PLAYING;
 
       char msg[256];
-      static char force_close_msg[256];
       snprintf(msg, std::size(msg), "%s launched.", app_name.c_str());
-      snprintf(force_close_msg, std::size(force_close_msg), "Force close [%s]", app_name.c_str());
+  #if defined(__APPLE__) || defined(__MACH__)
+      snprintf(
+        s_force_close_msg,
+        std::size(s_force_close_msg),
+        is_macos_tray_korean() ? "[%s] 강제 종료" : "Force close [%s]",
+        app_name.c_str()
+      );
+  #else
+      snprintf(s_force_close_msg, std::size(s_force_close_msg), "Force close [%s]", app_name.c_str());
+  #endif
   #ifdef _WIN32
       auto msg_acp = utf8ToAcp(msg);
-      auto force_msg_acp = utf8ToAcp(force_close_msg);
+      auto force_msg_acp = utf8ToAcp(s_force_close_msg);
       strncpy(msg, msg_acp.c_str(), std::size(msg) - 1);
       msg[std::size(msg) - 1] = '\0';
-      strncpy(force_close_msg, force_msg_acp.c_str(), std::size(force_close_msg) - 1);
-      force_close_msg[std::size(force_close_msg) - 1] = '\0';
+      strncpy(s_force_close_msg, force_msg_acp.c_str(), std::size(s_force_close_msg) - 1);
+      s_force_close_msg[std::size(s_force_close_msg) - 1] = '\0';
   #endif
       s_notification_text = msg;
       s_tooltip = "Streaming started for " + app_name;
@@ -620,7 +712,9 @@ namespace system_tray {
       tray.notification_text = s_notification_text.c_str();
       tray.notification_icon = TRAY_ICON_PLAYING;
       tray.tooltip = s_tooltip.c_str();
-      tray.menu[2].text = force_close_msg;
+      if (auto *force_item = find_force_stop_menu_item()) {
+        force_item->text = s_force_close_msg;
+      }
       s_last_playing_app = std::move(app_name);
       tray_update(&tray);
     });
@@ -670,8 +764,14 @@ namespace system_tray {
       tray.notification_title = "Application Stopped";
       tray.notification_text = s_notification_text.c_str();
       tray.tooltip = PROJECT_NAME;
-      tray.menu[2].text = TRAY_MSG_NO_APP_RUNNING;
       s_last_playing_app.clear();
+  #if defined(__APPLE__) || defined(__MACH__)
+      sync_macos_tray_localization();
+  #else
+      if (auto *force_item = find_force_stop_menu_item()) {
+        force_item->text = TRAY_MSG_NO_APP_RUNNING;
+      }
+  #endif
       tray_update(&tray);
     });
   }
@@ -702,6 +802,13 @@ namespace system_tray {
       };
       tray.tooltip = PROJECT_NAME;
       s_last_playing_app.clear();
+  #if defined(__APPLE__) || defined(__MACH__)
+      sync_macos_tray_localization();
+  #else
+      if (auto *force_item = find_force_stop_menu_item()) {
+        force_item->text = TRAY_MSG_NO_APP_RUNNING;
+      }
+  #endif
       tray_update(&tray);
     });
   }

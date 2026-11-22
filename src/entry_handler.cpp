@@ -6,6 +6,7 @@
 #include <csignal>
 #include <format>
 #include <iostream>
+#include <mutex>
 #include <string_view>
 #include <thread>
 
@@ -29,8 +30,27 @@ extern "C" {
 
 using namespace std::literals;
 
+namespace {
+  std::mutex g_native_ui_mutex;
+  std::function<bool(std::string_view)> g_native_ui_launcher;
+}  // namespace
+
+void set_native_ui_launcher(std::function<bool(std::string_view)> launcher) {
+  std::lock_guard lock(g_native_ui_mutex);
+  g_native_ui_launcher = std::move(launcher);
+}
+
 void launch_ui(const std::optional<std::string> &path) {
-  std::string url = confighttp::get_web_ui_url(path ? std::string_view {*path} : std::string_view {});
+  const std::string_view route = path ? std::string_view {*path} : std::string_view {};
+  std::function<bool(std::string_view)> native_launcher;
+  {
+    std::lock_guard lock(g_native_ui_mutex);
+    native_launcher = g_native_ui_launcher;
+  }
+  if (native_launcher && native_launcher(route)) {
+    return;
+  }
+  std::string url = confighttp::get_web_ui_url(route);
   platf::open_url(url);
 }
 

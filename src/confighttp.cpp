@@ -45,6 +45,12 @@
   #include <vector>
   #include <Windows.h>
 #endif
+#ifdef __APPLE__
+  #include "platform/macos/virtual_display.h"
+  #if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+    #include "system_tray.h"
+  #endif
+#endif
 // local includes
 #include "config.h"
 #include "config_http_log_policy.h"
@@ -528,9 +534,14 @@ namespace confighttp {
           continue;
         }
 
-        if (key == "macos_scroll_inertia" || key == "macos_pencil_mode") {
+        if (key == "macos_scroll_inertia" || key == "macos_pencil_mode" || key == "locale") {
           continue;
         }
+#ifdef __APPLE__
+        if (key == "dd_virtual_display_scale") {
+          continue;
+        }
+#endif
 
         if (key == "session_history_enabled") {
           return false;
@@ -3583,6 +3594,14 @@ namespace confighttp {
         if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
+#ifdef __APPLE__
+          if (changed_keys.count("dd_virtual_display_scale")) {
+            platf::macos_virtual_display::reapply_scale();
+          }
+  #if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+          system_tray::refresh_macos_tray_checks();
+  #endif
+#endif
           applied_now = true;
         } else {
           config::mark_deferred_reload();
@@ -3691,6 +3710,14 @@ namespace confighttp {
         if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
+#ifdef __APPLE__
+          if (changed_keys.count("dd_virtual_display_scale")) {
+            platf::macos_virtual_display::reapply_scale();
+          }
+  #if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+          system_tray::refresh_macos_tray_checks();
+  #endif
+#endif
           applied_now = true;
         } else {
           config::mark_deferred_reload();

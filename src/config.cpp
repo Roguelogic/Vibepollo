@@ -3011,6 +3011,10 @@ namespace config {
     g_deferred_reload.store(true, std::memory_order_release);
   }
 
+  bool has_deferred_reload() {
+    return g_deferred_reload.load(std::memory_order_acquire);
+  }
+
   void maybe_apply_deferred() {
     // Single-shot winner clears the flag and applies atomically.
     if (!has_active_stream_sessions() && g_deferred_reload.exchange(false, std::memory_order_acq_rel)) {

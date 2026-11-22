@@ -90,6 +90,8 @@ spctl -a -vvv -t exec "$APP_BUNDLE"
 
 echo "==> Updating /Applications/Vibepollo.app..."
 rsync -a --delete "$APP_BUNDLE/" /Applications/Vibepollo.app/
-launchctl kickstart -k "gui/$(id -u)/io.github.Nonary.vibepollo.loginscreen" || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Vibepollo.app || true
+launchctl bootout "gui/$(id -u)/io.github.Nonary.vibepollo.loginscreen" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/io.github.Nonary.vibepollo" 2>/dev/null || true
 
 echo "==> Done! Notarized DMG ready at: $OUT_DMG"

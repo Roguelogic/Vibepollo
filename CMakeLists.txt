@@ -8,6 +8,8 @@ if(NOT APPLE)
     message(FATAL_ERROR "Vibepollo is a standalone macOS-only host project.")
 endif()
 
+enable_language(Swift)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

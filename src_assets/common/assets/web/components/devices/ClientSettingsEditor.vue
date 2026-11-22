@@ -458,9 +458,17 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
             :disabled="busy"
           />
         </SettingRow>
-        <fieldset class="client-permissions">
-          <legend>{{ t('ui.devices.editor.permissions_title') }}</legend>
-          <p>{{ t('ui.devices.editor.permissions_description') }}</p>
+        <div
+          class="client-permissions"
+          role="group"
+          :aria-labelledby="`${controlIdPrefix}-permissions-title`"
+        >
+          <div class="client-permissions__header">
+            <h4 :id="`${controlIdPrefix}-permissions-title`">
+              {{ t('ui.devices.editor.permissions_title') }}
+            </h4>
+            <p>{{ t('ui.devices.editor.permissions_description') }}</p>
+          </div>
           <div class="client-permissions__grid">
             <label v-for="permission in permissionOptions" :key="permission.key">
               <input
@@ -472,7 +480,7 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
               <span>{{ t(`permissions.${permission.key}`) }}</span>
             </label>
           </div>
-        </fieldset>
+        </div>
       </div>
     </section>
 
@@ -1017,21 +1025,28 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
 .client-permissions {
   display: grid;
   gap: var(--vs-space-12);
-  padding: var(--vs-space-16);
-  border: var(--vs-border-width) solid var(--vs-color-border-subtle);
-  border-radius: var(--vs-radius-card);
+  padding: var(--vs-space-16) var(--vs-space-20);
+  border-block-start: var(--vs-border-width) solid var(--vs-color-border-subtle);
 }
 
-.client-permissions legend {
-  padding-inline: var(--vs-space-4);
+.client-permissions__header {
+  display: grid;
+  gap: var(--vs-space-4);
+}
+
+.client-permissions__header h4 {
+  margin: 0;
   color: var(--vs-color-text-primary);
-  font-weight: var(--vs-type-weight-semibold);
+  font-size: var(--vs-type-size-control);
+  font-weight: var(--vs-type-weight-medium);
+  line-height: var(--vs-type-line-height-control);
 }
 
 .client-permissions p {
   margin: 0;
   color: var(--vs-color-text-secondary);
   font-size: var(--vs-type-size-metadata);
+  line-height: var(--vs-type-line-height-metadata);
 }
 
 .client-permissions__grid {
@@ -1072,10 +1087,14 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
   align-items: center;
   justify-content: space-between;
   gap: var(--vs-space-16);
-  padding: var(--vs-space-12);
-  border-top: var(--vs-border-width) solid var(--vs-color-border-subtle);
-  border-radius: var(--vs-radius-control);
-  background: var(--vs-color-bg-subtle);
+  padding: var(--vs-space-12) var(--vs-space-16);
+  border: var(--vs-border-width) solid var(--vs-color-border-subtle);
+  border-radius: var(--vs-radius-card);
+  background: var(--vs-color-bg-surface);
+}
+
+.client-settings-editor__footer p {
+  margin: 0;
 }
 
 .client-settings-editor__actions {

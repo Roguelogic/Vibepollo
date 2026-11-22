@@ -1,6 +1,6 @@
 # macos specific compile definitions
 
-add_compile_definitions(SUNSHINE_PLATFORM="macos")
+add_compile_definitions($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:SUNSHINE_PLATFORM="macos">)
 
 if (SUNSHINE_BUILD_HOMEBREW)
     set(SUNSHINE_ASSETS_DIR "${CMAKE_INSTALL_PREFIX}/${SUNSHINE_ASSETS_DIR}")
@@ -94,10 +94,14 @@ if(SUNSHINE_ENABLE_TRAY)
             ${COCOA})
     # Used instead of third-party/tray/src/tray_darwin.m, which exits the process from tray_exit()
     # and calls AppKit off the main thread (see the file header).
-    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/platform/macos/tray.mm"
+    set_source_files_properties(
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/tray.mm"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/settings_bridge.mm"
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     list(APPEND PLATFORM_TARGET_FILES
-            "${CMAKE_SOURCE_DIR}/src/platform/macos/tray.mm")
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/tray.mm"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/settings_bridge.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/settings_bridge.mm")
 endif()
 
 list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/macos/managed_app_focus.mm")

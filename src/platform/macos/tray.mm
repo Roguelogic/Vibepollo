@@ -21,6 +21,7 @@
 
 // local includes
 #include "misc.h"
+#include "settings_bridge.h"
 
 namespace {
   // Menu contents are copied when tray_update() is called: callers keep mutating their tray
@@ -85,6 +86,11 @@ namespace {
   return NSTerminateCancel;
 }
 
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+  vibepollo_open_macos_native_ui(nullptr);
+  return YES;
+}
+
 @end
 
 namespace {
@@ -99,9 +105,15 @@ namespace {
         continue;
       }
 
+      NSString *keyEq = @"";
+      if (item.text == "Open Vibepollo" || item.text == "Vibepollo 설정...") {
+        keyEq = @",";
+      } else if (item.text == "Quit" || item.text == "Vibepollo 종료") {
+        keyEq = @"q";
+      }
       NSMenuItem *menu_item = [[NSMenuItem alloc] initWithTitle:@(item.text.c_str())
                                                          action:@selector(menuCallback:)
-                                                  keyEquivalent:@""];
+                                                  keyEquivalent:keyEq];
       menu_item.target = target;
       menu_item.enabled = !item.disabled;
       menu_item.state = item.checked ? NSControlStateValueOn : NSControlStateValueOff;
@@ -171,6 +183,7 @@ int tray_init(struct tray *tray) {
   }
 
   platf::ensure_appkit_session();
+  vibepollo_register_macos_native_ui();
   if (target == nil) {
     target = [[VibepolloTrayTarget alloc] init];
     NSApp.delegate = target;

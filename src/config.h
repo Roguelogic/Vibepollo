@@ -510,6 +510,7 @@ namespace config {
   // recursively enter the configuration gate.
   void apply_config_now(const display_transition::before_mutation_f &before_display_mutation = {});
   void mark_deferred_reload();
+  bool has_deferred_reload();
   void maybe_apply_deferred();
 
   // Gate helpers so session start/resume can hold a shared lock while apply holds a unique lock.
