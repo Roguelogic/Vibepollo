@@ -83,6 +83,7 @@
 #include "state_storage_policy.h"
 #include "update.h"
 #include "update_notification_state.h"
+#include "usb_stream_tunnel.h"
 #include "session_display_policy.h"
 #include "single_flight.h"
 #include "state_storage_policy.h"
@@ -5004,6 +5005,37 @@ namespace nvhttp {
     void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, bool normal_app_transition = true, bool launched_from_applist = false, std::uint64_t trace_id = 0);
     void cancel(resp_https_t response, req_https_t request);
 
+    static bool bind_direct_usb_video(
+      const req_https_t &request,
+      const verified_client_t &verified_client,
+      rtsp_stream::launch_session_t &session,
+      pt::ptree &tree
+    ) {
+      const auto [first, last] = request->header.equal_range(std::string(usb_stream_tunnel::video_launch_header));
+      if (first == last) {
+        return true;
+      }
+      if (!verified_client || session.client_uuid.empty() || !paired_client_uuid_enabled(session.client_uuid, verified_client->perm)) {
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message", "Direct USB video requires an enabled paired client");
+        return false;
+      }
+      if (session.input_only || session.role == remote_session::role_e::input) {
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "Direct USB video is unavailable for input-only sessions");
+        return false;
+      }
+      if (std::next(first) == last) {
+        session.direct_usb_video = usb_stream_tunnel::claim_video(first->second);
+      }
+      if (!session.direct_usb_video) {
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "Direct USB video token is invalid, expired or already used");
+        return false;
+      }
+      return true;
+    }
+
     void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, std::uint64_t trace_id = 0) {
       // Trace-enabled launch/resume routes correlate with a private trace ID;
       // do not emit raw request headers or query values into verbose logs.
@@ -5423,6 +5455,11 @@ namespace nvhttp {
         launch_session->role = is_remote_input ?
                                  remote_session::role_e::input :
                                  remote_session::role_e::monitor;
+        if (!bind_direct_usb_video(request, verified_client, *launch_session, tree)) {
+          tree.put("root.resume", 0);
+          tree.put("root.gamesession", 0);
+          return;
+        }
         if (monitor_profile) launch_session->monitor_profile_uuid = monitor_profile->uuid;
         launch_session->host_audio = remote_session::uses_host_audio(launch_session->role);
         launch_session->continuous_audio = false;
@@ -5550,7 +5587,10 @@ launch_session->exact_target_hold.reset();
           std::format(
             "{}{}:{}",
             launch_session->rtsp_url_scheme,
-            net::addr_to_url_escaped_string([&]() {
+            net::addr_to_url_escaped_string([&]() -> boost::asio::ip::address {
+              if (launch_session->direct_usb_video) {
+                return boost::asio::ip::address_v4::loopback();
+              }
               auto addr = request->local_endpoint().address();
 #ifdef __APPLE__
               if (config::sunshine.bind_address.empty()) {
@@ -5818,6 +5858,10 @@ launch_session->exact_target_hold.reset();
 #endif
       [[maybe_unused]] const bool allow_display_changes = true;
       auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity, request, true, dispatch::include_request_identity_log_fields(trace_id));
+      if (!bind_direct_usb_video(request, verified_client, *launch_session, tree)) {
+        tree.put("root.gamesession", 0);
+        return;
+      }
   #ifndef _WIN32
     if (launch_session->requested_resolution_only) {
       tree.put("root.<xmlattr>.status_code", 503);
@@ -6117,7 +6161,10 @@ launch_session->exact_target_hold.reset();
         std::format(
           "{}{}:{}",
           launch_session->rtsp_url_scheme,
-          net::addr_to_url_escaped_string([&]() {
+          net::addr_to_url_escaped_string([&]() -> boost::asio::ip::address {
+            if (launch_session->direct_usb_video) {
+              return boost::asio::ip::address_v4::loopback();
+            }
             auto addr = request->local_endpoint().address();
 #ifdef __APPLE__
             if (config::sunshine.bind_address.empty()) {
@@ -6449,6 +6496,10 @@ launch_session->exact_target_hold.reset();
     }
 
     auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity, request, true, dispatch::include_request_identity_log_fields(trace_id));
+    if (!bind_direct_usb_video(request, verified_client, *launch_session, tree)) {
+      tree.put("root.resume", 0);
+      return;
+    }
 #ifndef _WIN32
     if (launch_session->requested_resolution_only) {
       tree.put("root.<xmlattr>.status_code", 503);
@@ -6872,7 +6923,10 @@ launch_session->exact_target_hold.reset();
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string([&]() {
+        net::addr_to_url_escaped_string([&]() -> boost::asio::ip::address {
+          if (launch_session->direct_usb_video) {
+            return boost::asio::ip::address_v4::loopback();
+          }
           auto addr = request->local_endpoint().address();
 #ifdef __APPLE__
           if (config::sunshine.bind_address.empty()) {
@@ -7902,6 +7956,51 @@ launch_session->exact_target_hold.reset();
     std::thread ssl {accept_and_run, &https_server};
     std::thread tcp {accept_and_run, &http_server};
 
+#ifdef __APPLE__
+    auto tunnel_address = net::get_bind_address(address_family);
+    if (tunnel_address.empty() || tunnel_address == "0.0.0.0" || tunnel_address == "::") {
+      tunnel_address = "127.0.0.1";
+    }
+    auto tunnel_host_name = config::nvhttp.sunshine_name;
+    if (tunnel_host_name.empty()) {
+      boost::system::error_code hn_ec;
+      tunnel_host_name = boost::asio::ip::host_name(hn_ec);
+      if (tunnel_host_name.empty()) {
+        tunnel_host_name = "Vibepollo";
+      }
+    }
+    util::jthread usb_stream_tunnel_worker {
+      [](
+        util::stop_token stop_token,
+        std::string host_id,
+        std::string host_name,
+        std::string local_addr,
+        usb_stream_tunnel::ports_t ports
+      ) {
+        usb_stream_tunnel::run(
+          std::move(stop_token),
+          std::move(host_id),
+          std::move(host_name),
+          std::move(local_addr),
+          ports,
+          [] { return uuid_util::uuid_t::generate().string(); }
+        );
+      },
+      http::unique_id,
+      std::move(tunnel_host_name),
+      std::move(tunnel_address),
+      usb_stream_tunnel::ports_t {
+        port_http,
+        port_https,
+        net::map_port(rtsp_stream::RTSP_SETUP_PORT),
+        net::map_port(stream::VIDEO_STREAM_PORT),
+        net::map_port(stream::CONTROL_PORT),
+        net::map_port(stream::AUDIO_STREAM_PORT),
+        net::map_port(stream::AUDIO_STREAM_PORT + 1),
+      }
+    };
+#endif
+
     util::jthread pairing_expiry_worker([](util::stop_token stop_token) {
       platf::set_thread_name("pair_expiry");
       while (!stop_token.stop_requested()) {
@@ -7932,6 +8031,10 @@ launch_session->exact_target_hold.reset();
 #ifdef _WIN32
     platf::hotkey::stop_end_stream_hotkey();
     stop_hotkey.disable();
+#endif
+#ifdef __APPLE__
+    usb_stream_tunnel_worker.request_stop();
+    usb_stream_tunnel_worker.join();
 #endif
     pairing_expiry_worker.request_stop();
     pairing_expiry_worker.join();

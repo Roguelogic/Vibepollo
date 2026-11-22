@@ -37,6 +37,10 @@ namespace stream {
   struct session_t;
 }
 
+namespace usb_stream_tunnel {
+  class video_channel;
+}
+
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
 
@@ -74,6 +78,8 @@ namespace rtsp_stream {
 
     std::string av_ping_payload;
     uint32_t control_connect_data;
+    bool setup_video = false;
+    std::shared_ptr<usb_stream_tunnel::video_channel> direct_usb_video;
 
     std::string device_name;
     std::string unique_id;

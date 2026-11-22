@@ -459,6 +459,9 @@ sunshine_register_component(NAME test_component_utility_hex TEST_SOURCE unit/tes
 sunshine_register_component(NAME test_component_round_robin TEST_SOURCE unit/test_round_robin.cpp)
 sunshine_register_component(NAME test_component_stat_tracker_bounds TEST_SOURCE unit/test_stat_tracker_bounds.cpp
     LINK_LIBRARIES Boost::format)
+sunshine_register_component(NAME test_component_usb_stream_tunnel TEST_SOURCE unit/test_usb_stream_tunnel.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/usb_stream_tunnel.cpp"
+    LINK_LIBRARIES nlohmann_json::nlohmann_json Boost::asio Boost::property_tree Boost::system Threads::Threads)
 
 # --- macOS native component tests ---
 if(APPLE)

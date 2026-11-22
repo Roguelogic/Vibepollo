@@ -73,6 +73,7 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "update.h"
+#include "usb_stream_tunnel.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video_send.h"
@@ -680,6 +681,7 @@ namespace stream {
 
     struct {
       std::string ping_payload;
+      std::shared_ptr<usb_stream_tunnel::video_channel> direct_usb;
 
       std::uint32_t lowseq;
       udp::endpoint peer;
@@ -3100,36 +3102,60 @@ namespace stream {
               if (!burst_first_send) {
                 burst_first_send = send_start;
               }
-              const auto send_result = send_video_batch(
-                current_batch_size,
-                batch_info.allow_fallback,
-                [&] { return platf::send_batch(batch_info); },
-                [&](std::size_t y) {
-                  auto send_info = platf::send_info_t {
-                    shards.prefix(next_shard_to_send + y),
-                    shards.prefixsize,
-                    shards.data(next_shard_to_send + y),
-                    shards.blocksize,
-                    (uintptr_t) sock.native_handle(),
-                    peer_address,
-                    session->video.peer.port(),
-                    session->localAddress,
-                  };
-                  send_info.send_cancelled = send_cancelled;
-                  return platf::send(send_info);
-                },
-                send_cancelled
-              );
-              burst_fallback_batches += send_result.used_fallback;
-              frame_packets_accepted += send_result.packets_accepted;
-              ratecontrol_group_packets_sent += send_result.packets_accepted;
-              ratecontrol_frame_packets_sent += send_result.packets_accepted;
-              // Keep pacing debt from accepted batches even if this block or
-              // frame aborts before its final shard.
-              ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                             frame_pacing_delay(ratecontrol_frame_packets_sent);
-              if (!send_result.sent) {
-                throw video_send_failed_t {send_result.cancelled, unsigned(blockIndex), send_result.packets_accepted};
+              if (session->video.direct_usb) {
+                std::vector<char> batch;
+                batch.reserve(current_batch_size * (shards.blocksize + shards.prefixsize + 2));
+                bool usb_video_ok = true;
+                for (std::size_t y = next_shard_to_send; y <= static_cast<std::size_t>(x); ++y) {
+                  const auto prefix = shards.prefixsize ?
+                                        std::string_view(shards.prefix(y), shards.prefixsize) :
+                                        std::string_view {};
+                  if (!usb_stream_tunnel::append_video_datagram(batch, prefix, {shards.data(y), shards.blocksize})) {
+                    usb_video_ok = false;
+                    break;
+                  }
+                }
+                if (!usb_video_ok || !session->video.direct_usb->enqueue(std::move(batch))) {
+                  session::stop(*session);
+                  throw video_send_failed_t {true, unsigned(blockIndex), 0};
+                }
+                frame_packets_accepted += current_batch_size;
+                ratecontrol_group_packets_sent += current_batch_size;
+                ratecontrol_frame_packets_sent += current_batch_size;
+                ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                               frame_pacing_delay(ratecontrol_frame_packets_sent);
+              } else {
+                const auto send_result = send_video_batch(
+                  current_batch_size,
+                  batch_info.allow_fallback,
+                  [&] { return platf::send_batch(batch_info); },
+                  [&](std::size_t y) {
+                    auto send_info = platf::send_info_t {
+                      shards.prefix(next_shard_to_send + y),
+                      shards.prefixsize,
+                      shards.data(next_shard_to_send + y),
+                      shards.blocksize,
+                      (uintptr_t) sock.native_handle(),
+                      peer_address,
+                      session->video.peer.port(),
+                      session->localAddress,
+                    };
+                    send_info.send_cancelled = send_cancelled;
+                    return platf::send(send_info);
+                  },
+                  send_cancelled
+                );
+                burst_fallback_batches += send_result.used_fallback;
+                frame_packets_accepted += send_result.packets_accepted;
+                ratecontrol_group_packets_sent += send_result.packets_accepted;
+                ratecontrol_frame_packets_sent += send_result.packets_accepted;
+                // Keep pacing debt from accepted batches even if this block or
+                // frame aborts before its final shard.
+                ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                               frame_pacing_delay(ratecontrol_frame_packets_sent);
+                if (!send_result.sent) {
+                  throw video_send_failed_t {send_result.cancelled, unsigned(blockIndex), send_result.packets_accepted};
+                }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
               burst_last_return = std::chrono::steady_clock::now();
@@ -3643,14 +3669,40 @@ namespace stream {
     while_starting_do_nothing(session->state);
 
     auto ref = broadcast.ref();
-    const auto ping_error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
-    if (ping_error < 0) {
-      return;
+    if (!session->video.direct_usb) {
+      const auto ping_error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
+      if (ping_error < 0) {
+        return;
+      }
+
+      // Enable local prioritization and QoS tagging on video traffic if requested by the client
+      auto address = session->video.peer.address();
+      session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    } else {
+      const auto deadline = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+      bool reader_ready = false;
+      while (!session->shutdown_event->peek() && std::chrono::steady_clock::now() < deadline) {
+        if (session->video.direct_usb->wait_for_reader(100ms)) {
+          reader_ready = true;
+          break;
+        }
+        if (!session->video.direct_usb->active()) {
+          break;
+        }
+      }
+      if (!reader_ready) {
+        session->video.direct_usb->close();
+        BOOST_LOG(warning) << "Direct USB video reader did not start"sv;
+        return;
+      }
+      BOOST_LOG(info) << "Direct USB video active for session "sv << session->launch_session_id;
     }
 
-    // Enable local prioritization and QoS tagging on video traffic if requested by the client
-    auto address = session->video.peer.address();
-    session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    auto close_usb_video = util::fail_guard([&]() {
+      if (session->video.direct_usb) {
+        session->video.direct_usb->close();
+      }
+    });
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);
@@ -4099,8 +4151,11 @@ namespace stream {
         }
       });
 
-      // Release input before any potentially hung capture joins.
+      // Release input and any direct USB video queue before potentially hung capture joins.
       input::reset(session.input);
+      if (session.video.direct_usb) {
+        session.video.direct_usb->close();
+      }
 
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
@@ -4313,8 +4368,9 @@ namespace stream {
                                          (monitor.client_requested_bitrate > 0 ? monitor.client_requested_bitrate : monitor.bitrate) :
                                          (monitor.bitrate > 0 ? monitor.bitrate : monitor.client_requested_bitrate);
       session.video.pacing_bitrate_kbps.store(pacing_bitrate_kbps, std::memory_order_relaxed);
-      // PyroWave keeps its own pacing; the controller only serves ordinary video.
-      session.video.adaptive_pacing_enabled = config::stream.host_adaptive_pacing && !pyrowave_session;
+      // PyroWave and direct USB bulk video do not use ordinary UDP loss-based adaptive pacing.
+      session.video.adaptive_pacing_enabled =
+        config::stream.host_adaptive_pacing && !pyrowave_session && !session.video.direct_usb;
       session.video.adaptive_pacing = pacing::adaptive_pacing_t {session.video.adaptive_pacing_enabled};
 
       session.broadcast_ref = broadcast.ref();
@@ -4678,6 +4734,7 @@ namespace stream {
       session->video.bitrate_events = mail->event<int>(mail::dynamic_bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
+      session->video.direct_usb = launch_session.direct_usb_video;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
         session->video.cipher = crypto::cipher::gcm_t {

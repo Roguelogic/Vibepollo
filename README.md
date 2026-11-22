@@ -40,6 +40,9 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
   * Low-latency mouse, keyboard (including Korean/English input source switching), and 120Hz continuous scrolling with selectable inertia curves in the menu bar.
   * Supports native multi-touch and stylus tablet protocols (pressure, tilt, barrel roll, and side gestures) for VoidLink clients.
 
+* **USB Wired Streaming (`usbmuxd`)**
+  * Driverless plug-and-play USB-C / Thunderbolt streaming for VoidLink over macOS's built-in `usbmuxd` daemon, including a dedicated direct USB video channel that works even with iPad Wi-Fi turned off.
+
 ---
 
 ## Resolution & Refresh Rate Notes

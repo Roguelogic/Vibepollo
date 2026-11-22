@@ -54,6 +54,7 @@ extern "C" {
 #include "stream.h"
 #include "sync.h"
 #include "thread_pool.h"
+#include "usb_stream_tunnel.h"
 #include "video.h"
 
 namespace asio = boost::asio;
@@ -219,6 +220,8 @@ namespace rtsp_stream {
     snapshot->iv = iv;
     snapshot->av_ping_payload = av_ping_payload;
     snapshot->control_connect_data = control_connect_data;
+    snapshot->setup_video = setup_video;
+    snapshot->direct_usb_video = direct_usb_video;
     snapshot->unique_id = unique_id;
     snapshot->client_uuid = client_uuid;
     snapshot->client_name = client_name;
@@ -2245,6 +2248,7 @@ namespace rtsp_stream {
     if (type == "audio"sv) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
     } else if (type == "video"sv) {
+      session->setup_video = true;
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
@@ -2330,8 +2334,12 @@ namespace rtsp_stream {
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
+        if (!val.empty() && val[val.size() - 1] == ' ') {
           val = val.substr(0, val.size() - 1);
+        }
+        if (name == "x-ml-video.usbStreamVersion"sv && args.contains(name)) {
+          respond(socket->sock, *session, &option, 400, "Duplicate transport version", req->sequenceNumber, {});
+          return false;
         }
         args.emplace(name, val);
       }
@@ -2743,6 +2751,17 @@ namespace rtsp_stream {
 
     auto remote_address = remote_endpoint.address().to_string();
 
+    const auto usb_video = args.find("x-ml-video.usbStreamVersion"sv);
+    if (session->direct_usb_video || usb_video != args.end()) {
+      if (!session->direct_usb_video || !session->direct_usb_video->active() ||
+          usb_video == args.end() || usb_video->second != "1"sv ||
+          !session->setup_video || config.monitor.input_only ||
+          config.packetsize <= 0 || config.packetsize > 65000) {
+        respond(socket->sock, *session, &option, 461, "Direct USB Video Unavailable", req->sequenceNumber, {});
+        return false;
+      }
+    }
+
     const int sequence_number = req->sequenceNumber;
     const std::string client_uuid = session->client_uuid;
     const auto launch_session_id = session->id;
@@ -2851,6 +2870,12 @@ namespace rtsp_stream {
             audio_codec_option.option = audio_codec_header.data();
             audio_codec_option.content = audio_codec_name.data();
             completion_option.next = &audio_codec_option;
+            OPTION_ITEM usb_video_option {};
+            if (session->direct_usb_video) {
+              usb_video_option.option = const_cast<char *>("X-SS-USB-Video-Version");
+              usb_video_option.content = const_cast<char *>("1");
+              audio_codec_option.next = &usb_video_option;
+            }
             respond(socket->sock, *session, &completion_option, 200, "OK", sequence_number, {});
           }
 
