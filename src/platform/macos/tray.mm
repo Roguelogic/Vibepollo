@@ -106,9 +106,9 @@ namespace {
       }
 
       NSString *keyEq = @"";
-      if (item.text == "Open Vibepollo" || item.text == "Vibepollo 설정...") {
+      if (item.text == "Open Vibepollo" || item.text == "설정...") {
         keyEq = @",";
-      } else if (item.text == "Quit" || item.text == "Vibepollo 종료") {
+      } else if (item.text == "Quit" || item.text == "종료") {
         keyEq = @"q";
       }
       NSMenuItem *menu_item = [[NSMenuItem alloc] initWithTitle:@(item.text.c_str())

@@ -362,7 +362,7 @@ private struct GeneralSettingsPane: View {
           )
         ) {
           SettingsRowLabel(
-            title: l10n.pick("로그인 시 Vibepollo 열기", "Open at Login"),
+            title: l10n.pick("로그인 시 열기", "Open at Login"),
             subtitle: l10n.pick("Mac에 로그인할 때 메뉴 막대에서 자동으로 호스트를 시작합니다.", "Automatically start Vibepollo in the menu bar when you log in.")
           )
         }

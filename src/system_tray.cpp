@@ -630,19 +630,19 @@ namespace system_tray {
 
   static void sync_macos_tray_localization() {
     const bool ko = is_macos_tray_korean();
-    scroll_inertia_submenu[0].text = ko ? "MacBook 트랙패드 네이티브" : "MacBook Trackpad";
-    scroll_inertia_submenu[1].text = ko ? "iPad 모멘텀 관성" : "iPad Momentum";
-    scroll_inertia_submenu[2].text = ko ? "관성 없음" : "Disabled";
+    scroll_inertia_submenu[0].text = ko ? "MacBook 트랙패드" : "MacBook Trackpad";
+    scroll_inertia_submenu[1].text = ko ? "iPad 모멘텀" : "iPad Momentum";
+    scroll_inertia_submenu[2].text = ko ? "사용 안 함" : "Disabled";
 
     pencil_mode_submenu[0].text = ko ? "클라이언트 설정 따름 (VoidLink)" : "Follow Client (VoidLink)";
-    pencil_mode_submenu[1].text = ko ? "스크롤 및 탭 (iPad 조작 방식)" : "Scroll & Tap (iPad Style)";
-    pencil_mode_submenu[2].text = ko ? "드로잉 태블릿 (필압 펜 입력)" : "Drawing Tablet (Pen Input)";
+    pencil_mode_submenu[1].text = ko ? "스크롤 및 탭 (iPad 스타일)" : "Scroll & Tap (iPad Style)";
+    pencil_mode_submenu[2].text = ko ? "드로잉 태블릿 (펜 입력)" : "Drawing Tablet (Pen Input)";
 
     for (auto *m = tray.menu; m != nullptr && m->text != nullptr; ++m) {
       if (m->cb == tray_open_ui_cb) {
-        m->text = ko ? "Vibepollo 설정..." : "Open Vibepollo";
+        m->text = ko ? "설정..." : "Open Vibepollo";
       } else if (m->cb == tray_pair_pin_cb) {
-        m->text = ko ? "새 기기 페어링 (PIN)..." : "Pair Device (PIN)...";
+        m->text = ko ? "기기 페어링 (PIN)..." : "Pair Device (PIN)...";
       } else if (m->cb == tray_force_stop_cb) {
         if (!s_last_playing_app.empty()) {
           snprintf(
@@ -662,13 +662,13 @@ namespace system_tray {
       } else if (m->submenu == pencil_mode_submenu) {
         m->text = "Apple Pencil";
       } else if (m->cb == tray_open_at_login_cb) {
-        m->text = ko ? "로그인 시 Vibepollo 열기" : "Open at Login";
+        m->text = ko ? "로그인 시 열기" : "Open at Login";
       } else if (m->cb == tray_allow_login_screen_cb) {
-        m->text = ko ? "Mac 잠금 및 로그인 화면에서 허용" : "Allow on Login Screen";
+        m->text = ko ? "로그인 화면에서 허용" : "Allow on Login Screen";
       } else if (m->cb == tray_restart_cb) {
-        m->text = ko ? "Vibepollo 재시작" : "Restart";
+        m->text = ko ? "재시작" : "Restart";
       } else if (m->cb == tray_quit_cb) {
-        m->text = ko ? "Vibepollo 종료" : "Quit";
+        m->text = ko ? "종료" : "Quit";
       }
     }
   }

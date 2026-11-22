@@ -274,7 +274,7 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
     )
     appMenu.addItem(NSMenuItem.separator())
     appMenu.addItem(
-      withTitle: l10n.pick("Vibepollo 종료", "Quit Vibepollo"),
+      withTitle: l10n.pick("종료", "Quit"),
       action: #selector(NSApplication.terminate(_:)),
       keyEquivalent: "q"
     )
