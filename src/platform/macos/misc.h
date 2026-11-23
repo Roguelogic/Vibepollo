@@ -116,6 +116,12 @@ namespace platf {
   bool is_loginwindow_session();
 
   /**
+   * @brief Whether a non-root Open-at-Login background launch occurred while macOS has no active
+   *        interactive Aqua session for this user (e.g. sitting at LoginWindow after logout).
+   */
+  bool should_exit_for_inactive_gui_session();
+
+  /**
    * @brief Prepare an isolated root-owned runtime directory seeded from the owner's paired config
    *        when running in the pre-login macOS LoginWindow session.
    */

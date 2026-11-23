@@ -26,6 +26,7 @@
 #include "src/cbs.h"
 #include "src/logging.h"
 #include "src/platform/macos/av_img_t.h"
+#include "src/platform/macos/cf_guard.h"
 #include "src/platform/macos/vt_encoder.h"
 #include "src/utility.h"
 #include "src/video.h"
@@ -446,12 +447,13 @@ namespace {
           }
 
           CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample_buffer);
-          if (format != self->last_format) {
+          if (format && (!self->last_format || !CMFormatDescriptionEqual(format, self->last_format.get()))) {
             if (!sync && self->last_format) {
               BOOST_LOG(warning) << "VideoToolbox format description changed without a keyframe, forcing IDR"sv;
               self->need_idr = true;
             }
-            self->last_format = format;
+            CFRetain(format);
+            self->last_format.reset(format);
             self->cached_parameter_sets = build_patched_parameter_sets(format);
           }
 
@@ -717,8 +719,8 @@ namespace {
     bool sticky_error = false;
     bool need_idr = false;
     logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "VideoToolbox: encoded frame sizes in kB", ""};  ///< Periodic encoded frame size statistics.
-    // Pointer identity only, never dereferenced; used to notice mid-stream parameter set changes
-    CMFormatDescriptionRef last_format = nullptr;
+    // Retained format description to detect mid-stream parameter set changes without ABA pointer reuse.
+    platf::cf_ref_t<CMFormatDescriptionRef> last_format {};
     std::vector<uint8_t> cached_parameter_sets;
     std::vector<uint8_t> cached_hdr_sei;
   };

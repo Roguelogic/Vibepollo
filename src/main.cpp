@@ -80,6 +80,7 @@
   #include "platform/macos/misc.h"
   #include "platform/macos/virtual_display.h"
 
+  #include <dispatch/dispatch.h>
   #include <mach-o/dyld.h>
 #endif
 
@@ -399,6 +400,9 @@ int main(int argc, char *argv[]) {
     }
   }
   platf::prepare_loginwindow_runtime();
+  if (platf::should_exit_for_inactive_gui_session()) {
+    return 0;
+  }
 #endif
 
   // parse config file
@@ -740,6 +744,11 @@ int main(int argc, char *argv[]) {
   if (config::sunshine.system_tray) {
     system_tray::run_tray();
   }
+  #ifdef __APPLE__
+  else {
+    system_tray::ensure_macos_app_delegate();
+  }
+  #endif
 #ifdef _WIN32
   auto tray_shutdown_guard = util::fail_guard([&shutdown_deadline]() {
     shutdown_deadline.arm();
@@ -763,7 +772,38 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-#ifndef __linux__
+#ifdef __APPLE__
+  // Handle SIGINT and SIGTERM on the GCD main queue outside POSIX signal context so
+  // AppKit, Boost.Log, and process teardown locks are never entered from an async signal.
+  std::signal(SIGINT, SIG_IGN);
+  std::signal(SIGTERM, SIG_IGN);
+
+  static dispatch_source_t s_macos_sigint = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, dispatch_get_main_queue());
+  if (s_macos_sigint) {
+    dispatch_source_set_event_handler(s_macos_sigint, ^{
+      shutdown_signal_requested.store(true, std::memory_order_relaxed);
+      BOOST_LOG(info) << "Interrupt handler called"sv;
+      proc::proc.terminate();
+      shutdown_event->raise(true);
+    });
+    dispatch_resume(s_macos_sigint);
+  }
+
+  static dispatch_source_t s_macos_sigterm = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
+  if (s_macos_sigterm) {
+    dispatch_source_set_event_handler(s_macos_sigterm, ^{
+      if (platf::is_loginwindow_session()) {
+        // Release ports and virtual display immediately when macOS transitions LoginWindow -> Aqua
+        // after password entry so the incoming desktop agent binds without port contention.
+        std::_Exit(0);
+      }
+      shutdown_signal_requested.store(true, std::memory_order_relaxed);
+      BOOST_LOG(info) << "Terminate handler called"sv;
+      shutdown_event->raise(true);
+    });
+    dispatch_resume(s_macos_sigterm);
+  }
+#elif !defined(__linux__)
   // Other platforms retain their native signal/control handlers. Linux has
   // blocked these signals process-wide and consumes them synchronously above.
   on_signal(SIGINT, [&shutdown_signal_requested, shutdown_event]() {
@@ -785,15 +825,6 @@ int main(int argc, char *argv[]) {
   on_signal(SIGTERM, [&shutdown_signal_requested, shutdown_event]() {
     shutdown_signal_requested.store(true, std::memory_order_relaxed);
     BOOST_LOG(info) << "Terminate handler called"sv;
-  #ifdef __APPLE__
-    if (platf::is_loginwindow_session()) {
-      // Release ports and virtual display immediately when macOS transitions LoginWindow -> Aqua
-      // after password entry so the incoming desktop agent binds without port contention.
-      platf::macos_virtual_display::end_launch_hold();
-      platf::macos_virtual_display::end_pause_hold();
-      std::_Exit(0);
-    }
-  #endif
 
     // Break out of the main loop
     shutdown_event->raise(true);
@@ -1227,6 +1258,8 @@ int main(int argc, char *argv[]) {
   platf::run_main_event_loop([&shutdown_event]() {
     return shutdown_event->peek();
   });
+  platf::macos_virtual_display::end_launch_hold();
+  platf::macos_virtual_display::end_pause_hold();
 #endif
 
   // Wait for shutdown

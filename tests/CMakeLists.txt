@@ -471,8 +471,11 @@ if(APPLE)
     sunshine_register_component(NAME test_component_av_audio_policy TEST_SOURCE unit/platform/macos/test_av_audio.mm
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/macos/av_audio_policy.cpp")
     sunshine_register_component(NAME test_component_macos_wheel_scroll TEST_SOURCE unit/platform/macos/test_wheel_scroll.cpp)
-    sunshine_register_component(NAME test_component_macos_window_drag_prefetch TEST_SOURCE unit/platform/macos/test_window_drag_prefetch.cpp
-        LINK_LIBRARIES Threads::Threads)
+    sunshine_register_component(NAME test_component_macos_keymap TEST_SOURCE unit/platform/macos/test_keymap.cpp
+        PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/macos/keymap.cpp"
+        LINK_LIBRARIES "-framework ApplicationServices" "-framework Carbon")
+    sunshine_register_component(NAME test_component_macos_input_events TEST_SOURCE unit/platform/macos/test_macos_input_events.mm
+        LINK_LIBRARIES "-framework Cocoa" "-framework ApplicationServices")
     sunshine_register_component(NAME test_component_macos_display_policy TEST_SOURCE unit/platform/macos/test_display_policy.cpp
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/macos/display_policy.cpp")
 endif()

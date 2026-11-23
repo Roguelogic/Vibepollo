@@ -14,6 +14,7 @@
 #include <iterator>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace stream::pacing {
@@ -120,6 +121,8 @@ namespace stream::pacing {
   struct fec_report_t {
     std::uint32_t frame {};
     fec_block_t block;
+    /// True on the first unrecoverable block observed for `frame` within the window.
+    bool first_unrecoverable_for_frame {false};
   };
 
   /// Validates reports against the frames actually sent and counts each frame's
@@ -148,7 +151,7 @@ namespace stream::pacing {
         return frame.index == status->frame;
       });
       if (entry == frames_.end()) {
-        frames_.push_back({status->frame, 0, status->blocks});
+        frames_.push_back({status->frame, 0, status->blocks, false});
         entry = std::prev(frames_.end());
       }
       if (entry->block_count != status->blocks) {
@@ -165,12 +168,13 @@ namespace stream::pacing {
       // These best-effort reports infer recovery, not a successful decode.
       const std::uint32_t received = std::uint32_t(status->received_data) + status->received_parity;
       if (received < status->data) {
-        return fec_report_t {status->frame, fec_block_t::unrecoverable_block()};
+        const bool first_unrecoverable = !std::exchange(entry->unrecoverable_reported, true);
+        return fec_report_t {status->frame, fec_block_t::unrecoverable_block(), first_unrecoverable};
       }
       if (status->received_data < status->data) {
-        return fec_report_t {status->frame, fec_block_t::recovered_block(std::uint16_t(status->data - status->received_data), status->data)};
+        return fec_report_t {status->frame, fec_block_t::recovered_block(std::uint16_t(status->data - status->received_data), status->data), false};
       }
-      return fec_report_t {status->frame, fec_block_t::clean_block()};
+      return fec_report_t {status->frame, fec_block_t::clean_block(), false};
     }
 
     std::uint64_t reports() const {
@@ -190,6 +194,7 @@ namespace stream::pacing {
       std::uint32_t index;
       std::uint8_t blocks;  ///< Bitmask of block indexes already reported.
       std::uint8_t block_count;
+      bool unrecoverable_reported {false};
     };
 
     std::vector<frame_t> frames_;

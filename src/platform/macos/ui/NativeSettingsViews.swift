@@ -294,6 +294,7 @@ private struct GeneralSettingsPane: View {
   @ObservedObject var store: HostStore
   @ViewState private var showAdvancedSheet = false
   @ViewState private var hostNameDraft: String = ""
+  @FocusState private var hostNameFocused: Bool
   private var l10n: L10n { store.l10n }
 
   var body: some View {
@@ -345,11 +346,14 @@ private struct GeneralSettingsPane: View {
           .labelsHidden()
           .multilineTextAlignment(.trailing)
           .frame(width: 220)
+          .focused($hostNameFocused)
           .onSubmit {
             commitHostNameIfNeeded()
           }
-          .onReceive(NotificationCenter.default.publisher(for: NSControl.textDidEndEditingNotification)) { _ in
-            commitHostNameIfNeeded()
+          .onChange(of: hostNameFocused) { _, focused in
+            if !focused {
+              commitHostNameIfNeeded()
+            }
           }
         }
       }
@@ -724,22 +728,6 @@ private struct VideoSettingsPane: View {
           Text(l10n.pick("10-bit HDR까지 허용", "Up to 10-bit HDR")).tag(3)
         }
 
-        Picker(
-          l10n.pick("AV1 허용 범위", "Allow AV1"),
-          selection: Binding(
-            get: { store.settings.av1Mode },
-            set: { v in
-              store.settings.av1Mode = v
-              store.patchSettings(["av1_mode": v])
-            }
-          )
-        ) {
-          Text(l10n.pick("자동 (클라이언트 설정 따름)", "Automatic (Follow Client)")).tag(0)
-          Text(l10n.pick("사용 안 함", "Disabled")).tag(1)
-          Text(l10n.pick("8-bit SDR까지만 허용", "Up to 8-bit SDR")).tag(2)
-          Text(l10n.pick("10-bit HDR까지 허용", "Up to 10-bit HDR")).tag(3)
-        }
-
         Toggle(
           isOn: Binding(
             get: { store.settings.vtRealtime },
@@ -820,6 +808,21 @@ private struct InputAudioSettingsPane: View {
         }
 
         Toggle(
+          isOn: Binding(
+            get: { store.settings.palmRejection },
+            set: { v in
+              store.settings.palmRejection = v
+              store.patchSettings(["macos_palm_rejection": v])
+            }
+          )
+        ) {
+          SettingsRowLabel(
+            title: l10n.pick("펜 사용 중 손바닥 터치 차단", "Reject Touch While Using Pencil"),
+            subtitle: l10n.pick("Apple Pencil이 호버 중이거나 그리는 동안 손바닥·손가락 터치 오작동을 자동으로 막습니다.", "Ignore stray finger and palm touches while Apple Pencil is hovering or drawing.")
+          )
+        }
+
+        Toggle(
           l10n.pick("고해상도 부드러운 스크롤", "High-Resolution Scrolling"),
           isOn: Binding(
             get: { store.settings.highResScrolling },
@@ -831,7 +834,6 @@ private struct InputAudioSettingsPane: View {
         )
 
         Toggle(
-          l10n.pick("네이티브 펜 및 멀티터치 전달", "Native Pen & Touch Input"),
           isOn: Binding(
             get: { store.settings.nativePenTouch },
             set: { v in
@@ -839,7 +841,12 @@ private struct InputAudioSettingsPane: View {
               store.patchSettings(["native_pen_touch": v])
             }
           )
-        )
+        ) {
+          SettingsRowLabel(
+            title: l10n.pick("Apple Pencil 및 보조 터치 전달", "Apple Pencil & Auxiliary Touch"),
+            subtitle: l10n.pick("Apple Pencil 필압 · 호버 · 배럴 롤을 전달합니다. 손가락 조작은 클라이언트 앱의 트랙패드/마우스 모드를 권장합니다.", "Forwards Apple Pencil pressure, hover, and barrel roll. Use the client app's Trackpad or Mouse mode for finger navigation.")
+          )
+        }
       }
 
       Section(l10n.pick("입력 장치", "Input Devices")) {
@@ -861,17 +868,6 @@ private struct InputAudioSettingsPane: View {
             set: { v in
               store.settings.mouse = v
               store.patchSettings(["mouse": v])
-            }
-          )
-        )
-
-        Toggle(
-          l10n.pick("게임 컨트롤러 입력 허용", "Enable Gamepad Input"),
-          isOn: Binding(
-            get: { store.settings.controller },
-            set: { v in
-              store.settings.controller = v
-              store.patchSettings(["controller": v])
             }
           )
         )
@@ -916,8 +912,8 @@ private struct InputAudioSettingsPane: View {
           }
         } label: {
           SettingsRowLabel(
-            title: l10n.pick("컨트롤러 · 키 반복 및 키 바인딩", "Controller, Key Repeat & Keybindings"),
-            subtitle: l10n.pick("진동, DS4 모션/터치패드, 가이드 버튼, 키 반복 속도 및 키 매핑을 설정합니다.", "Configure rumble, DS4 motion/touchpad, guide button, key repeat, and key mappings.")
+            title: l10n.pick("입력 세션 · 키 반복 및 키 바인딩", "Input Session, Key Repeat & Keybindings"),
+            subtitle: l10n.pick("입력 전용 모드, 우측 Option 매핑, 키 반복 속도 및 커스텀 키 바인딩을 설정합니다.", "Configure input-only mode, Right Option mapping, key repeat, and custom keybindings.")
           )
         }
 
@@ -928,7 +924,7 @@ private struct InputAudioSettingsPane: View {
         } label: {
           SettingsRowLabel(
             title: l10n.pick("오디오 출력 장치 및 서라운드 옵션", "Audio Routing & Surround"),
-            subtitle: l10n.pick("오디오 싱크 장치명, 기본 장치 유지 정책 및 고음질 서라운드를 설정합니다.", "Configure audio sink devices, default output retention, and high-quality surround.")
+            subtitle: l10n.pick("CoreAudio 출력 싱크 장치 지정 및 Dolby 고음질 서라운드를 설정합니다.", "Configure CoreAudio sink override and high-quality Dolby surround.")
           )
         }
       }
@@ -1644,8 +1640,8 @@ private struct DeviceDetailSubView: View {
               }
             } label: {
               SettingsRowLabel(
-                title: l10n.pick("개별 입력 장치 권한", "Granular Input Permissions"),
-                subtitle: l10n.pick("키보드, 마우스, 터치, 펜, 컨트롤러 허용 여부를 개별 지정합니다.", "Toggle keyboard, mouse, touch, pen, and controller individually.")
+                title: l10n.pick("개별 입력 및 클립보드 권한", "Granular Input & Clipboard Permissions"),
+                subtitle: l10n.pick("키보드, 마우스, 터치, 펜 및 클립보드 읽기/쓰기 허용 여부를 개별 지정합니다.", "Toggle keyboard, mouse, touch, pen, and clipboard read/write individually.")
               )
             }
           }
@@ -1843,7 +1839,6 @@ private struct DeviceGranularPermSheet: View {
           Toggle(l10n.pick("마우스 및 트랙패드", "Mouse & Trackpad"), isOn: perm(PairedClientItem.maskInputMouse))
           Toggle(l10n.pick("멀티터치 화면", "Touch"), isOn: perm(PairedClientItem.maskInputTouch))
           Toggle(l10n.pick("펜 및 Apple Pencil", "Pen & Apple Pencil"), isOn: perm(PairedClientItem.maskInputPen))
-          Toggle(l10n.pick("게임 컨트롤러", "Game Controller"), isOn: perm(PairedClientItem.maskInputController))
           Toggle(l10n.pick("호스트 클립보드 읽기", "Read Host Clipboard"), isOn: perm(PairedClientItem.maskClipboardRead))
           Toggle(l10n.pick("호스트 클립보드 쓰기", "Write Host Clipboard"), isOn: perm(PairedClientItem.maskClipboardSet))
         }
@@ -1968,6 +1963,7 @@ private struct DeviceCommandsSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             onCommit(client.wrappedValue)
             dismiss()
           }
@@ -2347,6 +2343,7 @@ private struct AppEditorSheet: View {
         }
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("저장", "Save")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             if let err = store.saveApp(app) {
               errorMsg = err
             } else {

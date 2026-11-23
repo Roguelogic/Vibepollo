@@ -669,6 +669,7 @@ namespace config {
     true,  // native pen/touch support
     "macos",  // macOS continuous scroll inertia mode ("macos", "ipados", "disabled")
     "auto",  // macOS Apple Pencil mode ("auto", "scroll", "draw")
+    true,  // macOS host-side palm rejection while Apple Pencil is active
     false,  // enable input only mode
     true,  // forward_rumble
   };
@@ -859,7 +860,7 @@ namespace config {
       // We know we have a valid closing bracket if:
       // 1. We didn't reach the end, or
       // 2. We reached the end but the last character was the matching closing bracket
-      if (endl == end && end == begin_val + 1) {
+      if (endl == end && (end == begin_val + 1 || *(end - 1) != ']')) {
         BOOST_LOG(warning) << "config: Missing ']' in config option: " << to_string(begin, end_name);
         return std::make_pair(endl, std::nullopt);
       }
@@ -869,6 +870,183 @@ namespace config {
       endl,
       std::make_pair(to_string(begin, end_name), to_string(begin_val, endl))
     );
+  }
+
+  namespace {
+    std::atomic<macos_scroll_inertia_e> g_macos_scroll_inertia {macos_scroll_inertia_e::macos};
+    std::atomic<macos_pencil_mode_e> g_macos_pencil_mode {macos_pencil_mode_e::follow_client};
+    std::atomic<bool> g_macos_palm_rejection {true};
+
+    void publish_macos_input_snapshots() noexcept {
+      macos_scroll_inertia_e inertia = macos_scroll_inertia_e::macos;
+      if (input.macos_scroll_inertia == "ipados") {
+        inertia = macos_scroll_inertia_e::ipados;
+      } else if (input.macos_scroll_inertia == "disabled") {
+        inertia = macos_scroll_inertia_e::disabled;
+      }
+      g_macos_scroll_inertia.store(inertia, std::memory_order_release);
+
+      macos_pencil_mode_e pmode = macos_pencil_mode_e::follow_client;
+      if (input.macos_pencil_mode == "scroll") {
+        pmode = macos_pencil_mode_e::scroll;
+      } else if (input.macos_pencil_mode == "draw") {
+        pmode = macos_pencil_mode_e::draw;
+      }
+      g_macos_pencil_mode.store(pmode, std::memory_order_release);
+      g_macos_palm_rejection.store(input.macos_palm_rejection, std::memory_order_release);
+    }
+
+    std::string sanitize_config_value(std::string_view raw) {
+      std::string trimmed {raw};
+      while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) {
+        trimmed.erase(trimmed.begin());
+      }
+      while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' || trimmed.back() == '\r' || trimmed.back() == '\n')) {
+        trimmed.pop_back();
+      }
+      if (trimmed.empty()) {
+        return {};
+      }
+      if (trimmed.front() == '[') {
+        // Ensure balanced brackets so an unclosed '[' can never swallow subsequent lines in sunshine.conf.
+        auto after = skip_list(trimmed.begin() + 1, trimmed.end());
+        if (after == trimmed.end() && (trimmed.size() < 2 || trimmed.back() != ']')) {
+          std::erase_if(trimmed, [](char c) { return c == '\r' || c == '\n'; });
+          trimmed.push_back(']');
+        }
+        return trimmed;
+      }
+      std::replace(trimmed.begin(), trimmed.end(), '\r', ' ');
+      std::replace(trimmed.begin(), trimmed.end(), '\n', ' ');
+      return trimmed;
+    }
+
+    bool write_file_atomic(const std::string &target_path, const std::string &contents) {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      const fs::path dst {target_path};
+      if (!dst.parent_path().empty()) {
+        fs::create_directories(dst.parent_path(), ec);
+      }
+      const fs::path tmp = dst.string() + ".tmp";
+      if (file_handler::write_file(tmp.string().c_str(), contents) != 0) {
+        fs::remove(tmp, ec);
+        return false;
+      }
+      fs::rename(tmp, dst, ec);
+      if (ec) {
+        fs::remove(tmp, ec);
+        return file_handler::write_file(target_path.c_str(), contents) == 0;
+      }
+      return true;
+    }
+  }  // namespace
+
+  macos_scroll_inertia_e get_macos_scroll_inertia() noexcept {
+    return g_macos_scroll_inertia.load(std::memory_order_acquire);
+  }
+
+  macos_pencil_mode_e get_macos_pencil_mode() noexcept {
+    return g_macos_pencil_mode.load(std::memory_order_acquire);
+  }
+
+  bool get_macos_palm_rejection() noexcept {
+    return g_macos_palm_rejection.load(std::memory_order_acquire);
+  }
+
+  std::mutex &config_file_mutex() {
+    static std::mutex mtx;
+    return mtx;
+  }
+
+  bool update_config_file(
+    const std::map<std::string, std::optional<std::string>> &updates,
+    const bool replace_all
+  ) {
+    std::lock_guard lock {config_file_mutex()};
+    if (sunshine.config_file.empty()) {
+      return false;
+    }
+
+    std::map<std::string, std::optional<std::string>> normalized;
+    for (const auto &[raw_key, raw_val] : updates) {
+      std::string key = normalize_config_key(raw_key);
+      if (key.empty() || key.find_first_of("=\r\n#") != std::string::npos) {
+        continue;
+      }
+      if (!raw_val.has_value()) {
+        normalized[key] = std::nullopt;
+      } else {
+        std::string clean = sanitize_config_value(*raw_val);
+        if (clean.empty()) {
+          normalized[key] = std::nullopt;
+        } else {
+          normalized[key] = std::move(clean);
+        }
+      }
+    }
+
+    if (replace_all) {
+      std::string out;
+      for (const auto &[k, v] : normalized) {
+        if (v.has_value()) {
+          out += k + " = " + *v + "\n";
+        }
+      }
+      return write_file_atomic(sunshine.config_file, out);
+    }
+
+    const std::string existing = file_handler::read_file(sunshine.config_file.c_str());
+    const std::string_view existing_view {existing};
+    std::string out;
+    out.reserve(existing.size() + 256);
+    std::set<std::string> handled;
+
+    auto pos = existing_view.cbegin();
+    const auto end = existing_view.cend();
+    while (pos < end) {
+      const auto line_non_ws = std::find_if_not(pos, end, space_tab);
+      if (line_non_ws == end || endline(*line_non_ws)) {
+        auto next_pos = line_non_ws;
+        if (next_pos != end) {
+          next_pos += (*next_pos == '\r' && (next_pos + 1) != end && *(next_pos + 1) == '\n') ? 2 : 1;
+        }
+        out.append(pos, next_pos);
+        pos = next_pos;
+        continue;
+      }
+
+      const auto seg_start = pos;
+      auto [endl, var] = parse_option(pos, end);
+      auto next_pos = endl;
+      if (next_pos != end) {
+        next_pos += (*next_pos == '\r' && (next_pos + 1) != end && *(next_pos + 1) == '\n') ? 2 : 1;
+      }
+
+      if (var.has_value()) {
+        const std::string key = normalize_config_key(var->first);
+        if (const auto it = normalized.find(key); it != normalized.end()) {
+          if (handled.insert(key).second && it->second.has_value()) {
+            out += key + " = " + *it->second + "\n";
+          }
+          pos = next_pos;
+          continue;
+        }
+      }
+
+      out.append(seg_start, next_pos);
+      pos = next_pos;
+    }
+
+    if (!out.empty() && out.back() != '\n') {
+      out.push_back('\n');
+    }
+    for (const auto &[k, v] : normalized) {
+      if (v.has_value() && !handled.count(k)) {
+        out += k + " = " + *v + "\n";
+      }
+    }
+    return write_file_atomic(sunshine.config_file, out);
   }
 
   std::unordered_map<std::string, std::string> parse_config(const ::std::string_view &file_content) {
@@ -1773,6 +1951,8 @@ namespace config {
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
     string_restricted_f(vars, "macos_scroll_inertia", input.macos_scroll_inertia, {"macos"sv, "ipados"sv, "disabled"sv});
     string_restricted_f(vars, "macos_pencil_mode", input.macos_pencil_mode, {"auto"sv, "scroll"sv, "draw"sv});
+    bool_f(vars, "macos_palm_rejection", input.macos_palm_rejection);
+    publish_macos_input_snapshots();
     bool_f(vars, "enable_input_only_mode", input.enable_input_only_mode);
 
     bool_f(vars, "system_tray", sunshine.system_tray);
@@ -2253,6 +2433,7 @@ namespace config {
         "native_pen_touch",
         "macos_scroll_inertia",
         "macos_pencil_mode",
+        "macos_palm_rejection",
         "keybindings",
         "ds5_inputtino_randomize_mac",
         "proton_dualsense_compatibility",
@@ -2346,6 +2527,74 @@ namespace config {
              webrtc_stream::has_capture_active() ||
              webrtc_stream::has_teardown_in_progress();
     }
+  }  // namespace
+
+  bool has_active_or_pending_stream_session() {
+    return has_active_stream_sessions();
+  }
+
+  bool is_restart_required_key(const std::string_view key) noexcept {
+    return key == "port" ||
+           key == "address_family" ||
+           key == "upnp" ||
+           key == "pkey" ||
+           key == "cert" ||
+           key == "enable_discovery" ||
+           key == "system_tray";
+  }
+
+  bool can_hot_apply_during_session(const std::set<std::string> &keys) noexcept {
+    if (keys.empty()) {
+      return false;
+    }
+    for (const auto &key : keys) {
+      if (is_restart_required_key(key) || key == "session_history_enabled") {
+        return false;
+      }
+      if (key.rfind("app_focus_", 0) == 0 ||
+          key.rfind("playnite_", 0) == 0 ||
+          key.rfind("steam_", 0) == 0 ||
+          key.rfind("realtime_stats_", 0) == 0) {
+        continue;
+      }
+      if (key == "rtx_hdr" ||
+          key == "rtx_hdr_sdr_brightness" ||
+          key == "rtx_hdr_contrast" ||
+          key == "rtx_hdr_saturation" ||
+          key == "rtx_hdr_middle_gray" ||
+          key == "rtx_hdr_peak_brightness") {
+        continue;
+      }
+      if (key == "macos_scroll_inertia" ||
+          key == "macos_pencil_mode" ||
+          key == "macos_palm_rejection" ||
+          key == "locale" ||
+          key == "lid_close_ends_streams" ||
+          key == "enable_pairing" ||
+          key == "sunshine_name" ||
+          key == "min_log_level" ||
+          key == "origin_web_ui_allowed" ||
+          key == "update_check_interval" ||
+          key == "notify_pre_releases" ||
+          key == "session_history_ttl_days" ||
+          key == "session_history_db_size_limit_mb" ||
+          key == "hardware_metrics" ||
+          key == "hardware_metrics_interval" ||
+          key == "remote_monitor_mute_audio" ||
+          key == "remote_monitor_disconnect_on_stream_end") {
+        continue;
+      }
+#ifdef __APPLE__
+      if (key == "dd_virtual_display_scale") {
+        continue;
+      }
+#endif
+      return false;
+    }
+    return true;
+  }
+
+  namespace {
 
 #ifdef _WIN32
     bool is_virtual_output_override(const std::optional<std::string> &output_name) {

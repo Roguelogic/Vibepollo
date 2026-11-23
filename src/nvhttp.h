@@ -418,7 +418,8 @@ namespace nvhttp {
     const bool always_use_virtual_display,
     const std::string &virtual_display_mode,
     const std::string &virtual_display_layout,
-    const bool prefer_10bit_sdr
+    const bool prefer_10bit_sdr,
+    std::optional<std::unordered_map<std::string, std::string>> config_overrides = std::nullopt
   );
 
   /**

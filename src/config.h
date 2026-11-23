@@ -9,7 +9,9 @@
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -298,6 +300,7 @@ namespace config {
     bool native_pen_touch;
     std::string macos_scroll_inertia;
     std::string macos_pencil_mode;
+    bool macos_palm_rejection;
 
     bool enable_input_only_mode;
     bool forward_rumble;
@@ -474,6 +477,33 @@ namespace config {
   extern frame_limiter_t frame_limiter;
   extern lossless_scaling_t lossless_scaling;
   extern sunshine_t sunshine;
+
+  enum class macos_scroll_inertia_e : std::uint8_t {
+    macos = 0,
+    ipados = 1,
+    disabled = 2,
+  };
+
+  enum class macos_pencil_mode_e : std::uint8_t {
+    follow_client = 0,
+    scroll = 1,
+    draw = 2,
+  };
+
+  // Lock-free snapshots published by apply_config() for real-time 120Hz input threads.
+  macos_scroll_inertia_e get_macos_scroll_inertia() noexcept;
+  macos_pencil_mode_e get_macos_pencil_mode() noexcept;
+  bool get_macos_palm_rejection() noexcept;
+
+  // Thread-safe atomic config-file persistence & shared hot-reload policy.
+  std::mutex &config_file_mutex();
+  bool update_config_file(
+    const std::map<std::string, std::optional<std::string>> &updates,
+    bool replace_all = false
+  );
+  bool has_active_or_pending_stream_session();
+  bool is_restart_required_key(std::string_view key) noexcept;
+  bool can_hot_apply_during_session(const std::set<std::string> &keys) noexcept;
 
   // Only the last completed apply_config publishes this lock-free snapshot.
   hardware_metrics_settings_t get_hardware_metrics_settings();

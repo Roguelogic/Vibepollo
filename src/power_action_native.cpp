@@ -7,6 +7,8 @@
   #include <windows.h>
   #include <powrprof.h>
 // clang-format on
+#elif defined(__APPLE__)
+  #include <IOKit/pwr_mgt/IOPMLib.h>
 #endif
 
 namespace nvhttp::power_action {
@@ -30,6 +32,8 @@ namespace nvhttp::power_action {
 #ifdef _WIN32
     SYSTEM_POWER_CAPABILITIES caps {};
     return GetPwrCapabilities(&caps) && (caps.SystemS1 || caps.SystemS2 || caps.SystemS3 || modern_standby_supported(caps));
+#elif defined(__APPLE__)
+    return IOPMSleepEnabled();
 #else
     // Linux's machine host needs a dedicated privileged broker operation.
     // Never substitute a shell command or an interactive elevation prompt.
@@ -89,6 +93,17 @@ namespace nvhttp::power_action {
     // Sleep, never hibernate; preserve all wake events. The OS may still deny
     // the transition. This call can return after resume.
     return SetSuspendState(FALSE, FALSE, FALSE) != FALSE;
+#elif defined(__APPLE__)
+    if (!native_sleep_supported()) {
+      return false;
+    }
+    const io_connect_t port = IOPMFindPowerManagement(MACH_PORT_NULL);
+    if (port == MACH_PORT_NULL) {
+      return false;
+    }
+    const IOReturn rc = IOPMSleepSystem(port);
+    IOServiceClose(port);
+    return rc == kIOReturnSuccess;
 #else
     return false;
 #endif

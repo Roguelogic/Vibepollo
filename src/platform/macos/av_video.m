@@ -22,10 +22,11 @@
   NSMutableArray *result = [NSMutableArray array];
 
   for (uint32_t i = 0; i < count; i++) {
+    NSString *displayName = [self getDisplayName:displays[i]] ?: [NSString stringWithFormat:@"Display %u", displays[i]];
     [result addObject:@{
       @"id": [NSNumber numberWithUnsignedInt:displays[i]],
-      @"name": [NSString stringWithFormat:@"%d", displays[i]],
-      @"displayName": [self getDisplayName:displays[i]],
+      @"name": [NSString stringWithFormat:@"%u", displays[i]],
+      @"displayName": displayName,
     }];
   }
 
@@ -43,11 +44,13 @@
 
 - (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate {
   self = [super init];
+  if (!self) {
+    return nil;
+  }
 
   // No mode means no such display, as on a Mac without a screen of its own.
   CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
   if (mode == NULL) {
-    [self release];
     return nil;
   }
 
@@ -55,11 +58,11 @@
   self.pixelFormat = kCVPixelFormatType_32BGRA;
   self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
   self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
-  self.minFrameDuration = CMTimeMake(1, frameRate);
+  self.minFrameDuration = CMTimeMake(1, MAX(frameRate, 1));
   self.session = [[AVCaptureSession alloc] init];
-  self.videoOutputs = [[NSMapTable alloc] init];
-  self.captureCallbacks = [[NSMapTable alloc] init];
-  self.captureSignals = [[NSMapTable alloc] init];
+  self.videoOutputs = [NSMapTable strongToStrongObjectsMapTable];
+  self.captureCallbacks = [NSMapTable strongToStrongObjectsMapTable];
+  self.captureSignals = [NSMapTable strongToStrongObjectsMapTable];
 
   CFRelease(mode);
 
@@ -69,13 +72,59 @@
   if ([self.session canAddInput:screenInput]) {
     [self.session addInput:screenInput];
   } else {
-    [screenInput release];
     return nil;
   }
 
   [self.session startRunning];
 
   return self;
+}
+
+- (void)stopCaptureForSignal:(dispatch_semaphore_t)signal {
+  if (signal == nil) {
+    return;
+  }
+  @synchronized(self) {
+    AVCaptureConnection *matchedConnection = nil;
+    for (AVCaptureConnection *conn in self.captureSignals.keyEnumerator) {
+      if ([self.captureSignals objectForKey:conn] == signal) {
+        matchedConnection = conn;
+        break;
+      }
+    }
+    if (matchedConnection == nil) {
+      return;
+    }
+    [self.session stopRunning];
+    [self.captureCallbacks removeObjectForKey:matchedConnection];
+    AVCaptureVideoDataOutput *output = [self.videoOutputs objectForKey:matchedConnection];
+    if (output != nil) {
+      [output setSampleBufferDelegate:nil queue:nil];
+      [self.session removeOutput:output];
+      [self.videoOutputs removeObjectForKey:matchedConnection];
+    }
+    [self.captureSignals removeObjectForKey:matchedConnection];
+    dispatch_semaphore_signal(signal);
+    if (self.videoOutputs.count > 0) {
+      [self.session startRunning];
+    }
+  }
+}
+
+- (void)stopAllCaptures {
+  @synchronized(self) {
+    [self.session stopRunning];
+    for (AVCaptureVideoDataOutput *output in self.videoOutputs.objectEnumerator) {
+      [output setSampleBufferDelegate:nil queue:nil];
+      [self.session removeOutput:output];
+    }
+    for (dispatch_semaphore_t signal in self.captureSignals.objectEnumerator) {
+      dispatch_semaphore_signal(signal);
+    }
+    [self.videoOutputs removeAllObjects];
+    [self.captureCallbacks removeAllObjects];
+    [self.captureSignals removeAllObjects];
+  }
 }
 
 - (void)dealloc {
@@ -85,10 +134,6 @@
   for (AVCaptureVideoDataOutput *output in self.videoOutputs.objectEnumerator) {
     [output setSampleBufferDelegate:nil queue:nil];
   }
-  [self.videoOutputs release];
-  [self.captureCallbacks release];
-  [self.captureSignals release];
-  [super dealloc];
 }
 
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight {
@@ -116,15 +161,18 @@
     if ([self.session canAddOutput:videoOutput]) {
       [self.session addOutput:videoOutput];
     } else {
-      [videoOutput release];
       return nil;
     }
 
     AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
+    if (videoConnection == nil) {
+      [self.session removeOutput:videoOutput];
+      return nil;
+    }
     dispatch_semaphore_t signal = dispatch_semaphore_create(0);
 
     [self.videoOutputs setObject:videoOutput forKey:videoConnection];
-    [self.captureCallbacks setObject:frameCallback forKey:videoConnection];
+    [self.captureCallbacks setObject:[frameCallback copy] forKey:videoConnection];
     [self.captureSignals setObject:signal forKey:videoConnection];
 
     [self.session startRunning];
@@ -136,17 +184,27 @@
 - (void)captureOutput:(AVCaptureOutput *)captureOutput
   didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
          fromConnection:(AVCaptureConnection *)connection {
-  FrameCallbackBlock callback = [self.captureCallbacks objectForKey:connection];
+  FrameCallbackBlock callback = nil;
+  @synchronized(self) {
+    callback = [self.captureCallbacks objectForKey:connection];
+  }
 
   if (callback != nil) {
     if (!callback(sampleBuffer)) {
       @synchronized(self) {
         [self.session stopRunning];
         [self.captureCallbacks removeObjectForKey:connection];
-        [self.session removeOutput:[self.videoOutputs objectForKey:connection]];
-        [self.videoOutputs removeObjectForKey:connection];
-        dispatch_semaphore_signal([self.captureSignals objectForKey:connection]);
-        [self.captureSignals removeObjectForKey:connection];
+        AVCaptureVideoDataOutput *output = [self.videoOutputs objectForKey:connection];
+        if (output != nil) {
+          [output setSampleBufferDelegate:nil queue:nil];
+          [self.session removeOutput:output];
+          [self.videoOutputs removeObjectForKey:connection];
+        }
+        dispatch_semaphore_t signal = [self.captureSignals objectForKey:connection];
+        if (signal != nil) {
+          dispatch_semaphore_signal(signal);
+          [self.captureSignals removeObjectForKey:connection];
+        }
         [self.session startRunning];
       }
     }

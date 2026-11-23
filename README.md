@@ -13,7 +13,7 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
    * **Screen & System Audio Recording**
    * **Accessibility**
 4. Open `https://localhost:47990` (or click **Open Vibepollo** from the menu bar icon) to create your admin login and pair your client.
-   * *Client note*: On iPadOS / iOS, **VoidLink** is recommended (standard Moonlight lacks native touch and stylus protocol support).
+   * *Client note*: On iPadOS / iOS, **VoidLink** is recommended (use **Trackpad / Mouse** mode for finger navigation, with automatic Apple Pencil mode sync and stylus protocol extensions).
 
 ---
 
@@ -37,8 +37,8 @@ Forked from [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) (based on [A
   * *Note*: If FileVault full-disk encryption is enabled, macOS waits at the pre-boot EFI unlock screen before starting `launchd` agents; unattended cold reboots require turning FileVault off or rebooting via `sudo fdesetup authrestart`.
 
 * **Native macOS Input**
-  * Low-latency mouse, keyboard (including Korean/English input source switching), and 120Hz continuous scrolling with selectable inertia curves in the menu bar.
-  * Supports native multi-touch and stylus tablet protocols (pressure, tilt, barrel roll, and side gestures) for VoidLink clients.
+  * Low-latency mouse, keyboard (including Korean/English input source switching), client trackpad pinch-to-zoom (`Magnify`), and 120Hz continuous scrolling with selectable inertia curves.
+  * **VoidLink Apple Pencil Integration**: Automatic client Pencil Mode sync (`Stylus` / `Touch` / `Mouse`), native macOS tablet events (pressure, tilt, barrel roll, hover reticle, double-tap eraser, squeeze right-click), and palm rejection.
 
 * **USB Wired Streaming (`usbmuxd`)**
   * Driverless plug-and-play USB-C / Thunderbolt streaming for VoidLink over macOS's built-in `usbmuxd` daemon, including a dedicated direct USB video channel that works even with iPad Wi-Fi turned off.

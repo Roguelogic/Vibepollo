@@ -25,6 +25,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 // lib includes
 #include <boost/algorithm/string/predicate.hpp>
@@ -168,7 +169,7 @@ namespace stream {
     }
 
     template<typename T>
-    void saturating_add_relaxed(std::atomic<T> &target, T delta) {
+    void saturating_add_relaxed(std::atomic<T> &target, std::type_identity_t<T> delta) {
       static_assert(std::is_integral_v<T>, "saturating_add_relaxed requires integral atomics");
 
       auto current = target.load(std::memory_order_relaxed);
@@ -636,6 +637,60 @@ namespace stream {
     udp::socket audio_sock {io_context};
 
     control_server_t control_server;
+
+    std::mutex active_sessions_mutex;
+    std::condition_variable active_sessions_cv;
+    std::unordered_set<session_t *> active_sessions;
+    std::unordered_map<session_t *, std::size_t> inflight_sends;
+  };
+
+  class broadcast_session_lease_t {
+  public:
+    broadcast_session_lease_t(broadcast_ctx_t &ctx, session_t *session) noexcept:
+        ctx_(&ctx) {
+      if (!session) {
+        return;
+      }
+      std::lock_guard lg {ctx.active_sessions_mutex};
+      if (ctx.active_sessions.find(session) == ctx.active_sessions.end()) {
+        return;
+      }
+      ++ctx.inflight_sends[session];
+      session_ = session;
+    }
+
+    ~broadcast_session_lease_t() {
+      if (!session_) {
+        return;
+      }
+      bool notify = false;
+      {
+        std::lock_guard lg {ctx_->active_sessions_mutex};
+        auto it = ctx_->inflight_sends.find(session_);
+        if (it != ctx_->inflight_sends.end() && --it->second == 0) {
+          ctx_->inflight_sends.erase(it);
+          notify = true;
+        }
+      }
+      if (notify) {
+        ctx_->active_sessions_cv.notify_all();
+      }
+    }
+
+    broadcast_session_lease_t(const broadcast_session_lease_t &) = delete;
+    broadcast_session_lease_t &operator=(const broadcast_session_lease_t &) = delete;
+
+    session_t *get() const noexcept {
+      return session_;
+    }
+
+    explicit operator bool() const noexcept {
+      return session_ != nullptr;
+    }
+
+  private:
+    broadcast_ctx_t *ctx_ {nullptr};
+    session_t *session_ {nullptr};
   };
 
   enum class stop_reason_e {
@@ -677,7 +732,18 @@ namespace stream {
 
     safe::shared_t<broadcast_ctx_t>::ptr_t broadcast_ref;
 
+    mutable std::mutex local_address_mutex;
     boost::asio::ip::address localAddress;
+
+    boost::asio::ip::address get_local_address() const {
+      std::lock_guard lg {local_address_mutex};
+      return localAddress;
+    }
+
+    void set_local_address(const boost::asio::ip::address &addr) {
+      std::lock_guard lg {local_address_mutex};
+      localAddress = addr;
+    }
 
     struct {
       std::string ping_payload;
@@ -783,7 +849,7 @@ namespace stream {
       std::atomic<std::uint16_t> last_encode_latency_us10 {0};  // in 1/10 ms units
       std::atomic<std::int64_t> last_frame_index {0};
       /// Index of the newest frame whose send began, or -1 before the first one.
-      /// Written only with host_adaptive_pacing, which fences client reports on it.
+      /// Fences client SS_FRAME_FEC_STATUS reports for loss accounting and adaptive pacing.
       std::atomic<std::int64_t> wire_frame_index {-1};
       /// Frames abandoned by a socket send failure; adaptive pacing treats a rise as loss.
       std::atomic<std::uint64_t> video_send_failures {0};
@@ -798,6 +864,26 @@ namespace stream {
       std::array<std::uint8_t, 16> guid_bytes {};
     } virtual_display;
 #endif
+
+    void unregister_from_broadcast() noexcept {
+      if (!broadcast_ref) {
+        return;
+      }
+      std::unique_lock lock {broadcast_ref->active_sessions_mutex};
+      broadcast_ref->active_sessions.erase(this);
+      broadcast_ref->active_sessions_cv.wait(lock, [this]() {
+        return broadcast_ref->inflight_sends.find(this) == broadcast_ref->inflight_sends.end();
+      });
+    }
+
+    ~session_t() {
+      unregister_from_broadcast();
+      // Drop broadcast_ref before any member of session_t is destroyed so end_broadcast()
+      // joins video/audio/control/recv threads while stats, shutdown_event, and buffers remain valid.
+      if (broadcast_ref) {
+        broadcast_ref.release();
+      }
+    }
   };
 
   /**
@@ -1134,7 +1220,7 @@ namespace stream {
         // proper routing on multi-homed hosts.
         auto local_address = platf::from_sockaddr((sockaddr *) &peer->localAddress.address);
         try {
-          session_p->localAddress = boost::asio::ip::make_address(local_address);
+          session_p->set_local_address(boost::asio::ip::make_address(local_address));
         } catch (const boost::system::system_error &e) {
           BOOST_LOG(error) << "boost::system::system_error in address parsing: " << e.what() << " (code: " << e.code() << ")"sv;
           throw;
@@ -1748,23 +1834,26 @@ namespace stream {
     // Client to host SS_FRAME_FEC_STATUS: one report per FEC block that needed
     // recovery or was dropped. (Host to client, the same number is Set RGB LED.)
     server->map(pacing::fec_status_packet_type, [mark_fec_hazard](session_t *session, const std::string_view &payload) {
-      if (const auto parsed = pacing::parse_fec_status(payload);
-          parsed && parsed->received_data < parsed->data) {
+      const auto last_sent = last_sent_frame(session);
+      const auto report = session->video.fec_reports.record(payload, last_sent);
+      if (report && report->block.kind != pacing::fec_block_t::kind_e::clean) {
         // Even a single lost data packet recovered seamlessly by parity elevates Adaptive FEC
         // immediately to full configured protection before any visible frame loss can occur.
         mark_fec_hazard(session);
       }
+      if (report && report->first_unrecoverable_for_frame) {
+        // Sunshine clients send SS_FRAME_FEC_STATUS instead of IDX_LOSS_STATS; record distinct
+        // unrecoverable frames regardless of whether host_adaptive_pacing is enabled.
+        saturating_add_relaxed(session->stats.client_reported_losses, 1);
+      }
       if (!session->video.adaptive_pacing_enabled) {
-        // Off: behave as before this type had a handler.
         BOOST_LOG(debug)
-          << "type [Unknown] { "sv << util::hex(pacing::fec_status_packet_type).to_string_view() << " }"sv << std::endl
+          << "type [SS_FRAME_FEC_STATUS] { "sv << util::hex(pacing::fec_status_packet_type).to_string_view() << " }"sv << std::endl
           << "---data---"sv << std::endl
           << util::hex_vec(payload) << std::endl
           << "---end data---"sv;
         return;
       }
-      const auto last_sent = last_sent_frame(session);
-      const auto report = session->video.fec_reports.record(payload, last_sent);
       if (!report) {
         return;
       }
@@ -2394,7 +2483,8 @@ namespace stream {
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(broadcast_ctx_t &ctx) {
+    auto &sock = ctx.video_sock;
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto video_epoch = std::chrono::steady_clock::now();
@@ -2480,10 +2570,17 @@ namespace stream {
 
       frame_network_latency_logger.first_point_now();
 
-      auto session = (session_t *) packet->channel_data;
-      if (!session) {
+      auto raw_session = (session_t *) packet->channel_data;
+      if (!raw_session) {
         continue;
       }
+      broadcast_session_lease_t session_lease {ctx, raw_session};
+      if (!session_lease) {
+        wire_timeline_by_session.erase(raw_session);
+        continue;
+      }
+      auto *session = session_lease.get();
+      auto session_local_address = session->get_local_address();
       const auto packet_pop_timestamp = std::chrono::steady_clock::now();
       auto wire_state_it = wire_timeline_by_session.find(session);
       if (wire_state_it == wire_timeline_by_session.end()) {
@@ -2555,6 +2652,13 @@ namespace stream {
         session->stats.last_encode_latency_us10.store(0, std::memory_order_relaxed);
       }
 
+      // Insert space for packet headers
+      auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
+      auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
+
+      // The frame header precedes the frame in the first packet
+      const std::size_t total_shards = (sizeof(frame_header) + payload.size() + payload_blocksize - 1) / payload_blocksize;
+
       // PyroWave frames are all intra-coded, so a lost frame costs one frame and never a
       // recovery keyframe, and the client decodes a frame that lost only finer detail.
       // Critical shards receive baseline parity. Stable pictures at low cadence
@@ -2566,33 +2670,21 @@ namespace stream {
         wire_timeline_state.last_seen_send_failures = send_failures_now;
         session->stats.last_fec_hazard_ns.store(packet_pop_timestamp.time_since_epoch().count(), std::memory_order_relaxed);
       }
-      if (!pyrowave_session && fecPercentage > 5 && !packet->is_idr()) {
-        // Parsec-style lossless Adaptive FEC: keep full configured parity on IDR frames, during
-        // session warmup (first 2s), and for 8s after ANY single recovered/lost packet reported by
-        // SS_FRAME_FEC_STATUS or IDX_LOSS_STATS; otherwise step down to 10% (8..15s) -> 5% (>=15s
-        // zero-loss steady state) while preserving >=2 parity shards per block for 0% frame loss.
+      if (!pyrowave_session) {
         const auto now_ns = packet_pop_timestamp.time_since_epoch().count();
         const auto start_ns = session->stats.start_time.time_since_epoch().count();
         const auto hazard_ns = session->stats.last_fec_hazard_ns.load(std::memory_order_relaxed);
-        if ((now_ns - start_ns) >= 2'000'000'000LL) {
-          const auto clean_ns = hazard_ns > 0 ? (now_ns - hazard_ns) : (now_ns - start_ns);
-          if (clean_ns >= 15'000'000'000LL) {
-            fecPercentage = std::min(fecPercentage, 5);
-          } else if (clean_ns >= 8'000'000'000LL) {
-            fecPercentage = std::min(fecPercentage, 10);
-          }
-        }
+        const auto clean_hazard_ns = hazard_ns > 0 ? std::optional<std::int64_t> {now_ns - hazard_ns} : std::nullopt;
+        fecPercentage = pacing::adaptive_fec_percentage(
+          fecPercentage,
+          packet->is_idr(),
+          total_shards,
+          now_ns - start_ns,
+          clean_hazard_ns
+        );
       }
-      if (session->video.adaptive_pacing_enabled) {
-        session->stats.wire_frame_index.store(packet->frame_index(), std::memory_order_relaxed);
-      }
+      session->stats.wire_frame_index.store(packet->frame_index(), std::memory_order_relaxed);
 
-      // Insert space for packet headers
-      auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
-      auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-
-      // The frame header precedes the frame in the first packet
-      const std::size_t total_shards = (sizeof(frame_header) + payload.size() + payload_blocksize - 1) / payload_blocksize;
       const std::size_t critical_shards = pyrowave_session && packet->pyrowave_critical_bytes ?
                                             std::min(total_shards, (sizeof(frame_header) + packet->pyrowave_critical_bytes + payload_blocksize - 1) / payload_blocksize) :
                                             0;
@@ -2708,11 +2800,10 @@ namespace stream {
         fec_blocks_begin = std::begin(fec_blocks),
         fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
 
-      // Both ordinary demand modes use this frame's actual FEC packet count.
-      // The existing batch-only option preserves its deadline behavior; group
-      // pacing is a separate opt-in so saved configurations remain compatible.
+      // Ordinary video modes compute this frame's actual FEC-expanded packet count
+      // for both explicit demand pacing and the default oversized/IDR burst guard.
       std::size_t pacing_frame_packets = total_shards;
-      if (!pyrowave_session && (config::stream.pacing_batch_demand_limit || config::stream.pacing_group_demand_limit)) {
+      if (!pyrowave_session) {
         pacing_frame_packets = 0;
         for (std::size_t x = 0; x < fec_blocks_needed; ++x) {
           const auto data_shards = (fec_blocks[x].size() + blocksize - 1) / blocksize;
@@ -2760,7 +2851,7 @@ namespace stream {
             wire_timeline_state.cached_link_alias = "unavailable";
 #ifdef _WIN32
             platf::routed_link_info_t link_info;
-            wire_timeline_state.cached_link_bps = platf::routed_link_bps(session->localAddress, session->video.peer.address(), &link_info);
+            wire_timeline_state.cached_link_bps = platf::routed_link_bps(session_local_address, session->video.peer.address(), &link_info);
             wire_timeline_state.cached_interface_id = link_info.luid;
             if (!link_info.alias.empty()) {
               wire_timeline_state.cached_link_alias = link_info.alias + " (ifType " + std::to_string(link_info.if_type) +
@@ -2768,7 +2859,7 @@ namespace stream {
             }
 #elif defined(__linux__)
             platf::routed_link_info_t link_info;
-            wire_timeline_state.cached_link_bps = platf::routed_link_bps(session->localAddress, session->video.peer.address(), &link_info);
+            wire_timeline_state.cached_link_bps = platf::routed_link_bps(session_local_address, session->video.peer.address(), &link_info);
             wire_timeline_state.cached_interface_id = link_info.if_index;
             if (!link_info.alias.empty()) {
               wire_timeline_state.cached_link_alias = link_info.alias + " (transmit " + std::to_string(link_info.transmit_bps / 1'000'000) + " Mbps)";
@@ -2807,7 +2898,7 @@ namespace stream {
                packet_pop_timestamp - wire_timeline_state.last_pacing_log >= 30s)) {
             wire_timeline_state.logged_pacing = pacing_source;
             wire_timeline_state.last_pacing_log = packet_pop_timestamp;
-            BOOST_LOG(info) << "PyroWave pacing: "sv << session->localAddress << " -> "sv << session->video.peer.address()
+            BOOST_LOG(info) << "PyroWave pacing: "sv << session_local_address << " -> "sv << session->video.peer.address()
                             << " via "sv << wire_timeline_state.cached_link_alias << ", " << link_interface_kind << ' ' << link_interface_id
                             << ", routed_link_bps "sv << link_bps << (link_bps ? "" : " (fallback: frame/bitrate demand)")
                             << ", "sv << reported_packets_per_ms << " packets/ms at "sv << wire_bytes << " wire bytes ("sv
@@ -2889,6 +2980,31 @@ namespace stream {
           ratecontrol_packets_in_1ms = adaptive_pace ?
             std::min(ratecontrol_packets_in_1ms, ordinary_batch_quantum_packets) : ordinary_batch_quantum_packets;
         }
+
+        // GFN-style sub-frame burst guard under default settings: keep 0 ms delay on
+        // ordinary frames, USB tunnels, and loopback, while spacing oversized frames and
+        // heavy IDR keyframes into smaller 1 ms sub-batches so Wi-Fi AP queues do not
+        // tail-drop recovery keyframes into cascading IDR storms.
+        bool default_burst_guard_active = false;
+        if (!pyrowave_session &&
+            !session->video.direct_usb &&
+            !session->video.peer.address().is_loopback() &&
+            !session->video.adaptive_pacing_enabled &&
+            !config::stream.pacing_batch_demand_limit &&
+            !config::stream.pacing_group_demand_limit &&
+            pacing_ceiling == 0) {
+          const auto stream_kbps = session->video.pacing_bitrate_kbps.load(std::memory_order_relaxed);
+          const auto ip_header_bytes = session->video.peer.address().is_v6() ? 40u : 20u;
+          const auto wire_bytes = blocksize + 38 + ip_header_bytes + 8 +
+                                  (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          if (const auto guard_packets = pacing::burst_guard_packets_per_ms(
+                packet->is_idr(), pacing_frame_packets, stream_kbps, payload_blocksize, wire_bytes);
+              guard_packets && *guard_packets < ratecontrol_packets_in_1ms) {
+            ratecontrol_packets_in_1ms = *guard_packets;
+            default_burst_guard_active = true;
+          }
+        }
+
         const auto ratecontrol_pace = adaptive_pace.value_or(
           ordinary_group_pace.value_or(pacing::packet_pace_t::fixed(ratecontrol_packets_in_1ms)));
 
@@ -2905,7 +3021,7 @@ namespace stream {
         if (!pyrowave_session && (config::stream.pacing_batch_demand_limit || config::stream.pacing_group_demand_limit)) {
           max_batch_size_bytes = pacing::max_batch_bytes(max_batch_size_bytes, ordinary_batch_quantum_packets, datagram_size);
         }
-        if (session->video.adaptive_pacing_enabled) {
+        if (session->video.adaptive_pacing_enabled || default_burst_guard_active) {
           max_batch_size_bytes = pacing::max_batch_bytes(max_batch_size_bytes, ratecontrol_packets_in_1ms, datagram_size);
         }
         if (pacing_ceiling > 0) {
@@ -3015,7 +3131,7 @@ namespace stream {
             (uintptr_t) sock.native_handle(),
             peer_address,
             session->video.peer.port(),
-            session->localAddress,
+            session_local_address,
           };
           batch_info.send_cancelled = send_cancelled;
 
@@ -3139,7 +3255,7 @@ namespace stream {
                       (uintptr_t) sock.native_handle(),
                       peer_address,
                       session->video.peer.port(),
-                      session->localAddress,
+                      session_local_address,
                     };
                     send_info.send_cancelled = send_cancelled;
                     return platf::send(send_info);
@@ -3334,7 +3450,8 @@ namespace stream {
     shutdown_event->raise(true);
   }
 
-  void audioBroadcastThread(udp::socket &sock) {
+  void audioBroadcastThread(broadcast_ctx_t &ctx) {
+    auto &sock = ctx.audio_sock;
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
@@ -3364,10 +3481,16 @@ namespace stream {
       }
 
       TUPLE_2D_REF(channel_data, packet_data, *packet);
-      auto session = (session_t *) channel_data;
-      if (!session) {
+      auto raw_session = (session_t *) channel_data;
+      if (!raw_session) {
         continue;
       }
+      broadcast_session_lease_t session_lease {ctx, raw_session};
+      if (!session_lease) {
+        continue;
+      }
+      auto *session = session_lease.get();
+      auto session_local_address = session->get_local_address();
 
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
@@ -3400,7 +3523,7 @@ namespace stream {
           (uintptr_t) sock.native_handle(),
           peer_address,
           session->audio.peer.port(),
-          session->localAddress,
+          session_local_address,
         };
         platf::send(send_info);
 
@@ -3427,7 +3550,7 @@ namespace stream {
               (uintptr_t) sock.native_handle(),
               peer_address,
               session->audio.peer.port(),
-              session->localAddress,
+              session_local_address,
             };
             platf::send(send_info);
             BOOST_LOG(verbose) << "Audio FEC ["sv << (sequenceNumber & ~(RTPA_DATA_SHARDS - 1)) << ' ' << x << "] ::  send..."sv;
@@ -3499,10 +3622,9 @@ namespace stream {
       return -1;
     }
 
-#ifdef _WIN32
-    // Windows IOCP receives don't make the socket nonblocking. Raw WSASendMsg()
-    // must return on buffer pressure so the broadcast thread can apply its
-    // retry deadline instead of waiting indefinitely inside the send call.
+#if defined(_WIN32) || defined(__APPLE__)
+    // Raw WSASendMsg()/sendmsg_x() must return on buffer pressure so the broadcast
+    // thread can apply its bounded retry deadline instead of blocking indefinitely.
     ctx.video_sock.native_non_blocking(true, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't make Video server nonblocking: "sv << ec.message();
@@ -3524,8 +3646,8 @@ namespace stream {
       return -1;
     }
 
-#ifdef _WIN32
-    // Audio uses the same raw Winsock sender and bounded pressure retry.
+#if defined(_WIN32) || defined(__APPLE__)
+    // Audio uses the same raw socket sender and bounded pressure retry.
     ctx.audio_sock.native_non_blocking(true, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't make Audio server nonblocking: "sv << ec.message();
@@ -3539,8 +3661,8 @@ namespace stream {
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
-    ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
+    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx)};
+    ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
     ctx.recv_thread = std::thread {recvThread, std::ref(ctx)};
@@ -4175,6 +4297,7 @@ namespace stream {
           BOOST_LOG(debug) << "Waiting for " << name << " to end...";
         }
       );
+      session.unregister_from_broadcast();
       // Watchdog coverage ends with the thread joins, which are the unbounded and
       // unrecoverable part. Everything below waits on the process-wide lifecycle
       // gate, which other threads legitimately hold for much longer than
@@ -4398,6 +4521,10 @@ namespace stream {
           return START_PACING_REJECTED;
         }
         session.broadcast_ref->control_server._sessions->push_back(&session);
+      }
+      {
+        std::lock_guard lg {session.broadcast_ref->active_sessions_mutex};
+        session.broadcast_ref->active_sessions.insert(&session);
       }
 
       auto addr = boost::asio::ip::make_address(addr_string);

@@ -143,41 +143,6 @@ namespace {
     return CGPreflightPostEventAccess();
   }
 
-  bool is_hot_apply_safe_during_stream(const std::set<std::string> &keys) {
-    if (keys.empty()) {
-      return false;
-    }
-    static const std::set<std::string> safe_keys = {
-      "macos_scroll_inertia",
-      "macos_pencil_mode",
-      "dd_virtual_display_scale",
-      "locale",
-      "lid_close_ends_streams",
-      "enable_pairing",
-      "sunshine_name",
-      "min_log_level",
-      "origin_web_ui_allowed",
-      "update_check_interval",
-      "notify_pre_releases",
-      "session_history_enabled",
-      "session_history_ttl_days",
-      "session_history_db_size_limit_mb",
-      "hardware_metrics",
-      "hardware_metrics_interval",
-      "realtime_stats_enabled",
-      "realtime_stats_poll_interval_ms",
-    };
-    for (const auto &k : keys) {
-      if (k.rfind("app_focus_", 0) == 0 || k.rfind("steam_", 0) == 0) {
-        continue;
-      }
-      if (!safe_keys.count(k)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
   bool is_system_app_entry(const nlohmann::json &entry) {
     if (!entry.is_object()) {
       return false;
@@ -253,11 +218,14 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
   boost::system::error_code ec;
   const std::string fallback_host = boost::asio::ip::host_name(ec);
-  out["hostName"] = !config::nvhttp.sunshine_name.empty()
-                      ? config::nvhttp.sunshine_name
-                      : (ec ? std::string("Mac") : fallback_host);
-  out["locale"] = config::sunshine.locale;
-  out["virtualDisplayMode"] = virtual_display_mode_string(config::video.virtual_display_mode);
+  {
+    auto read_gate = config::acquire_apply_read_gate();
+    out["hostName"] = !config::nvhttp.sunshine_name.empty()
+                        ? config::nvhttp.sunshine_name
+                        : (ec ? std::string("Mac") : fallback_host);
+    out["locale"] = config::sunshine.locale;
+    out["virtualDisplayMode"] = virtual_display_mode_string(config::video.virtual_display_mode);
+  }
 
   const auto all_clients = nvhttp::get_all_clients();
   out["pairedCount"] = all_clients.is_array() ? static_cast<int>(all_clients.size()) : 0;
@@ -370,6 +338,16 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
       static_cast<uint32_t>(crypto::PERM::_all)
     );
 
+    std::unordered_map<std::string, std::string> overrides;
+    const bool has_overrides = input.contains("config_overrides") && input["config_overrides"].is_object();
+    if (has_overrides) {
+      for (const auto &it : input["config_overrides"].items()) {
+        if (!it.key().empty() && !it.value().is_null()) {
+          overrides[it.key()] = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+        }
+      }
+    }
+
     bool ok = nvhttp::update_device_info(
       uuid,
       name,
@@ -383,31 +361,9 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
       always_use_virtual_display,
       virtual_display_mode,
       virtual_display_layout,
-      prefer_10bit_sdr
+      prefer_10bit_sdr,
+      has_overrides ? std::make_optional(std::move(overrides)) : std::nullopt
     );
-
-    if (input.contains("config_overrides") && input["config_overrides"].is_object()) {
-      std::unordered_map<std::string, std::string> overrides;
-      for (const auto &it : input["config_overrides"].items()) {
-        if (!it.key().empty() && !it.value().is_null()) {
-          overrides[it.key()] = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
-        }
-      }
-      ok = nvhttp::update_device_info(
-             uuid,
-             name,
-             display_mode,
-             output_name_override,
-             always_use_virtual_display,
-             virtual_display_mode,
-             virtual_display_layout,
-             std::move(overrides),
-             prefer_10bit_sdr,
-             std::nullopt,
-             std::nullopt
-           ) &&
-           ok;
-    }
 
     if (input.contains("allow_sleep") && input["allow_sleep"].is_boolean()) {
       ok = nvhttp::set_client_sleep_allowed(uuid, input["allow_sleep"].get<bool>()) && ok;
@@ -568,14 +524,24 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
     if (input.contains("prepCmds") && input["prepCmds"].is_array()) {
       nlohmann::json prep_arr = nlohmann::json::array();
+      const auto existing_preps = (entry.contains("prep-cmd") && entry["prep-cmd"].is_array())
+                                    ? entry["prep-cmd"]
+                                    : nlohmann::json::array();
+      std::size_t idx = 0;
       for (const auto &p : input["prepCmds"]) {
         if (p.is_object()) {
           const std::string do_c = p.value("do", "");
           const std::string undo_c = p.value("undo", "");
           if (!do_c.empty() || !undo_c.empty()) {
-            prep_arr.push_back({{"do", do_c}, {"undo", undo_c}});
+            nlohmann::json item = (idx < existing_preps.size() && existing_preps[idx].is_object())
+                                    ? existing_preps[idx]
+                                    : nlohmann::json::object();
+            item["do"] = do_c;
+            item["undo"] = undo_c;
+            prep_arr.push_back(std::move(item));
           }
         }
+        ++idx;
       }
       entry["prep-cmd"] = std::move(prep_arr);
     }
@@ -634,14 +600,21 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
 - (NSString *)fetchSettingsJSON {
   nlohmann::json out;
-  auto file_vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+  std::unordered_map<std::string, std::string> file_vars;
+  {
+    std::lock_guard file_lock {config::config_file_mutex()};
+    file_vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+  }
+  const bool opens_login = platf::opens_at_login();
+  const bool allow_login_screen = platf::loginscreen_agent_enabled();
+  auto read_gate = config::acquire_apply_read_gate();
 
   // General, Identity, Lifecycle & Files
   out["locale"] = config::sunshine.locale;
   out["sunshineName"] = config::nvhttp.sunshine_name;
   out["minLogLevel"] = config::sunshine.min_log_level;
-  out["opensAtLogin"] = platf::opens_at_login();
-  out["allowOnLoginScreen"] = platf::loginscreen_agent_enabled();
+  out["opensAtLogin"] = opens_login;
+  out["allowOnLoginScreen"] = allow_login_screen;
   out["lidCloseEndsStreams"] = config::sunshine.lid_close_ends_streams;
   out["updateCheckInterval"] = config::sunshine.update_check_interval_seconds;
   out["notifyPreReleases"] = config::sunshine.notify_pre_releases;
@@ -747,6 +720,7 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
   out["scrollInertia"] = config::input.macos_scroll_inertia.empty() ? "macos" : config::input.macos_scroll_inertia;
   out["pencilMode"] = config::input.macos_pencil_mode.empty() ? "auto" : config::input.macos_pencil_mode;
+  out["palmRejection"] = config::input.macos_palm_rejection;
   out["highResScrolling"] = config::input.high_resolution_scrolling;
   out["nativePenTouch"] = config::input.native_pen_touch;
 
@@ -806,62 +780,56 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
       return @{@"status": @NO};
     }
 
-    auto current = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
     std::set<std::string> changed_keys;
+    std::set<std::string> non_restart_keys;
+    std::map<std::string, std::optional<std::string>> updates;
 
     for (auto it = patch.begin(); it != patch.end(); ++it) {
       const std::string key = it.key();
       const auto &val = it.value();
       changed_keys.insert(key);
+      if (!config::is_restart_required_key(key)) {
+        non_restart_keys.insert(key);
+      }
 
       if (val.is_null() ||
           (val.is_string() && val.get<std::string>().empty()) ||
           (val.is_array() && val.empty())) {
-        current.erase(key);
+        updates[key] = std::nullopt;
         continue;
       }
       if (val.is_string()) {
-        current[key] = val.get<std::string>();
+        updates[key] = val.get<std::string>();
       } else if (val.is_boolean()) {
-        current[key] = val.get<bool>() ? "true" : "false";
+        updates[key] = val.get<bool>() ? "true" : "false";
       } else {
-        current[key] = val.dump();
+        updates[key] = val.dump();
       }
     }
 
-    std::stringstream ss;
-    for (const auto &[k, v] : current) {
-      ss << k << " = " << v << "\n";
+    if (!config::update_config_file(updates, false)) {
+      return @{@"status": @NO};
     }
-    file_handler::write_file(config::sunshine.config_file.c_str(), ss.str());
 
-    static const std::set<std::string> restart_keys = {
-      "port",
-      "address_family",
-      "upnp",
-      "pkey",
-      "cert",
-      "enable_discovery",
-    };
     bool restart_required = false;
     for (const auto &k : changed_keys) {
-      if (restart_keys.count(k)) {
+      if (config::is_restart_required_key(k)) {
         restart_required = true;
         break;
       }
     }
 
-    const bool has_sessions = rtsp_stream::session_count_no_cleanup() > 0;
+    const bool has_sessions = config::has_active_or_pending_stream_session();
     bool applied_now = false;
     bool deferred = false;
 
-    if (!restart_required) {
-      if (is_hot_apply_safe_during_stream(changed_keys) || !has_sessions) {
+    if (!non_restart_keys.empty()) {
+      if (config::can_hot_apply_during_session(non_restart_keys) || !has_sessions) {
         config::apply_config_now();
-        if (changed_keys.count("dd_virtual_display_scale")) {
+        if (non_restart_keys.count("dd_virtual_display_scale")) {
           platf::macos_virtual_display::reapply_scale();
         }
-        applied_now = true;
+        applied_now = !restart_required;
       } else {
         config::mark_deferred_reload();
         deferred = true;

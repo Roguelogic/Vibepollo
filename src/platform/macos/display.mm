@@ -254,7 +254,27 @@ namespace {
   [super setPixelFormat:normalize_cg_stream_pixel_format(pixelFormat)];
 }
 
-- (void)dealloc {
+- (void)stopCaptureForSignal:(dispatch_semaphore_t)signal {
+  if (signal == nil) {
+    return;
+  }
+  std::shared_ptr<cg_stream_slot_t> matched;
+  {
+    std::lock_guard lock {_slots_mutex};
+    for (auto it = _slots.begin(); it != _slots.end(); ++it) {
+      if (*it && (*it)->signal == signal) {
+        matched = *it;
+        _slots.erase(it);
+        break;
+      }
+    }
+  }
+  if (matched) {
+    matched->stop(false);
+  }
+}
+
+- (void)stopAllCaptures {
   std::vector<std::shared_ptr<cg_stream_slot_t>> slots;
   {
     std::lock_guard lock {_slots_mutex};
@@ -265,6 +285,10 @@ namespace {
       slot->stop(false);
     }
   }
+}
+
+- (void)dealloc {
+  [self stopAllCaptures];
   [super dealloc];
 }
 
@@ -429,8 +453,9 @@ namespace platf {
       std::chrono::steady_clock::time_point last_frame = std::chrono::steady_clock::now();
     };
 
-    // SDR white in ScreenCaptureKit's HDR frames, measured from an HDR virtual display on macOS 27.
-    constexpr double sdr_white_nits = 140.0;
+    // Canonical HDR SDR reference white (ITU-R BT.2408 / Apple ColorSync PQ white = 203 nits),
+    // matching SCCaptureDynamicRangeHDRCanonicalDisplay (2).
+    constexpr double sdr_white_nits = 203.0;
     // macOS 27 gives an HDR virtual display this much EDR headroom.
     constexpr double virtual_display_headroom = 5.0;
     // The brightest Apple displays peak at 1600 nits.
@@ -564,9 +589,16 @@ namespace platf {
       // Keep the display awake while capturing, as the Windows capture does: a sleeping display
       // sends no frames.
       IOPMAssertionID keep_awake = kIOPMNullAssertionID;
-      IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn, CFSTR("Vibepollo is streaming the display"), &keep_awake);
-      auto release_keep_awake = util::fail_guard([keep_awake]() {
-        IOPMAssertionRelease(keep_awake);
+      const IOReturn awake_status = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleDisplaySleep,
+        kIOPMAssertionLevelOn,
+        CFSTR("Vibepollo is streaming the display"),
+        &keep_awake
+      );
+      auto release_keep_awake = util::fail_guard([awake_status, keep_awake]() {
+        if (awake_status == kIOReturnSuccess && keep_awake != kIOPMNullAssertionID) {
+          IOPMAssertionRelease(keep_awake);
+        }
       });
 
       const std::uint64_t initial_scale_epoch = macos_virtual_display::scale_reinit_epoch();
@@ -620,6 +652,9 @@ namespace platf {
       if (signal == nil) {
         return capture_e::error;
       }
+      auto stop_capture_guard = util::fail_guard([this, signal]() {
+        [av_capture stopCaptureForSignal:signal];
+      });
 
       // Frames stop while the display sleeps. After a second without one, re-send the last image
       // every second, as the Linux captures do on a timeout: the stream stays up, and a stop
@@ -704,7 +739,9 @@ namespace platf {
       @autoreleasepool {
         if ([av_capture isKindOfClass:[SCVideo class]]) {
           if (NSString *reason = static_cast<SCVideo *>(av_capture).stopReason) {
-            return reason.UTF8String;
+            if (const char *utf8 = reason.UTF8String) {
+              return utf8;
+            }
           }
         }
       }
@@ -801,13 +838,42 @@ namespace platf {
       if (signal == nil) {
         return 1;
       }
+      auto stop_capture_guard = util::fail_guard([this, signal]() {
+        [av_capture stopCaptureForSignal:signal];
+      });
 
       // A display that's asleep sends nothing: fail, so the client gets an error instead of a
       // connection that hangs forever. The capture can also end by itself without an image.
-      dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+      const int64_t wait_ns = platf::is_loginwindow_session() ? (600LL * NSEC_PER_MSEC) : (3LL * NSEC_PER_SEC);
+      dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, wait_ns));
       std::lock_guard lock {state->mutex};
       state->stopped = true;
       if (!state->delivered) {
+        if (platf::is_loginwindow_session()) {
+          // Immediately after WindowServer boots into LoginWindow, an idle headless display may not
+          // have emitted its first SCStream surface yet; synthesize one IOSurface-backed frame so
+          // startup encoder probing completes in < 1s instead of delaying port binding by ~20s.
+          video::config_t synth_cfg {};
+          synth_cfg.width = std::max(1, av_capture.frameWidth);
+          synth_cfg.height = std::max(1, av_capture.frameHeight);
+          synth_cfg.framerate = 60;
+          auto fallback = platf::black_display(synth_cfg);
+          if (fallback) {
+            if (lock_cpu) {
+              (void) fallback->make_avcodec_encode_device(pix_fmt_e::yuv420p);
+            } else {
+              const pix_fmt_e fmt = (av_capture.pixelFormat == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange) ?
+                                      pix_fmt_e::yuv444p16 :
+                                      (av_capture.pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ?
+                                         pix_fmt_e::p010 :
+                                         pix_fmt_e::nv12);
+              (void) fallback->make_vt_encode_device(fmt);
+            }
+            if (fallback->dummy_img(img) == 0) {
+              return 0;
+            }
+          }
+        }
         BOOST_LOG(error) << "Display "sv << display_id << " sent no image within 3 seconds"sv;
         return 1;
       }
@@ -870,10 +936,14 @@ namespace platf {
       av_img->sample_buffer = std::make_shared<av_sample_buf_t>(black);
       av_img->pixel_buffer = std::make_shared<av_pixel_buf_t>(av_img->sample_buffer->buf);
       img->data = av_img->pixel_buffer->data();
-      img->width = (int) CVPixelBufferGetWidth(av_img->pixel_buffer->buf);
-      img->height = (int) CVPixelBufferGetHeight(av_img->pixel_buffer->buf);
-      img->row_pitch = (int) CVPixelBufferGetBytesPerRow(av_img->pixel_buffer->buf);
-      img->pixel_pitch = img->row_pitch / img->width;
+      auto *pb = av_img->pixel_buffer->buf;
+      img->width = (int) CVPixelBufferGetWidth(pb);
+      img->height = (int) CVPixelBufferGetHeight(pb);
+      const size_t bpr = CVPixelBufferIsPlanar(pb) ?
+                           CVPixelBufferGetBytesPerRowOfPlane(pb, 0) :
+                           CVPixelBufferGetBytesPerRow(pb);
+      img->row_pitch = (int) bpr;
+      img->pixel_pitch = img->width > 0 ? img->row_pitch / img->width : 0;
       return 0;
     }
 
@@ -987,6 +1057,7 @@ namespace platf {
     const video::config_t &config,
     const std::optional<adapter_id_t> &required_adapter
   ) {
+    @autoreleasepool {
     (void) required_adapter;
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
@@ -1013,10 +1084,12 @@ namespace platf {
       NSNumber *display_id = item[@"id"];
       // We need show display's product name and corresponding display number given by user
       NSString *name = item[@"displayName"];
+      const char *name_utf8 = (name && name.UTF8String) ? name.UTF8String : "Unknown";
+      const unsigned int item_id = display_id ? [display_id unsignedIntValue] : 0;
       // We are using CGGetActiveDisplayList that only returns active displays so hardcoded connected value in log to true
-      BOOST_LOG(info) << "Detected display: "sv << name.UTF8String << " (id: "sv << [NSString stringWithFormat:@"%@", display_id].UTF8String << ") connected: true"sv;
-      if (!display_name.empty() && std::atoi(display_name.c_str()) == [display_id unsignedIntValue]) {
-        display->display_id = [display_id unsignedIntValue];
+      BOOST_LOG(info) << "Detected display: "sv << name_utf8 << " (id: "sv << item_id << ") connected: true"sv;
+      if (!display_name.empty() && display_id && static_cast<unsigned int>(std::atoi(display_name.c_str())) == item_id) {
+        display->display_id = item_id;
       }
     }
     // A Remote Monitor stream captures its own display. For any other stream, the stream's virtual
@@ -1117,20 +1190,28 @@ namespace platf {
     display->input_output_name = std::to_string(display->display_id);
 
     return display;
+    }
   }
 
   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
-    __block std::vector<std::string> display_names;
+    (void) hwdevice_type;
+    @autoreleasepool {
+      __block std::vector<std::string> display_names;
 
-    auto display_array = [AVVideo displayNames];
+      auto display_array = [AVVideo displayNames];
 
-    display_names.reserve([display_array count]);
-    [display_array enumerateObjectsUsingBlock:^(NSDictionary *_Nonnull obj, NSUInteger idx, BOOL *_Nonnull stop) {
-      NSString *name = obj[@"name"];
-      display_names.emplace_back(name.UTF8String);
-    }];
+      display_names.reserve([display_array count]);
+      [display_array enumerateObjectsUsingBlock:^(NSDictionary *_Nonnull obj, NSUInteger idx, BOOL *_Nonnull stop) {
+        (void) idx;
+        (void) stop;
+        NSString *name = obj[@"name"];
+        if (name && name.UTF8String) {
+          display_names.emplace_back(name.UTF8String);
+        }
+      }];
 
-    return display_names;
+      return display_names;
+    }
   }
 
   /**

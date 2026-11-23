@@ -96,20 +96,23 @@ namespace {
 namespace {
   VibepolloTrayTarget *target = nil;
 
-  NSMenu *build_menu(const std::vector<menu_item_t> &items) {
+  NSMenu *build_menu(const std::vector<menu_item_t> &items, bool top_level = true) {
     NSMenu *menu = [[NSMenu alloc] init];
     menu.autoenablesItems = NO;
-    for (const auto &item : items) {
+    for (std::size_t idx = 0; idx < items.size(); ++idx) {
+      const auto &item = items[idx];
       if (item.text == "-") {
         [menu addItem:[NSMenuItem separatorItem]];
         continue;
       }
 
       NSString *keyEq = @"";
-      if (item.text == "Open Vibepollo" || item.text == "설정...") {
-        keyEq = @",";
-      } else if (item.text == "Quit" || item.text == "종료") {
-        keyEq = @"q";
+      if (top_level && item.submenu.empty() && item.source != nullptr && item.source->cb != nullptr) {
+        if (idx == 0) {
+          keyEq = @",";
+        } else if (idx + 1 == items.size()) {
+          keyEq = @"q";
+        }
       }
       NSMenuItem *menu_item = [[NSMenuItem alloc] initWithTitle:@(item.text.c_str())
                                                          action:@selector(menuCallback:)
@@ -119,7 +122,7 @@ namespace {
       menu_item.state = item.checked ? NSControlStateValueOn : NSControlStateValueOff;
       menu_item.representedObject = [NSValue valueWithPointer:item.source];
       if (!item.submenu.empty()) {
-        menu_item.submenu = build_menu(item.submenu);
+        menu_item.submenu = build_menu(item.submenu, false);
       }
       [menu addItem:menu_item];
     }
@@ -176,18 +179,29 @@ void tray_set_log_callback(tray_log_callback cb) {
   log_callback = cb;
 }
 
+extern "C" void tray_ensure_macos_app_delegate(void) {
+  auto install = ^{
+    platf::ensure_appkit_session();
+    vibepollo_register_macos_native_ui();
+    if (target == nil) {
+      target = [[VibepolloTrayTarget alloc] init];
+      NSApp.delegate = target;
+    }
+  };
+  if (NSThread.isMainThread) {
+    install();
+  } else {
+    dispatch_async(dispatch_get_main_queue(), install);
+  }
+}
+
 int tray_init(struct tray *tray) {
   if (!NSThread.isMainThread) {
     tray_log_message(TRAY_LOG_ERROR, @"tray_init() must be called on the main thread");
     return -1;
   }
 
-  platf::ensure_appkit_session();
-  vibepollo_register_macos_native_ui();
-  if (target == nil) {
-    target = [[VibepolloTrayTarget alloc] init];
-    NSApp.delegate = target;
-  }
+  tray_ensure_macos_app_delegate();
 
   status_item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
   if (status_item == nil) {

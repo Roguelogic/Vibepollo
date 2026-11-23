@@ -48,6 +48,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${VIDEO_TOOLBOX_LIBRARY})
 
 set_source_files_properties(
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.mm"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -68,16 +69,20 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_img_t.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.m"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/cf_guard.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display_policy.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display_policy.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/keymap.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/keymap.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/microphone.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/misc.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/host_stats.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/nv12_zero_device.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/nv12_zero_device.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/palm_rejection.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/publish.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.m"
@@ -85,6 +90,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/wheel_scroll.h"
         "${CMAKE_SOURCE_DIR}/third-party/TPCircularBuffer/TPCircularBuffer.c"
         "${CMAKE_SOURCE_DIR}/third-party/TPCircularBuffer/TPCircularBuffer.h"
         ${APPLE_PLIST_FILE})

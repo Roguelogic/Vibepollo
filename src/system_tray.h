@@ -94,6 +94,7 @@ namespace system_tray {
    */
   void update_tray_vigem_missing();
 #if defined(__APPLE__) || defined(__MACH__)
+  void ensure_macos_app_delegate();
   void refresh_macos_tray_checks();
 #endif
 }  // namespace system_tray

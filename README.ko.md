@@ -12,8 +12,8 @@
 3. **시스템 설정 → 개인정보 보호 및 보안**에서 아래 두 권한을 허용합니다:
    * **화면 및 시스템 오디오 녹음**
    * **손쉬운 사용 (Accessibility)**
-4. 상단 메뉴바 아이콘에서 **Open Vibepollo**를 누르거나 브라우저에서 `https://localhost:47990` 에 접속해 초기 관리자 계정을 설정하고 클라이언트와 페어링합니다.
-   * *클라이언트 참고*: iPadOS / iOS 환경에서는 **VoidLink** 사용을 권장합니다 (일반 Moonlight 앱은 네이티브 터치 및 펜 확장 프로토콜을 지원하지 않습니다).
+4. 상단 메뉴바 아이콘에서 **설정...** (**Open Vibepollo**)을 누르거나 브라우저에서 `https://localhost:47990` 에 접속해 초기 관리자 계정을 설정하고 클라이언트와 페어링합니다.
+   * *클라이언트 참고*: iPadOS / iOS 환경에서는 **VoidLink** 사용을 권장합니다 (손가락 조작은 **트랙패드/마우스 모드** 권장, Apple Pencil 모드 자동 동기화 및 전용 확장 프로토콜 지원).
 
 ---
 
@@ -33,12 +33,12 @@
   * BlackHole 등 별도 가상 오디오 드라이버 설치 없이 macOS 내장 CoreAudio 탭(`CATapDescription`)으로 시스템 오디오 즉시 캡처
 
 * **재부팅 직후 로그인 화면 접속 (`LoginWindow`)**
-  * 상단 메뉴바의 **Allow on Login Screen** 옵션으로 `LoginWindow` 및 `Aqua` 세션을 함께 담당하는 LaunchAgent 등록 지원
+  * 상단 메뉴바의 **로그인 화면에서 허용** (**Allow on Login Screen**) 옵션으로 `LoginWindow` 및 `Aqua` 세션을 함께 담당하는 LaunchAgent 등록 지원
   * *참고*: FileVault 디스크 암호화가 켜져 있으면 부팅 초기 EFI 잠금 해제 단계에서 대기하므로, 완전 무인 재부팅 시에도 원격 접속하려면 FileVault를 끄거나 `sudo fdesetup authrestart`로 재부팅해야 합니다.
 
 * **macOS 네이티브 입력 처리**
-  * 저지연 마우스·키보드(`한/영` 전환 포함) 입력 및 상단 메뉴바에서 관성 곡선을 선택할 수 있는 120Hz 연속 스크롤 지원
-  * VoidLink 등 확장 클라이언트의 네이티브 멀티터치 및 스타일러스 타블렛 입력(필압·기울기·배럴 롤·사이드 제스처) 연동 지원
+  * 저지연 마우스·키보드(`한/영` 전환 포함), 클라이언트 트랙패드 핀치 줌(`Magnify`), 상단 메뉴바에서 관성 곡선을 선택할 수 있는 120Hz 연속 스크롤 지원
+  * **VoidLink Apple Pencil 특화 연동**: 클라이언트 펜슬 모드(`Stylus` / `Touch` / `Mouse`) 자동 동기화, macOS 네이티브 타블렛 입력(필압·기울기·배럴 롤·에어 호버·더블탭 지우개·스퀴즈 우클릭) 및 손바닥 터치 차단(Palm Rejection) 지원
 
 * **USB 유선 스트리밍 (`usbmuxd`)**
   * 별도 드라이버 설치 없이 macOS 기본 내장 `usbmuxd` 데몬을 통해 USB-C / Thunderbolt 케이블만으로 VoidLink 유선 연결 및 전용 USB 비디오 채널 지원 (iPad Wi-Fi를 끈 상태에서도 페어링·스트리밍·충전 동시 가능)

@@ -8,8 +8,9 @@ set -euo pipefail
 #   ASC_KEY_PATH=~/Downloads/AuthKey_XXXX.p8 ASC_KEY_ID=XXXX ASC_ISSUER_ID=UUID ./scripts/notarize_macos.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_DMG="${OUT_DMG:-/Users/jeonjimin/Documents/remote-desktop/Vibepollo-macOS-arm64.dmg}"
+OUT_DMG="${OUT_DMG:-$REPO_ROOT/../Vibepollo-macOS-arm64.dmg}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-vibepollo-notary}"
+INSTALL_LOCAL="${INSTALL_LOCAL:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,10 +48,19 @@ echo "==> Using signing identity: $DEV_ID"
 
 # 3. Configure, build, bundle, and sign with Hardened Runtime + entitlements.plist
 cd "$REPO_ROOT"
+OPENSSL_ARGS=()
+if [[ -z "${OPENSSL_ROOT_DIR:-}" ]] && command -v brew >/dev/null 2>&1; then
+  BREW_OPENSSL="$(brew --prefix openssl@3 2>/dev/null || true)"
+  if [[ -n "$BREW_OPENSSL" && -d "$BREW_OPENSSL" ]]; then
+    OPENSSL_ARGS+=("-DOPENSSL_ROOT_DIR=$BREW_OPENSSL")
+  fi
+fi
+
 cmake -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTS=OFF \
-  -DAPPLE_CODESIGN_IDENTITY="$DEV_ID"
+  -DAPPLE_CODESIGN_IDENTITY="$DEV_ID" \
+  "${OPENSSL_ARGS[@]}"
 cmake --build build --target sunshine -j"$(sysctl -n hw.ncpu)"
 
 rm -rf build/bundle_stage
@@ -88,10 +98,16 @@ xcrun stapler validate "$APP_BUNDLE"
 echo "==> Verifying Gatekeeper acceptance..."
 spctl -a -vvv -t exec "$APP_BUNDLE"
 
-echo "==> Updating /Applications/Vibepollo.app..."
-rsync -a --delete "$APP_BUNDLE/" /Applications/Vibepollo.app/
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Vibepollo.app || true
-launchctl bootout "gui/$(id -u)/io.github.Nonary.vibepollo.loginscreen" 2>/dev/null || true
-launchctl kickstart -k "gui/$(id -u)/io.github.Nonary.vibepollo" 2>/dev/null || true
+if [[ "$INSTALL_LOCAL" == "1" ]]; then
+  echo "==> Updating /Applications/Vibepollo.app..."
+  rsync -a --delete "$APP_BUNDLE/" /Applications/Vibepollo.app/
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Vibepollo.app || true
+  launchctl bootout "gui/$(id -u)/io.github.Nonary.vibepollo.loginscreen" 2>/dev/null || true
+  if ! launchctl kickstart -k "gui/$(id -u)/io.github.Nonary.vibepollo" 2>/dev/null; then
+    pkill -TERM -f "/Applications/Vibepollo.app/Contents/MacOS/Vibepollo" 2>/dev/null || true
+    sleep 1
+    open -g /Applications/Vibepollo.app
+  fi
+fi
 
 echo "==> Done! Notarized DMG ready at: $OUT_DMG"

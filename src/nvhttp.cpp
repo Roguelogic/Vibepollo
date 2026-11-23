@@ -104,6 +104,7 @@
   #include "platform/linux/private_display_resume_policy.h"
 #endif
 #ifdef __APPLE__
+  #include "platform/macos/misc.h"
   #include "platform/macos/virtual_display.h"
 #endif
 
@@ -5036,7 +5037,8 @@ namespace nvhttp {
       return true;
     }
 
-    void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, std::uint64_t trace_id = 0) {
+    void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, std::uint64_t trace_id = 0, bool respond_as_resume = false) {
+      const char *const session_ok_key = respond_as_resume ? "root.resume" : "root.gamesession";
       // Trace-enabled launch/resume routes correlate with a private trace ID;
       // do not emit raw request headers or query values into verbose logs.
       if (dispatch::include_request_identity_log_fields(trace_id)) {
@@ -5621,16 +5623,29 @@ launch_session->exact_target_hold.reset();
             static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
           )
         );
-        tree.put("root.gamesession", 1);
+        tree.put(session_ok_key, 1);
         return;
       }
       std::unique_lock normal_transition_lock {normal_http_app_transition_mutex};
       auto requested_app = proc::proc.resolve_app(appid_str, appuuid_str);
+#ifdef __APPLE__
+      const bool loginwindow_desktop = platf::is_loginwindow_session();
+      if (!requested_app && loginwindow_desktop) {
+        // Pre-login LoginWindow sessions expose only the locked-down Desktop stream; map any
+        // cached client tile launch directly to Desktop so remote sign-in always succeeds.
+        const auto login_apps = proc::proc.get_apps();
+        if (!login_apps.empty()) {
+          requested_app = login_apps.front();
+        }
+      }
+#else
+      constexpr bool loginwindow_desktop = false;
+#endif
       auto appid = requested_app ? util::from_view(requested_app->id) : util::from_view(appid_str);
       auto current_app_uuid = proc::proc.get_running_app_uuid();
       bool is_input_only = config::input.enable_input_only_mode && (appid == proc::input_only_app_id || (appuuid_str == REMOTE_INPUT_UUID));
 
-      auto required_perm = PERM::launch;
+      auto required_perm = (respond_as_resume && loginwindow_desktop) ? PERM::_allow_view : PERM::launch;
 
       if (dispatch::include_request_identity_log_fields(trace_id)) {
         BOOST_LOG(verbose) << "Launching app [" << appid_str << "] with UUID [" << appuuid_str << "]";
@@ -6196,7 +6211,7 @@ launch_session->exact_target_hold.reset();
         )
       );
       keep_runtime_overrides = true;
-      tree.put("root.gamesession", 1);
+      tree.put(session_ok_key, 1);
 #ifdef _WIN32
       tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
 #elif defined(__linux__)
@@ -6310,6 +6325,23 @@ launch_session->exact_target_hold.reset();
     // non-positive id means nothing is running. Comparing against 0 alone would let a
     // stale /resume run the whole resume path for an app that no longer exists.
     if (current_appid <= 0) {
+#ifdef __APPLE__
+      if (platf::is_loginwindow_session()) {
+        const auto login_apps = proc::proc.get_apps();
+        if (!login_apps.empty()) {
+          g.disable();
+          std::string rebuilt_qs = "appid=" + login_apps.front().id + "&localAudioPlayMode=0";
+          for (const auto &[k, v] : request->parse_query_string()) {
+            if (k != "appid" && k != "appuuid" && k != "localAudioPlayMode") {
+              rebuilt_qs += "&" + k + "=" + v;
+            }
+          }
+          request->query_string = std::move(rebuilt_qs);
+          launch(host_audio, std::move(response), std::move(request), current_appid, trace_id, true);
+          return;
+        }
+      }
+#endif
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "No running app to resume");
@@ -8423,11 +8455,17 @@ launch_session->exact_target_hold.reset();
     const bool always_use_virtual_display,
     const std::string &virtual_display_mode,
     const std::string &virtual_display_layout,
-    const bool prefer_10bit_sdr
+    const bool prefer_10bit_sdr,
+    std::optional<std::unordered_map<std::string, std::string>> config_overrides
   ) {
     host_stream_control::activity_guard_t activity;
     if (!activity) return false;
     if (name.size() > pairing_policy::max_paired_client_name_length) return false;
+    if (config_overrides) {
+      std::unordered_map<std::string, std::string> normalized_overrides;
+      config::merge_config_overrides(normalized_overrides, *config_overrides);
+      config_overrides = std::move(normalized_overrides);
+    }
     const bool transient = config::sunshine.flags[config::flag::FRESH_STATE];
     if (!transient) statefile::migrate_recent_state_keys();
     bool persisted = false;
@@ -8453,6 +8491,9 @@ launch_session->exact_target_hold.reset();
           named_cert_p->virtual_display_mode_override = virtual_display_mode;
           named_cert_p->virtual_display_layout_override = virtual_display_layout;
           named_cert_p->prefer_10bit_sdr = prefer_10bit_sdr;
+          if (config_overrides) {
+            named_cert_p->config_overrides = std::move(*config_overrides);
+          }
           updated = true;
           persisted = transient || save_state_snapshot_locked(client_root);
           if (!persisted) {

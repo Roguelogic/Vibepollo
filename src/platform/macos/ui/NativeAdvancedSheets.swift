@@ -351,6 +351,7 @@ struct GeneralAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitPathsIfNeeded()
             dismiss()
           }
@@ -432,8 +433,8 @@ struct DisplayAdvancedSheet: View {
               }
             )
           ) {
-            Text(l10n.pick("단독 표시 (물리 화면 숨김)", "Exclusive")).tag("exclusive")
-            Text(l10n.pick("데스크톱 확장 (기본)", "Extended (Default)")).tag("extended")
+            Text(l10n.pick("단독 표시 (물리 화면 숨김, 기본)", "Exclusive (Default)")).tag("exclusive")
+            Text(l10n.pick("데스크톱 확장", "Extended")).tag("extended")
             Text(l10n.pick("확장 + 주 모니터 지정", "Extended Primary")).tag("extended_primary")
             Text(l10n.pick("확장 + 커서 격리 배치", "Extended Isolated")).tag("extended_isolated")
             Text(l10n.pick("확장 + 주 모니터 및 커서 격리", "Extended Primary & Isolated")).tag("extended_primary_isolated")
@@ -539,6 +540,7 @@ struct DisplayAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFieldsIfNeeded()
             dismiss()
           }
@@ -659,17 +661,6 @@ struct VideoAdvancedSheet: View {
               }
             )
           )
-
-          Toggle(
-            l10n.pick("PyroWave 초저지연 코덱 광고", "Enable PyroWave Codec"),
-            isOn: Binding(
-              get: { store.settings.pyrowave },
-              set: { v in
-                store.settings.pyrowave = v
-                store.patchSettings(["pyrowave": v])
-              }
-            )
-          )
         }
 
         Section("Apple VideoToolbox") {
@@ -772,6 +763,7 @@ struct VideoAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitNumericFields()
             dismiss()
           }
@@ -833,9 +825,6 @@ struct InputAdvancedSheet: View {
   @Environment(\.dismiss) private var dismiss
   private var l10n: L10n { store.l10n }
 
-  @ViewState private var backTimeoutDraft: Int = -1
-  @ViewState private var guideKeyDraft: Int = 0
-  @ViewState private var guideSlotDraft: Int = 0
   @ViewState private var repeatDelayDraft: Int = 500
   @ViewState private var repeatFreqDraft: Double = 24.9
   @ViewState private var keybindingsDraft: String = ""
@@ -843,7 +832,7 @@ struct InputAdvancedSheet: View {
   var body: some View {
     NavigationStack {
       Form {
-        Section(l10n.pick("게임 컨트롤러 및 세션", "Controller & Input Session")) {
+        Section(l10n.pick("입력 세션", "Input Session")) {
           Toggle(
             l10n.pick("입력 전용(Input-Only) 스트림 모드 허용", "Enable Input-Only Mode"),
             isOn: Binding(
@@ -854,77 +843,6 @@ struct InputAdvancedSheet: View {
               }
             )
           )
-
-          Toggle(
-            l10n.pick("컨트롤러 진동(럼블) 전달", "Forward Controller Rumble"),
-            isOn: Binding(
-              get: { store.settings.forwardRumble },
-              set: { v in
-                store.settings.forwardRumble = v
-                store.patchSettings(["forward_rumble": v])
-              }
-            )
-          )
-
-          Toggle(
-            l10n.pick("자이로/모션 센서를 DualShock 4로 전달", "Motion as DualShock 4"),
-            isOn: Binding(
-              get: { store.settings.motionAsDs4 },
-              set: { v in
-                store.settings.motionAsDs4 = v
-                store.patchSettings(["motion_as_ds4": v])
-              }
-            )
-          )
-
-          Toggle(
-            l10n.pick("트랙패드를 DualShock 4 터치패드로 전달", "Touchpad as DualShock 4"),
-            isOn: Binding(
-              get: { store.settings.touchpadAsDs4 },
-              set: { v in
-                store.settings.touchpadAsDs4 = v
-                store.patchSettings(["touchpad_as_ds4": v])
-              }
-            )
-          )
-
-          Toggle(
-            l10n.pick("Back 버튼을 DS4 터치패드 클릭으로 처리", "DS4 Back as Touchpad Click"),
-            isOn: Binding(
-              get: { store.settings.ds4BackAsTouchpadClick },
-              set: { v in
-                store.settings.ds4BackAsTouchpadClick = v
-                store.patchSettings(["ds4_back_as_touchpad_click": v])
-              }
-            )
-          )
-
-          LabeledContent(l10n.pick("Back→Guide 에뮬레이션 시간 (ms)", "Back Button Timeout (ms)")) {
-            TextField("", value: $backTimeoutDraft, format: .number.grouping(.never))
-              .labelsHidden()
-              .font(.system(size: 12, design: .monospaced))
-              .multilineTextAlignment(.trailing)
-              .frame(width: 90)
-              .onSubmit(commitFields)
-          }
-
-          LabeledContent(l10n.pick("가이드 버튼 가상 키코드 (0–255)", "Guide Button Keycode")) {
-            TextField("", value: $guideKeyDraft, format: .number.grouping(.never))
-              .labelsHidden()
-              .font(.system(size: 12, design: .monospaced))
-              .multilineTextAlignment(.trailing)
-              .frame(width: 90)
-              .onSubmit(commitFields)
-          }
-
-          LabeledContent(l10n.pick("가이드 버튼 컨트롤러 슬롯 (0–15)", "Guide Button Controller Slot")) {
-            TextField("", value: $guideSlotDraft, format: .number.grouping(.never))
-              .labelsHidden()
-              .font(.system(size: 12, design: .monospaced))
-              .multilineTextAlignment(.trailing)
-              .frame(width: 90)
-              .onSubmit(commitFields)
-          }
         }
 
         Section(l10n.pick("키보드 반복 및 키 매핑", "Keyboard Repeat & Key Mapping")) {
@@ -935,17 +853,6 @@ struct InputAdvancedSheet: View {
               set: { v in
                 store.settings.keyRightAltToKeyWin = v
                 store.patchSettings(["key_rightalt_to_key_win": v])
-              }
-            )
-          )
-
-          Toggle(
-            l10n.pick("항상 물리 키 스캔코드 전송", "Always Send Scancodes"),
-            isOn: Binding(
-              get: { store.settings.alwaysSendScancodes },
-              set: { v in
-                store.settings.alwaysSendScancodes = v
-                store.patchSettings(["always_send_scancodes": v])
               }
             )
           )
@@ -984,6 +891,7 @@ struct InputAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFields()
             dismiss()
           }
@@ -992,11 +900,8 @@ struct InputAdvancedSheet: View {
         }
       }
     }
-    .frame(width: 500, height: 490)
+    .frame(width: 480, height: 340)
     .onAppear {
-      backTimeoutDraft = store.settings.backButtonTimeout
-      guideKeyDraft = store.settings.guideButtonKey
-      guideSlotDraft = store.settings.guideButtonController
       repeatDelayDraft = store.settings.keyRepeatDelay
       repeatFreqDraft = store.settings.keyRepeatFrequency
       keybindingsDraft = store.settings.keybindings
@@ -1008,20 +913,6 @@ struct InputAdvancedSheet: View {
 
   private func commitFields() {
     var patch: [String: Any] = [:]
-    if backTimeoutDraft != store.settings.backButtonTimeout {
-      store.settings.backButtonTimeout = backTimeoutDraft
-      patch["back_button_timeout"] = backTimeoutDraft
-    }
-    let gk = max(0, min(255, guideKeyDraft))
-    if gk != store.settings.guideButtonKey {
-      store.settings.guideButtonKey = gk
-      patch["guide_button_key"] = gk
-    }
-    let gs = max(0, min(15, guideSlotDraft))
-    if gs != store.settings.guideButtonController {
-      store.settings.guideButtonController = gs
-      patch["guide_button_controller"] = gs
-    }
     let rd = max(0, repeatDelayDraft)
     if rd != store.settings.keyRepeatDelay {
       store.settings.keyRepeatDelay = rd
@@ -1049,7 +940,6 @@ struct AudioAdvancedSheet: View {
   private var l10n: L10n { store.l10n }
 
   @ViewState private var audioSinkDraft: String = ""
-  @ViewState private var virtualSinkDraft: String = ""
 
   var body: some View {
     NavigationStack {
@@ -1065,42 +955,11 @@ struct AudioAdvancedSheet: View {
               }
             )
           )
-
-          Toggle(
-            l10n.pick("기본 오디오 출력 장치 유지", "Keep Default Audio Output"),
-            isOn: Binding(
-              get: { store.settings.keepSinkDefault },
-              set: { v in
-                store.settings.keepSinkDefault = v
-                store.patchSettings(["keep_sink_default": v])
-              }
-            )
-          )
-
-          Toggle(
-            l10n.pick("활성 오디오 출력 자동 캡처", "Auto-Capture Active Sink"),
-            isOn: Binding(
-              get: { store.settings.autoCaptureSink },
-              set: { v in
-                store.settings.autoCaptureSink = v
-                store.patchSettings(["auto_capture_sink": v])
-              }
-            )
-          )
         }
 
-        Section(l10n.pick("오디오 장치 지정 (비워 두면 시스템 기본)", "Audio Sink Override")) {
+        Section(l10n.pick("CoreAudio 출력 장치 지정 (비워 두면 시스템 전체 오디오)", "CoreAudio Sink Override")) {
           LabeledContent(l10n.pick("오디오 싱크 (audio_sink)", "Audio Sink")) {
             TextField("", text: $audioSinkDraft, prompt: Text(l10n.pick("시스템 기본", "System Default")))
-              .labelsHidden()
-              .font(.system(size: 12, design: .monospaced))
-              .multilineTextAlignment(.trailing)
-              .frame(width: 210)
-              .onSubmit(commitFields)
-          }
-
-          LabeledContent(l10n.pick("가상 오디오 싱크 (virtual_sink)", "Virtual Sink")) {
-            TextField("", text: $virtualSinkDraft, prompt: Text(l10n.pick("선택 사항", "Optional")))
               .labelsHidden()
               .font(.system(size: 12, design: .monospaced))
               .multilineTextAlignment(.trailing)
@@ -1115,6 +974,7 @@ struct AudioAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFields()
             dismiss()
           }
@@ -1123,10 +983,9 @@ struct AudioAdvancedSheet: View {
         }
       }
     }
-    .frame(width: 470, height: 315)
+    .frame(width: 470, height: 240)
     .onAppear {
       audioSinkDraft = store.settings.audioSink
-      virtualSinkDraft = store.settings.virtualSink
     }
     .onDisappear {
       commitFields()
@@ -1134,19 +993,10 @@ struct AudioAdvancedSheet: View {
   }
 
   private func commitFields() {
-    var patch: [String: Any] = [:]
     let s1 = audioSinkDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     if s1 != store.settings.audioSink {
       store.settings.audioSink = s1
-      patch["audio_sink"] = s1
-    }
-    let s2 = virtualSinkDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-    if s2 != store.settings.virtualSink {
-      store.settings.virtualSink = s2
-      patch["virtual_sink"] = s2
-    }
-    if !patch.isEmpty {
-      store.patchSettings(patch)
+      store.patchSettings(["audio_sink": s1])
     }
   }
 }
@@ -1334,6 +1184,7 @@ struct NetworkAdvancedSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFields()
             dismiss()
           }
@@ -1511,6 +1362,7 @@ struct TelemetrySettingsSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFields()
             dismiss()
           }
@@ -1680,6 +1532,7 @@ struct SteamIntegrationSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             commitFields()
             dismiss()
           }
@@ -1847,6 +1700,7 @@ struct AppAdvancedOptionsSheet: View {
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("완료", "Done")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             app.detached = detachedRows.map(\.cmd)
             dismiss()
           }
@@ -1977,6 +1831,7 @@ struct ConfigOverridesSheet: View {
         }
         ToolbarItem(placement: .confirmationAction) {
           Button(l10n.pick("저장", "Save")) {
+            NSApp.keyWindow?.makeFirstResponder(nil)
             var map: [String: String] = [:]
             for r in rows {
               let k = r.key.trimmingCharacters(in: .whitespacesAndNewlines)

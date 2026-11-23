@@ -295,7 +295,10 @@ void macos_sc_set_cursor_visible(bool visible) {
                                 self.pixelFormat == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange);
   if (self.hdr && tenBitHdrFormat) {
     if ([configuration respondsToSelector:NSSelectorFromString(@"setCaptureDynamicRange:")]) {
-      [configuration setValue:@1 forKey:@"captureDynamicRange"];
+      // SCCaptureDynamicRangeHDRCanonicalDisplay (2): standardizes HDR output for remote HDR
+      // displays (~203 nits SDR reference white per ITU-R BT.2408) instead of HDRLocalDisplay (1),
+      // which compresses virtual-display SDR desktop content down to ~140 nits.
+      [configuration setValue:@2 forKey:@"captureDynamicRange"];
     }
     configuration.colorSpaceName = kCGColorSpaceITUR_2100_PQ;
     configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020;
@@ -386,10 +389,38 @@ void macos_sc_set_cursor_visible(bool visible) {
   return capture.signal;
 }
 
-- (void)dealloc {
-  for (SCVideoCapture *capture in _captures) {
+- (void)stopCaptureForSignal:(dispatch_semaphore_t)signal {
+  if (signal == nil) {
+    return;
+  }
+  SCVideoCapture *matched = nil;
+  @synchronized(self) {
+    for (SCVideoCapture *capture in _captures) {
+      if (capture.signal == signal) {
+        matched = capture;
+        break;
+      }
+    }
+  }
+  if (matched != nil) {
+    [matched finish];
+  }
+}
+
+- (void)stopAllCaptures {
+  NSArray<SCVideoCapture *> *active = nil;
+  @synchronized(self) {
+    if (_captures.count > 0) {
+      active = [_captures copy];
+    }
+  }
+  for (SCVideoCapture *capture in active) {
     [capture finish];
   }
+}
+
+- (void)dealloc {
+  [self stopAllCaptures];
 }
 
 @end

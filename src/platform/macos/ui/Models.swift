@@ -307,9 +307,9 @@ struct HostSettingsState: Equatable {
 
   // Display & Remote Monitor
   var virtualDisplayMode: String = "per_client"
-  var virtualDisplayLayout: String = "extended"
-  var virtualDisplayScale: Int = -1
-  var keepDisplayWhilePaused: Bool = false
+  var virtualDisplayLayout: String = "exclusive"
+  var virtualDisplayScale: Int = 0
+  var keepDisplayWhilePaused: Bool = true
   var pausedDisplayTimeoutSecs: Int = 7200
   var hdrRequestOverride: String = "auto"
   var virtualDisplayMaxClients: Int = 4
@@ -317,7 +317,7 @@ struct HostSettingsState: Equatable {
   var fallbackMode: String = "1920x1080x60"
   var remoteMonitorConfirmAppReplacement: Bool = true
   var remoteMonitorMuteAudio: Bool = false
-  var remoteMonitorDisconnectOnStreamEnd: Bool = true
+  var remoteMonitorDisconnectOnStreamEnd: Bool = false
 
   // Video & Encoder
   var encoder: String = ""
@@ -360,6 +360,7 @@ struct HostSettingsState: Equatable {
 
   var scrollInertia: String = "macos"
   var pencilMode: String = "auto"
+  var palmRejection: Bool = true
   var highResScrolling: Bool = true
   var nativePenTouch: Bool = true
 
@@ -384,7 +385,7 @@ struct HostSettingsState: Equatable {
   var pingTimeout: Int = 10000
   var controlPeerTimeout: Int = 0
   var pacingMaxBitrateKbps: Int = 0
-  var packetsize: Int = 1392
+  var packetsize: Int = 0
   var lanEncryptionMode: Int = 0
   var wanEncryptionMode: Int = 1
   var sessionTokenTtlSeconds: Int = 7200
@@ -415,7 +416,6 @@ enum OverrideableSettingCatalog {
     "minimum_fps_target",
     "fec_percentage",
     "hevc_mode",
-    "av1_mode",
     "encoder",
     "vt_realtime",
     "vt_software",
@@ -430,22 +430,16 @@ enum OverrideableSettingCatalog {
     "dd_paused_virtual_display_timeout_secs",
     "macos_scroll_inertia",
     "macos_pencil_mode",
+    "macos_palm_rejection",
     "high_resolution_scrolling",
     "native_pen_touch",
     "keyboard",
     "mouse",
-    "controller",
-    "motion_as_ds4",
-    "touchpad_as_ds4",
-    "back_button_timeout",
-    "guide_button_key",
-    "guide_button_controller",
     "key_repeat_delay",
     "key_repeat_frequency",
     "key_rightalt_to_key_win",
     "keybindings",
     "stream_audio",
     "audio_sink",
-    "virtual_sink",
   ]
 }

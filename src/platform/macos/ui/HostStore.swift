@@ -404,9 +404,9 @@ final class HostStore: ObservableObject {
     next.cert = s("cert")
 
     next.virtualDisplayMode = s("virtualDisplayMode", "per_client")
-    next.virtualDisplayLayout = s("virtualDisplayLayout", "extended")
-    next.virtualDisplayScale = i("virtualDisplayScale", -1)
-    next.keepDisplayWhilePaused = b("keepDisplayWhilePaused", false)
+    next.virtualDisplayLayout = s("virtualDisplayLayout", "exclusive")
+    next.virtualDisplayScale = i("virtualDisplayScale", 0)
+    next.keepDisplayWhilePaused = b("keepDisplayWhilePaused", true)
     next.pausedDisplayTimeoutSecs = i("pausedDisplayTimeoutSecs", 7200)
     next.hdrRequestOverride = s("hdrRequestOverride", "auto")
     next.virtualDisplayMaxClients = i("virtualDisplayMaxClients", 4)
@@ -414,7 +414,7 @@ final class HostStore: ObservableObject {
     next.fallbackMode = s("fallbackMode", "1920x1080x60")
     next.remoteMonitorConfirmAppReplacement = b("remoteMonitorConfirmAppReplacement", true)
     next.remoteMonitorMuteAudio = b("remoteMonitorMuteAudio", false)
-    next.remoteMonitorDisconnectOnStreamEnd = b("remoteMonitorDisconnectOnStreamEnd", true)
+    next.remoteMonitorDisconnectOnStreamEnd = b("remoteMonitorDisconnectOnStreamEnd", false)
 
     next.encoder = s("encoder")
     next.maxBitrateKbps = i("maxBitrateKbps", 0)
@@ -452,6 +452,7 @@ final class HostStore: ObservableObject {
     next.keybindings = s("keybindings")
     next.scrollInertia = s("scrollInertia", "macos")
     next.pencilMode = s("pencilMode", "auto")
+    next.palmRejection = b("palmRejection", true)
     next.highResScrolling = b("highResScrolling", true)
     next.nativePenTouch = b("nativePenTouch", true)
 
@@ -475,7 +476,7 @@ final class HostStore: ObservableObject {
     next.pingTimeout = i("pingTimeout", 10000)
     next.controlPeerTimeout = i("controlPeerTimeout", 0)
     next.pacingMaxBitrateKbps = i("pacingMaxBitrateKbps", 0)
-    next.packetsize = i("packetsize", 1392)
+    next.packetsize = i("packetsize", 0)
     next.lanEncryptionMode = i("lanEncryptionMode", 0)
     next.wanEncryptionMode = i("wanEncryptionMode", 1)
     next.sessionTokenTtlSeconds = i("sessionTokenTtlSeconds", 7200)

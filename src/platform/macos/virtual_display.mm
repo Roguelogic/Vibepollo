@@ -289,20 +289,6 @@ namespace platf::macos_virtual_display {
       return pixels;
     }
 
-    /**
-     * @brief Map Vibepollo's display scale setting onto what macOS offers: Retina (2x) or standard (1x).
-     * @details -1 (resolution-based) picks Retina above 1920x1200, where a standard-density desktop
-     *          would have tiny text (phones at native resolution, 1440p, 4K); 0 keeps macOS's
-     *          default (standard); otherwise 125% and up uses Retina HiDPI backing modes.
-     */
-    bool use_hidpi(const int width, const int height) {
-      const int scale = config::video.dd.virtual_display_scale_percent;
-      if (scale < 0) {
-        return width > 1920 || height > 1200;
-      }
-      return scale >= 125;
-    }
-
     bool same_mode(const CGDisplayModeRef a, const CGDisplayModeRef b) {
       return CGDisplayModeGetPixelWidth(a) == CGDisplayModeGetPixelWidth(b) && CGDisplayModeGetPixelHeight(a) == CGDisplayModeGetPixelHeight(b) &&
              CGDisplayModeGetWidth(a) == CGDisplayModeGetWidth(b) && CGDisplayModeGetHeight(a) == CGDisplayModeGetHeight(b);
@@ -889,7 +875,9 @@ namespace platf::macos_virtual_display {
         descriptor.bluePrimary = CGPointMake(0.150, 0.060);
         descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
       }
-      descriptor.terminationHandler = ^(id, id) {
+      // VirtualDisplayClient invokes terminationHandler with scalar status arguments when
+      // WindowServer exits; __unsafe_unretained prevents ARC from calling objc_retain on them.
+      descriptor.terminationHandler = ^(__unsafe_unretained id, __unsafe_unretained id) {
         BOOST_LOG(warning) << "Virtual display: macOS removed the virtual display"sv;
       };
 
@@ -1215,7 +1203,9 @@ namespace platf::macos_virtual_display {
       for (NSScreen *screen in NSScreen.screens) {
         NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
         if (number.unsignedIntValue == id) {
-          return screen.localizedName.UTF8String;
+          if (NSString *loc = screen.localizedName; loc && loc.UTF8String) {
+            return loc.UTF8String;
+          }
         }
       }
       return "Display "s + std::to_string(id);
@@ -1258,9 +1248,20 @@ namespace platf::macos_virtual_display {
   }
 
   std::optional<std::pair<int, int>> remote_layout_size(const std::string &, const remote_display_topology::mode_t &mode) {
-    // Desktop coordinates are in points; a Retina display's capture mode is twice that.
-    const auto size = macos_display_policy::virtual_display_size(mode.width, mode.height, use_hidpi(mode.width, mode.height));
-    return std::pair {size.width, size.height};
+    // Desktop coordinates are in points; match the exact scale geometry make_display() applies.
+    const unsigned int base_w = std::max(2u, static_cast<unsigned int>(std::max(2, mode.width)) & ~1u);
+    const unsigned int base_h = std::max(2u, static_cast<unsigned int>(std::max(2, mode.height)) & ~1u);
+    const double headroom_factor = std::min({1.6, 7680.0 / base_w, 4320.0 / base_h});
+    const unsigned int max_pixel_width = std::max(base_w, round_even(base_w * std::max(1.0, headroom_factor)));
+    const unsigned int max_pixel_height = std::max(base_h, round_even(base_h * std::max(1.0, headroom_factor)));
+    const auto geom = compute_scale_geometry(
+      mode.width,
+      mode.height,
+      max_pixel_width,
+      max_pixel_height,
+      config::video.dd.virtual_display_scale_percent
+    );
+    return std::pair {static_cast<int>(geom.mode_width), static_cast<int>(geom.mode_height)};
   }
 
   void remote_resolve_mode(const std::string &, remote_display_topology::mode_t &mode) {
@@ -1609,6 +1610,7 @@ namespace platf::macos_virtual_display {
       }
       sync_recorded_mode(vd);
 
+      pending_flags.store(0, std::memory_order_relaxed);
       const auto gen = ++change_generation;
       settled_generation.store(gen, std::memory_order_release);
       BOOST_LOG(info) << "Virtual display: applied live scale ("sv << configured_scale << "%) on display "sv << vd.id

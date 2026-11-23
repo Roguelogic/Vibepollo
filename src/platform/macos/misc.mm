@@ -54,6 +54,8 @@
 #include <boost/asio/ip/host_name.hpp>
 #include <boost/asio/system_executor.hpp>
 #include <boost/program_options/parsers.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 // local includes
 #include "misc.h"
@@ -263,6 +265,28 @@ namespace platf {
     return cached;
   }
 
+  bool should_exit_for_inactive_gui_session() {
+    if (is_loginwindow_session() || geteuid() == 0 || !is_login_agent()) {
+      return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (true) {
+      if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
+        const auto login_done = static_cast<CFBooleanRef>(CFDictionaryGetValue(session, kCGSessionLoginDoneKey));
+        const auto username = static_cast<CFStringRef>(CFDictionaryGetValue(session, kCGSessionUserNameKey));
+        const bool active_user_gui = (login_done == kCFBooleanTrue && username != nullptr);
+        CFRelease(session);
+        if (active_user_gui) {
+          return false;
+        }
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return true;
+      }
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+
   void prepare_loginwindow_runtime() {
     if (!is_loginwindow_session()) {
       return;
@@ -278,10 +302,17 @@ namespace platf {
     ::chmod(runtime_cfg.c_str(), 0700);
     ::chmod((runtime_cfg / "credentials").c_str(), 0700);
 
+    std::string preserved_desktop_uuid;
     const char *owner_cfg_env = std::getenv("VIBEPOLLO_OWNER_CONFIG_DIR");
     if (owner_cfg_env != nullptr && owner_cfg_env[0] != '\0') {
       const fs::path src_cfg {owner_cfg_env};
-      for (const char *fname : {"sunshine.conf", "sunshine_state.json", "vibeshine_state.json"}) {
+      for (const char *fname : {
+             "sunshine.conf",
+             "sunshine_state.json",
+             "sunshine_state.json.bak",
+             "vibeshine_state.json",
+             "vibeshine_state.json.bak"
+           }) {
         copy_file_mode_0600(src_cfg / fname, runtime_cfg / fname);
       }
       const fs::path src_creds = src_cfg / "credentials";
@@ -292,22 +323,43 @@ namespace platf {
           }
         }
       }
+
+      // Preserve the owner's Desktop app UUID so clients tapping their cached Desktop tile on the
+      // LoginWindow screen resolve the exact same appuuid/appid without requiring an applist refresh.
+      const fs::path src_apps = src_cfg / "apps.json";
+      if (fs::is_regular_file(src_apps, ec) && !ec) {
+        try {
+          boost::property_tree::ptree apps_tree;
+          boost::property_tree::read_json(src_apps.string(), apps_tree);
+          if (const auto apps_child = apps_tree.get_child_optional("apps")) {
+            for (const auto &[_, node] : *apps_child) {
+              if (node.get<std::string>("name", "") == "Desktop") {
+                const std::string candidate = node.get<std::string>("uuid", "");
+                const bool safe_uuid = !candidate.empty() && candidate.size() <= 64 &&
+                                       std::all_of(candidate.begin(), candidate.end(), [](unsigned char ch) {
+                                         return std::isxdigit(ch) != 0 || ch == '-';
+                                       });
+                if (safe_uuid) {
+                  preserved_desktop_uuid = candidate;
+                }
+                break;
+              }
+            }
+          }
+        } catch (...) {
+        }
+      }
     }
 
     // Lock pre-login apps.json strictly to Desktop only so no shell commands can be launched as root
     // before authenticating through macOS SecurityAgent.
     {
       const fs::path apps_path = runtime_cfg / "apps.json";
-      constexpr std::string_view desktop_only_apps = R"({
-  "env": {},
-  "apps": [
-    {
-      "name": "Desktop",
-      "image-path": "desktop.png"
-    }
-  ]
-}
-)";
+      std::string desktop_only_apps = "{\n  \"env\": {},\n  \"apps\": [\n    {\n      \"name\": \"Desktop\",\n      \"image-path\": \"desktop.png\"";
+      if (!preserved_desktop_uuid.empty()) {
+        desktop_only_apps += ",\n      \"uuid\": \"" + preserved_desktop_uuid + "\"";
+      }
+      desktop_only_apps += "\n    }\n  ]\n}\n";
       ::unlink(apps_path.c_str());
       const int fd = ::open(apps_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
       if (fd >= 0) {
@@ -1216,6 +1268,109 @@ namespace platf {
     return 0;
   }
 
+  socklen_t populate_pktinfo_cmsg(
+    void *cmbuf,
+    const socklen_t cmbuf_capacity,
+    const boost::asio::ip::address &source_address,
+    const boost::asio::ip::address &target_address
+  ) {
+    if (source_address.is_unspecified()) {
+      return 0;
+    }
+    struct msghdr cmsg_template = {};
+    cmsg_template.msg_control = cmbuf;
+    cmsg_template.msg_controllen = cmbuf_capacity;
+    auto *pktinfo_cm = CMSG_FIRSTHDR(&cmsg_template);
+    if (!pktinfo_cm) {
+      return 0;
+    }
+
+    if (target_address.is_v6()) {
+      if (source_address.is_v6()) {
+        const auto src_v6 = source_address.to_v6();
+        if (!src_v6.is_v4_mapped()) {
+          struct in6_pktinfo pktInfo {};
+          const struct sockaddr_in6 saddr_v6 = to_sockaddr(src_v6, 0);
+          pktInfo.ipi6_addr = saddr_v6.sin6_addr;
+          pktInfo.ipi6_ifindex = saddr_v6.sin6_scope_id;
+
+          pktinfo_cm->cmsg_level = IPPROTO_IPV6;
+          pktinfo_cm->cmsg_type = IPV6_PKTINFO;
+          pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
+          std::memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
+          return CMSG_SPACE(sizeof(pktInfo));
+        }
+      }
+      return 0;
+    }
+
+    boost::asio::ip::address_v4 src_v4;
+    if (source_address.is_v4()) {
+      src_v4 = source_address.to_v4();
+    } else if (source_address.is_v6() && source_address.to_v6().is_v4_mapped()) {
+      src_v4 = boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, source_address.to_v6());
+    } else {
+      return 0;
+    }
+    if (src_v4.is_unspecified()) {
+      return 0;
+    }
+
+    struct in_pktinfo pktInfo {};
+    const struct sockaddr_in saddr_v4 = to_sockaddr(src_v4, 0);
+    pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
+    pktInfo.ipi_ifindex = resolve_ipv4_outbound_ifindex(saddr_v4.sin_addr.s_addr);
+
+    pktinfo_cm->cmsg_level = IPPROTO_IP;
+    pktinfo_cm->cmsg_type = IP_PKTINFO;
+    pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
+    std::memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
+    return CMSG_SPACE(sizeof(pktInfo));
+  }
+
+  bool wait_for_send_buffer_space(
+    int sockfd,
+    const std::function<bool()> &send_cancelled,
+    std::optional<std::chrono::steady_clock::time_point> &retry_deadline
+  ) {
+    constexpr auto max_wait = std::chrono::milliseconds(25);
+    const auto start = std::chrono::steady_clock::now();
+    if (!retry_deadline) {
+      retry_deadline = start + max_wait;
+    }
+    const auto deadline = *retry_deadline;
+    if (start >= deadline) {
+      return false;
+    }
+    while (true) {
+      if (send_cancelled && send_cancelled()) {
+        return false;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return false;
+      }
+      const int timeout_ms = std::max(
+        1,
+        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count())
+      );
+      struct pollfd pfd {};
+      pfd.fd = sockfd;
+      pfd.events = POLLOUT;
+      const int pr = poll(&pfd, 1, std::min(timeout_ms, 5));
+      if (pr > 0) {
+        if (std::chrono::steady_clock::now() - now < std::chrono::microseconds(100)) {
+          std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        return true;
+      }
+      if (pr < 0 && errno != EINTR) {
+        BOOST_LOG(warning) << "poll() failed: "sv << errno;
+        return false;
+      }
+    }
+  }
+
   bool send_batch(batched_send_info_t &send_info) {
     if (send_info.block_count == 0) {
       return true;
@@ -1242,42 +1397,19 @@ namespace platf {
       struct cmsghdr alignment;
     } cmbuf {};
 
-    socklen_t cmbuflen = 0;
-    {
-      struct msghdr cmsg_template = {};
-      cmsg_template.msg_control = cmbuf.buf;
-      cmsg_template.msg_controllen = sizeof(cmbuf.buf);
-      auto pktinfo_cm = CMSG_FIRSTHDR(&cmsg_template);
-      if (send_info.source_address.is_v6()) {
-        struct in6_pktinfo pktInfo {};
-        struct sockaddr_in6 saddr_v6 = to_sockaddr(send_info.source_address.to_v6(), 0);
-        pktInfo.ipi6_addr = saddr_v6.sin6_addr;
-        pktInfo.ipi6_ifindex = 0;
-
-        cmbuflen += CMSG_SPACE(sizeof(pktInfo));
-        pktinfo_cm->cmsg_level = IPPROTO_IPV6;
-        pktinfo_cm->cmsg_type = IPV6_PKTINFO;
-        pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
-        memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
-      } else {
-        struct in_pktinfo pktInfo {};
-        struct sockaddr_in saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
-        pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
-        pktInfo.ipi_ifindex = resolve_ipv4_outbound_ifindex(saddr_v4.sin_addr.s_addr);
-
-        cmbuflen += CMSG_SPACE(sizeof(pktInfo));
-        pktinfo_cm->cmsg_level = IPPROTO_IP;
-        pktinfo_cm->cmsg_type = IP_PKTINFO;
-        pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
-        memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
-      }
-    }
+    const socklen_t cmbuflen = populate_pktinfo_cmsg(
+      cmbuf.buf,
+      sizeof(cmbuf.buf),
+      send_info.source_address,
+      send_info.target_address
+    );
 
     constexpr size_t MAX_CHUNK = 64;
     std::array<struct msghdr_x, MAX_CHUNK> msgs {};
     std::array<struct iovec, MAX_CHUNK * 2> iovs {};
 
     size_t blocks_sent = 0;
+    std::optional<std::chrono::steady_clock::time_point> retry_deadline;
     while (blocks_sent < send_info.block_count) {
       if (send_info.send_cancelled && send_info.send_cancelled()) {
         send_info.allow_fallback = (blocks_sent == 0);
@@ -1294,7 +1426,7 @@ namespace platf {
         m.msg_namelen = msg_namelen;
         m.msg_iov = &iovs[iov_idx];
         m.msg_iovlen = send_info.headers ? 2 : 1;
-        m.msg_control = cmbuf.buf;
+        m.msg_control = cmbuflen > 0 ? cmbuf.buf : nullptr;
         m.msg_controllen = cmbuflen;
 
         if (send_info.headers) {
@@ -1313,17 +1445,8 @@ namespace platf {
         if (errno == EINTR) {
           continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          if (send_info.send_cancelled && send_info.send_cancelled()) {
-            send_info.allow_fallback = false;
-            return false;
-          }
-          struct pollfd pfd {};
-          pfd.fd = sockfd;
-          pfd.events = POLLOUT;
-          const int pr = poll(&pfd, 1, 10);
-          if (pr < 0 && errno != EINTR) {
-            BOOST_LOG(warning) << "poll() failed: "sv << errno;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+          if (!wait_for_send_buffer_space(sockfd, send_info.send_cancelled, retry_deadline)) {
             send_info.allow_fallback = false;
             return false;
           }
@@ -1343,6 +1466,7 @@ namespace platf {
       }
 
       blocks_sent += static_cast<size_t>(sent);
+      retry_deadline.reset();
     }
 
     return true;
@@ -1372,39 +1496,12 @@ namespace platf {
       struct cmsghdr alignment;
     } cmbuf {};
 
-    socklen_t cmbuflen = 0;
-
-    msg.msg_control = cmbuf.buf;
-    msg.msg_controllen = sizeof(cmbuf.buf);
-
-    auto pktinfo_cm = CMSG_FIRSTHDR(&msg);
-    if (send_info.source_address.is_v6()) {
-      struct in6_pktinfo pktInfo {};
-
-      struct sockaddr_in6 saddr_v6 = to_sockaddr(send_info.source_address.to_v6(), 0);
-      pktInfo.ipi6_addr = saddr_v6.sin6_addr;
-      pktInfo.ipi6_ifindex = 0;
-
-      cmbuflen += CMSG_SPACE(sizeof(pktInfo));
-
-      pktinfo_cm->cmsg_level = IPPROTO_IPV6;
-      pktinfo_cm->cmsg_type = IPV6_PKTINFO;
-      pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
-      memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
-    } else {
-      struct in_pktinfo pktInfo {};
-
-      struct sockaddr_in saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
-      pktInfo.ipi_spec_dst = saddr_v4.sin_addr;
-      pktInfo.ipi_ifindex = resolve_ipv4_outbound_ifindex(saddr_v4.sin_addr.s_addr);
-
-      cmbuflen += CMSG_SPACE(sizeof(pktInfo));
-
-      pktinfo_cm->cmsg_level = IPPROTO_IP;
-      pktinfo_cm->cmsg_type = IP_PKTINFO;
-      pktinfo_cm->cmsg_len = CMSG_LEN(sizeof(pktInfo));
-      memcpy(CMSG_DATA(pktinfo_cm), &pktInfo, sizeof(pktInfo));
-    }
+    const socklen_t cmbuflen = populate_pktinfo_cmsg(
+      cmbuf.buf,
+      sizeof(cmbuf.buf),
+      send_info.source_address,
+      send_info.target_address
+    );
 
     struct iovec iovs[2] = {};
     int iovlen = 0;
@@ -1419,53 +1516,61 @@ namespace platf {
 
     msg.msg_iov = iovs;
     msg.msg_iovlen = iovlen;
-
+    msg.msg_control = cmbuflen > 0 ? cmbuf.buf : nullptr;
     msg.msg_controllen = cmbuflen;
 
-    auto bytes_sent = sendmsg(sockfd, &msg, 0);
-
-    // If there's no send buffer space, wait for some to be available
-    while (bytes_sent < 0 && errno == EAGAIN) {
-      struct pollfd pfd;
-
-      pfd.fd = sockfd;
-      pfd.events = POLLOUT;
-
-      if (poll(&pfd, 1, -1) != 1) {
-        BOOST_LOG(warning) << "poll() failed: "sv << errno;
-        break;
+    std::optional<std::chrono::steady_clock::time_point> retry_deadline;
+    for (;;) {
+      if (send_info.send_cancelled && send_info.send_cancelled()) {
+        return false;
       }
-
-      // Try to send again
-      bytes_sent = sendmsg(sockfd, &msg, 0);
-    }
-
-    if (bytes_sent < 0) {
+      const ssize_t bytes_sent = sendmsg(sockfd, &msg, 0);
+      if (bytes_sent >= 0) {
+        return true;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+        if (!wait_for_send_buffer_space(sockfd, send_info.send_cancelled, retry_deadline)) {
+          return false;
+        }
+        continue;
+      }
       BOOST_LOG(warning) << "sendmsg() failed: "sv << errno;
       return false;
     }
-
-    return true;
   }
 
-  // We can't track QoS state separately for each destination on this OS,
-  // so we keep a ref count to only disable QoS options when all clients
-  // are disconnected.
-  static std::atomic<int> qos_ref_count = 0;
+  namespace {
+    std::mutex g_qos_ref_mutex;
+    std::unordered_map<int, int> g_qos_socket_ref_counts;
+  }  // namespace
 
   class qos_t: public deinit_t {
   public:
     qos_t(int sockfd, std::vector<std::tuple<int, int, int>> options):
         sockfd(sockfd),
-        options(options) {
-      qos_ref_count++;
+        options(std::move(options)) {
+      std::lock_guard lock {g_qos_ref_mutex};
+      ++g_qos_socket_ref_counts[sockfd];
     }
 
     virtual ~qos_t() {
-      if (--qos_ref_count == 0) {
+      bool should_reset = false;
+      {
+        std::lock_guard lock {g_qos_ref_mutex};
+        auto it = g_qos_socket_ref_counts.find(sockfd);
+        if (it != g_qos_socket_ref_counts.end() && --it->second <= 0) {
+          g_qos_socket_ref_counts.erase(it);
+          should_reset = true;
+        }
+      }
+      if (should_reset) {
         for (const auto &tuple : options) {
           auto reset_val = std::get<2>(tuple);
-          if (setsockopt(sockfd, std::get<0>(tuple), std::get<1>(tuple), &reset_val, sizeof(reset_val)) < 0) {
+          if (setsockopt(sockfd, std::get<0>(tuple), std::get<1>(tuple), &reset_val, sizeof(reset_val)) < 0 &&
+              errno != EBADF && errno != ENOTSOCK) {
             BOOST_LOG(warning) << "Failed to reset option: "sv << errno;
           }
         }
@@ -1602,14 +1707,44 @@ namespace platf {
 
   std::string
     get_clipboard() {
-    // Placeholder
-    return "";
+    if (is_loginwindow_session()) {
+      return {};
+    }
+    @autoreleasepool {
+      NSPasteboard *pb = [NSPasteboard generalPasteboard];
+      if (!pb) {
+        return {};
+      }
+      NSString *str = [pb stringForType:NSPasteboardTypeString];
+      if (!str) {
+        return {};
+      }
+      const char *utf8 = [str UTF8String];
+      return utf8 ? std::string {utf8} : std::string {};
+    }
   }
 
   bool
     set_clipboard(const std::string &content) {
-    // Placeholder
-    return false;
+    if (is_loginwindow_session()) {
+      return false;
+    }
+    @autoreleasepool {
+      NSPasteboard *pb = [NSPasteboard generalPasteboard];
+      if (!pb) {
+        return false;
+      }
+      NSString *str = [[NSString alloc] initWithBytes:content.data()
+                                               length:content.size()
+                                             encoding:NSUTF8StringEncoding];
+      if (!str) {
+        return false;
+      }
+      [pb clearContents];
+      const BOOL ok = [pb setString:str forType:NSPasteboardTypeString];
+      [str release];
+      return ok == YES;
+    }
   }
 
   std::string resolve_render_device() {
@@ -1740,6 +1875,7 @@ namespace {
       [sWindow setSharingType:NSWindowSharingReadOnly];
       [sWindow setAnimationBehavior:NSWindowAnimationBehaviorNone];
       [sWindow setLevel:NSScreenSaverWindowLevel];
+      [sWindow setCanBecomeVisibleWithoutLogin:YES];
       [sWindow setCollectionBehavior:(NSWindowCollectionBehaviorCanJoinAllSpaces |
                                       NSWindowCollectionBehaviorFullScreenAuxiliary |
                                       NSWindowCollectionBehaviorStationary |

@@ -60,6 +60,7 @@
   #include "platform/common.h"
   #include "process.h"
   #include "src/entry_handler.h"
+  #include "system_tray.h"
   #include "system_tray_lifecycle.h"
   #include "update.h"
 
@@ -147,11 +148,13 @@ namespace system_tray {
   static void tray_pencil_mode_auto_cb(struct tray_menu *item);
   static void tray_pencil_mode_scroll_cb(struct tray_menu *item);
   static void tray_pencil_mode_draw_cb(struct tray_menu *item);
+  static void tray_palm_rejection_cb(struct tray_menu *item);
   static void sync_scroll_inertia_tray_checks();
   static void sync_pencil_mode_tray_checks();
   static void sync_macos_tray_localization();
 
   static bool is_macos_tray_korean() {
+    auto read_gate = config::acquire_apply_read_gate();
     const auto &loc = config::sunshine.locale;
     return loc.size() >= 2 &&
            (loc[0] == 'k' || loc[0] == 'K') &&
@@ -169,6 +172,8 @@ namespace system_tray {
     {.text = "Follow Client (VoidLink)", .checked = 1, .checkbox = 1, .cb = tray_pencil_mode_auto_cb},
     {.text = "Scroll & Tap (iPad Style)", .checked = 0, .checkbox = 1, .cb = tray_pencil_mode_scroll_cb},
     {.text = "Drawing Tablet (Pen Input)", .checked = 0, .checkbox = 1, .cb = tray_pencil_mode_draw_cb},
+    {.text = "-"},
+    {.text = "Reject Touch While Using Pencil", .checked = 1, .checkbox = 1, .cb = tray_palm_rejection_cb},
     {.text = nullptr}
   };
   #endif
@@ -208,30 +213,25 @@ namespace system_tray {
   };
 
   #if defined(__APPLE__) || defined(__MACH__)
+  static std::recursive_mutex g_tray_state_mutex;
+
+  static void persist_and_apply_tray_setting(const char *key, const char *value) {
+    if (!config::update_config_file({{key, std::string {value}}}, false)) {
+      BOOST_LOG(warning) << "Couldn't persist "sv << key << " to config file"sv;
+    }
+    config::apply_config_now();
+    refresh_macos_tray_checks();
+  }
+
   static void sync_scroll_inertia_tray_checks() {
-    const auto &mode = config::input.macos_scroll_inertia;
-    scroll_inertia_submenu[0].checked = (mode != "ipados" && mode != "disabled") ? 1 : 0;
-    scroll_inertia_submenu[1].checked = (mode == "ipados") ? 1 : 0;
-    scroll_inertia_submenu[2].checked = (mode == "disabled") ? 1 : 0;
+    const auto mode = config::get_macos_scroll_inertia();
+    scroll_inertia_submenu[0].checked = (mode == config::macos_scroll_inertia_e::macos) ? 1 : 0;
+    scroll_inertia_submenu[1].checked = (mode == config::macos_scroll_inertia_e::ipados) ? 1 : 0;
+    scroll_inertia_submenu[2].checked = (mode == config::macos_scroll_inertia_e::disabled) ? 1 : 0;
   }
 
   static void set_scroll_inertia_from_tray(const char *mode) {
-    config::input.macos_scroll_inertia = mode;
-    try {
-      auto cfg = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
-      cfg["macos_scroll_inertia"] = mode;
-      std::string out;
-      for (const auto &[k, v] : cfg) {
-        out += k + " = " + v + "\n";
-      }
-      file_handler::write_file(config::sunshine.config_file.c_str(), out);
-      config::apply_config_now();
-    } catch (...) {
-      BOOST_LOG(warning) << "Couldn't persist macos_scroll_inertia to config file"sv;
-    }
-    sync_scroll_inertia_tray_checks();
-    sync_pencil_mode_tray_checks();
-    tray_update(&tray);
+    persist_and_apply_tray_setting("macos_scroll_inertia", mode);
     BOOST_LOG(info) << "macOS scroll inertia mode set to: "sv << mode;
   }
 
@@ -248,28 +248,21 @@ namespace system_tray {
   }
 
   static void sync_pencil_mode_tray_checks() {
-    const auto &mode = config::input.macos_pencil_mode;
-    pencil_mode_submenu[0].checked = (mode != "scroll" && mode != "draw") ? 1 : 0;
-    pencil_mode_submenu[1].checked = (mode == "scroll") ? 1 : 0;
-    pencil_mode_submenu[2].checked = (mode == "draw") ? 1 : 0;
+    const auto mode = config::get_macos_pencil_mode();
+    pencil_mode_submenu[0].checked = (mode == config::macos_pencil_mode_e::follow_client) ? 1 : 0;
+    pencil_mode_submenu[1].checked = (mode == config::macos_pencil_mode_e::scroll) ? 1 : 0;
+    pencil_mode_submenu[2].checked = (mode == config::macos_pencil_mode_e::draw) ? 1 : 0;
+    pencil_mode_submenu[4].checked = config::get_macos_palm_rejection() ? 1 : 0;
+  }
+
+  static void tray_palm_rejection_cb(struct tray_menu *item) {
+    const bool enable = !item->checked;
+    persist_and_apply_tray_setting("macos_palm_rejection", enable ? "true" : "false");
+    BOOST_LOG(info) << "macOS palm rejection set to: "sv << (enable ? "true"sv : "false"sv);
   }
 
   static void set_pencil_mode_from_tray(const char *mode) {
-    config::input.macos_pencil_mode = mode;
-    try {
-      auto cfg = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
-      cfg["macos_pencil_mode"] = mode;
-      std::string out;
-      for (const auto &[k, v] : cfg) {
-        out += k + " = " + v + "\n";
-      }
-      file_handler::write_file(config::sunshine.config_file.c_str(), out);
-      config::apply_config_now();
-    } catch (...) {
-      BOOST_LOG(warning) << "Couldn't persist macos_pencil_mode to config file"sv;
-    }
-    sync_pencil_mode_tray_checks();
-    tray_update(&tray);
+    persist_and_apply_tray_setting("macos_pencil_mode", mode);
     BOOST_LOG(info) << "macOS Apple Pencil mode set to: "sv << mode;
   }
 
@@ -289,12 +282,14 @@ namespace system_tray {
     bool enable = !item->checked;
     BOOST_LOG(info) << (enable ? "Enabling"sv : "Disabling"sv) << " open at login from system tray"sv;
     platf::set_opens_at_login(enable);
+    std::lock_guard lock {g_tray_state_mutex};
     // Show what actually happened: the user may still need to approve it in System Settings.
     item->checked = platf::opens_at_login();
     tray_update(&tray);
   }
 
   void refresh_macos_tray_checks() {
+    std::lock_guard lock {g_tray_state_mutex};
     sync_scroll_inertia_tray_checks();
     sync_pencil_mode_tray_checks();
     sync_macos_tray_localization();
@@ -306,6 +301,12 @@ namespace system_tray {
       }
     }
     tray_update(&tray);
+  }
+
+  extern "C" void tray_ensure_macos_app_delegate(void);
+
+  void ensure_macos_app_delegate() {
+    tray_ensure_macos_app_delegate();
   }
   #endif
 
@@ -346,6 +347,9 @@ namespace system_tray {
     }
     tray_action_cv.notify_one();
 #else
+  #if defined(__APPLE__) || defined(__MACH__)
+    std::lock_guard lock {g_tray_state_mutex};
+  #endif
     fn();
 #endif
   }
@@ -524,6 +528,7 @@ namespace system_tray {
 
   void run_tray() {
   #if defined(__APPLE__) || defined(__MACH__)
+    std::lock_guard lock {g_tray_state_mutex};
     // The user can also change this in System Settings while Vibepollo isn't running.
     for (auto *item = tray.menu; item->text != nullptr; ++item) {
       if (item->cb == tray_open_at_login_cb) {
@@ -637,6 +642,7 @@ namespace system_tray {
     pencil_mode_submenu[0].text = ko ? "클라이언트 설정 따름 (VoidLink)" : "Follow Client (VoidLink)";
     pencil_mode_submenu[1].text = ko ? "스크롤 및 탭 (iPad 스타일)" : "Scroll & Tap (iPad Style)";
     pencil_mode_submenu[2].text = ko ? "드로잉 태블릿 (펜 입력)" : "Drawing Tablet (Pen Input)";
+    pencil_mode_submenu[4].text = ko ? "펜 사용 중 터치 차단" : "Reject Touch While Using Pencil";
 
     for (auto *m = tray.menu; m != nullptr && m->text != nullptr; ++m) {
       if (m->cb == tray_open_ui_cb) {

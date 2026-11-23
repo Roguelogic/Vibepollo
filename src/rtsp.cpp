@@ -2148,6 +2148,11 @@ namespace rtsp_stream {
       ss << "a=x-ss-general.penBarrelRoll:1"sv << std::endl;
       ss << "a=x-ss-general.applePencilSideButtons:1"sv << std::endl;
     }
+    if (config::input.mouse) {
+      // Enable VoidLink smooth trackpad pinch-magnify (`SS_MAC_MAGNIFY_MAGIC`), while keeping
+      // `macTrackpadRotate` off so 2-finger horizontal swipes in Safari are never hijacked by twist.
+      ss << "a=x-ss-general.macTrackpadSimulation:1"sv << std::endl;
+    }
 #endif
 
     // Always request new control stream encryption if the client supports it

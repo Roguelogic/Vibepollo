@@ -295,6 +295,9 @@ namespace input {
     std::atomic_bool input_queue_task_scheduled;
     // Protected by input_queue_lock; set when touch_port_event publishes a newer generation.
     bool geometry_refresh_pending = false;
+    // Protected by input_queue_lock; tracks fast-path execution on controlBroadcast so reset() never tears down client_context concurrently.
+    bool inline_worker_active = false;
+    bool reset_cleanup_pending = false;
     // Protected by input_queue_lock; reset permanently closes this context.
     bool input_closed = false;
 
@@ -315,98 +318,36 @@ namespace input {
     int32_t accumulated_hscroll_delta;
   };
 
-  struct validated_input_packet_t {
-    std::uint32_t magic = 0;
-    std::size_t total_size = 0;
-  };
-
-  struct packet_size_bounds_t {
-    std::size_t min_total_size = 0;
-    std::size_t max_total_size = 0;
-  };
-
-  std::optional<packet_size_bounds_t> packet_size_bounds(std::uint32_t magic) {
-    switch (magic) {
-      case MOUSE_MOVE_REL_MAGIC_GEN5:
-        return packet_size_bounds_t {sizeof(NV_REL_MOUSE_MOVE_PACKET), sizeof(NV_REL_MOUSE_MOVE_PACKET)};
-      case MOUSE_MOVE_ABS_MAGIC:
-        return packet_size_bounds_t {sizeof(NV_ABS_MOUSE_MOVE_PACKET), sizeof(NV_ABS_MOUSE_MOVE_PACKET)};
-      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
-      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
-        return packet_size_bounds_t {sizeof(NV_MOUSE_BUTTON_PACKET), sizeof(NV_MOUSE_BUTTON_PACKET)};
-      case SCROLL_MAGIC_GEN5:
-        return packet_size_bounds_t {sizeof(NV_SCROLL_PACKET), sizeof(NV_SCROLL_PACKET)};
-      case SS_HSCROLL_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_HSCROLL_PACKET), sizeof(SS_HSCROLL_PACKET)};
-      case KEY_DOWN_EVENT_MAGIC:
-      case KEY_UP_EVENT_MAGIC:
-        return packet_size_bounds_t {sizeof(NV_KEYBOARD_PACKET), sizeof(NV_KEYBOARD_PACKET)};
-      case UTF8_TEXT_EVENT_MAGIC:
-        return packet_size_bounds_t {sizeof(NV_INPUT_HEADER), sizeof(NV_UNICODE_PACKET)};
-      case MULTI_CONTROLLER_MAGIC_GEN5:
-        return packet_size_bounds_t {sizeof(NV_MULTI_CONTROLLER_PACKET), sizeof(NV_MULTI_CONTROLLER_PACKET)};
-      case SS_TOUCH_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_TOUCH_PACKET), sizeof(SS_TOUCH_PACKET)};
-      case SS_PEN_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_PEN_PACKET), sizeof(SS_PEN_PACKET)};
-      case input::voidlink::pen_barrel_roll_magic:
-        return packet_size_bounds_t {sizeof(input::voidlink::pen_barrel_roll_packet_t), sizeof(input::voidlink::pen_barrel_roll_packet_t)};
-      case input::voidlink::apple_pencil_side_button_magic:
-        return packet_size_bounds_t {sizeof(input::voidlink::pencil_side_button_packet_t), sizeof(input::voidlink::pencil_side_button_packet_t)};
-      case input::voidlink::mac_magnify_magic:
-      case input::voidlink::mac_rotate_magic:
-        return packet_size_bounds_t {sizeof(input::voidlink::mac_trackpad_gesture_packet_t), sizeof(input::voidlink::mac_trackpad_gesture_packet_t)};
-      case SS_CONTROLLER_ARRIVAL_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_CONTROLLER_ARRIVAL_PACKET), sizeof(SS_CONTROLLER_ARRIVAL_PACKET)};
-      case SS_CONTROLLER_TOUCH_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_CONTROLLER_TOUCH_PACKET), sizeof(SS_CONTROLLER_TOUCH_PACKET)};
-      case SS_CONTROLLER_MOTION_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_CONTROLLER_MOTION_PACKET), sizeof(SS_CONTROLLER_MOTION_PACKET)};
-      case SS_CONTROLLER_BATTERY_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_CONTROLLER_BATTERY_PACKET), sizeof(SS_CONTROLLER_BATTERY_PACKET)};
-      case SS_STEAM_CONTROLLER_ATTRIBUTES_MAGIC:
-        return packet_size_bounds_t {sizeof(SS_STEAM_CONTROLLER_ATTRIBUTES_PACKET), sizeof(SS_STEAM_CONTROLLER_ATTRIBUTES_PACKET)};
-      default:
-        return std::nullopt;
-    }
-  }
-
-  std::optional<validated_input_packet_t> validate_packet(const std::vector<std::uint8_t> &input_data) {
-    const auto payload = std::string_view {
-      reinterpret_cast<const char *>(input_data.data()),
-      input_data.size()
-    };
-    const auto declared_size = util::packet::read_u32_be(payload, 0);
-    const auto magic = util::packet::read_u32_le(payload, sizeof(std::uint32_t));
-    if (!declared_size || !magic) {
-      BOOST_LOG(warning) << "Ignoring short input packet (" << input_data.size() << " bytes)";
-      return std::nullopt;
+  std::optional<validation::validated_packet_t> validate_packet(const std::vector<std::uint8_t> &input_data) {
+    const auto result = validation::validate_packet(input_data);
+    if (result.packet) {
+      return result.packet;
     }
 
-    const auto total_size = static_cast<std::size_t>(*declared_size) + sizeof(std::uint32_t);
-    if (total_size != input_data.size()) {
-      BOOST_LOG(warning) << "Ignoring malformed input packet for magic 0x" << util::hex(*magic).to_string_view()
-                         << " (declared=" << total_size << ", actual=" << input_data.size() << ')';
-      return std::nullopt;
-    }
-
-    const auto bounds = packet_size_bounds(*magic);
-    if (!bounds) {
-      BOOST_LOG(warning) << "Ignoring unknown input packet magic 0x" << util::hex(*magic).to_string_view();
-      return std::nullopt;
-    }
-
-    if (total_size < bounds->min_total_size || total_size > bounds->max_total_size) {
-      auto expected_size = std::to_string(bounds->min_total_size);
-      if (bounds->min_total_size != bounds->max_total_size) {
-        expected_size += "-" + std::to_string(bounds->max_total_size);
+    switch (result.error) {
+      case validation::packet_validation_error_e::short_header:
+        BOOST_LOG(warning) << "Ignoring short input packet (" << input_data.size() << " bytes)";
+        break;
+      case validation::packet_validation_error_e::declared_size_mismatch:
+        BOOST_LOG(warning) << "Ignoring malformed input packet for magic 0x" << util::hex(result.magic).to_string_view()
+                           << " (declared=" << result.total_size << ", actual=" << input_data.size() << ')';
+        break;
+      case validation::packet_validation_error_e::unknown_magic:
+        BOOST_LOG(warning) << "Ignoring unknown input packet magic 0x" << util::hex(result.magic).to_string_view();
+        break;
+      case validation::packet_validation_error_e::invalid_size: {
+        auto expected_size = std::to_string(result.expected_size.min_total_size);
+        if (result.expected_size.min_total_size != result.expected_size.max_total_size) {
+          expected_size += "-" + std::to_string(result.expected_size.max_total_size);
+        }
+        BOOST_LOG(warning) << "Ignoring malformed input packet for magic 0x" << util::hex(result.magic).to_string_view()
+                           << " (size=" << result.total_size << ", expected " << expected_size << ')';
+        break;
       }
-      BOOST_LOG(warning) << "Ignoring malformed input packet for magic 0x" << util::hex(*magic).to_string_view()
-                         << " (size=" << total_size << ", expected " << expected_size << ')';
-      return std::nullopt;
+      case validation::packet_validation_error_e::none:
+        break;
     }
-
-    return validated_input_packet_t {*magic, total_size};
+    return std::nullopt;
   }
 
   /**
@@ -1217,6 +1158,10 @@ namespace input {
     // including when a failed VHF child is removed. Windows already repeats
     // VHF keys, so do not create a periodic no-op timer for those keys.
     native_repeat = platf::keyboard_uses_native_repeat(platf_input, host.key);
+#elif defined(__APPLE__)
+    // CapsLock (0x14) and Hangul/Kana (0x15/0xFF) toggle the macOS input source; repeating
+    // them would cycle IME languages 25 times/sec while held.
+    native_repeat = (key_code == 0x14 || key_code == 0x15 || key_code == 0xFF);
 #endif
     if (!native_repeat && config::input.key_repeat_delay.count() > 0) {
       input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, input, key_code).task_id;
@@ -1424,29 +1369,27 @@ namespace input {
    * @return The monitor-local touch port, or std::nullopt if dimensions are invalid.
    */
   std::optional<platf::touch_port_t> monitor_touch_port(const input::touch_port_t &touch_port, std::pair<float, float> &coords) {
-    const float monitor_logical_w = (touch_port.width * touch_port.scalar_inv) / touch_port.scalar_tpcoords;
-    const float monitor_logical_h = (touch_port.height * touch_port.scalar_inv) / touch_port.scalar_tpcoords;
-    if (monitor_logical_w <= 0.0f || monitor_logical_h <= 0.0f) {
+    const auto normalized = validation::normalize_touch_port(
+      {
+        touch_port.offset_x,
+        touch_port.offset_y,
+        touch_port.width,
+        touch_port.height,
+        touch_port.scalar_inv,
+        touch_port.scalar_tpcoords,
+      },
+      coords
+    );
+    if (!normalized) {
       BOOST_LOG(warning) << "Ignoring touch/pen input due to invalid logical touch dimensions"sv;
       return std::nullopt;
     }
 
-    // Linux client_to_touchport() returns desktop-relative coordinates for
-    // inputtino. Windows keeps monitor-local coordinates here and applies the
-    // monitor offset when injecting the pointer.
-#ifdef __linux__
-    coords.first = (coords.first - touch_port.offset_x) / monitor_logical_w;
-    coords.second = (coords.second - touch_port.offset_y) / monitor_logical_h;
-#else
-    coords.first = coords.first / monitor_logical_w;
-    coords.second = coords.second / monitor_logical_h;
-#endif
-
     return platf::touch_port_t {
-      touch_port.offset_x,
-      touch_port.offset_y,
-      static_cast<int>(monitor_logical_w),
-      static_cast<int>(monitor_logical_h),
+      normalized->offset_x,
+      normalized->offset_y,
+      normalized->width,
+      normalized->height,
       0,
       0,
       touch_port.output_name,
@@ -2417,6 +2360,8 @@ namespace input {
     }
   }
 
+  void perform_reset_cleanup(const std::shared_ptr<input_t> &input);
+
   /**
    * @brief Called on the control stream thread to queue an input message.
    * @param input The input context pointer.
@@ -2440,6 +2385,7 @@ namespace input {
       // Check permission
       switch (packet->magic) {
         case MULTI_CONTROLLER_MAGIC_GEN5:
+        case controller_speaker_pcm::binding_magic:
         case SS_CONTROLLER_ARRIVAL_MAGIC:
         case SS_CONTROLLER_TOUCH_MAGIC:
         case SS_CONTROLLER_MOTION_MAGIC:
@@ -2512,6 +2458,7 @@ namespace input {
         // Direct real-time injection (GFN/Parsec-style): execute continuous pointer/scroll/pen/touch packets
         // immediately on stream::controlBroadcast without a task_pool condition_variable hop.
         input->input_queue_task_scheduled.store(true, std::memory_order_release);
+        input->inline_worker_active = true;
         run_inline = true;
       } else {
         input->input_queue.push_back({
@@ -2565,9 +2512,15 @@ namespace input {
           break;
       }
       bool handoff_remaining = false;
+      bool run_deferred_reset = false;
       {
         std::lock_guard<std::mutex> lg(input->input_queue_lock);
-        if ((input->input_queue.empty() && !input->geometry_refresh_pending) || input->input_closed) {
+        input->inline_worker_active = false;
+        if (input->reset_cleanup_pending) {
+          input->reset_cleanup_pending = false;
+          input->input_queue_task_scheduled.store(false, std::memory_order_release);
+          run_deferred_reset = true;
+        } else if ((input->input_queue.empty() && !input->geometry_refresh_pending) || input->input_closed) {
           input->input_queue_task_scheduled.store(false, std::memory_order_release);
         } else {
           handoff_remaining = true;
@@ -2575,6 +2528,9 @@ namespace input {
       }
       if (handoff_remaining) {
         task_pool.push(passthrough_next_message, input);
+      }
+      if (run_deferred_reset) {
+        task_pool.push(perform_reset_cleanup, input);
       }
       return;
     }
@@ -2593,10 +2549,49 @@ namespace input {
   }
 #endif
 
+  void perform_reset_cleanup(const std::shared_ptr<input_t> &input) {
+    task_pool.cancel(input->key_press_repeat_id);
+    input->key_press_repeat_id = nullptr;
+    task_pool.cancel(input->mouse_left_button_timeout);
+    input->mouse_left_button_timeout = nullptr;
+    for (int x = 1; x < mouse_press.size(); ++x) {
+      if (mouse_press_owner[x] == input.get()) {
+        platf::button_mouse(platf_input, x, true);
+        mouse_press[x] = false;
+        mouse_press_owner[x] = nullptr;
+      }
+    }
+    for (const auto &[client_key, held] : input->keys) {
+      release_key(held);
+    }
+    input->keys.clear();
+    input->shortcutFlags = 0;
+    input->guide_key_pressed = false;
+    for (auto &gamepad : input->gamepads) {
+      reset_gamepad(gamepad);
+    }
+    input->allocated_gamepads.store(0, std::memory_order_relaxed);
+    if (input->client_context) {
+      platf::touch_input_t touch {};
+      touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::touch_update(input->client_context.get(), {}, touch);
+      platf::pen_input_t pen {};
+      pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::pen_update(input->client_context.get(), {}, pen);
+      // Destroy per-client devices and cancel backend repeat timers on the
+      // same worker, even if transport callbacks still retain input_t.
+      input->client_context.reset();
+    }
+    input->accumulated_vscroll_delta = 0;
+    input->accumulated_hscroll_delta = 0;
+    BOOST_LOG(debug) << "Released disconnected client's keyboard, mouse, controllers, touch and pen input";
+  }
+
   void reset(std::shared_ptr<input_t> &input) {
     if (!input) {
       return;
     }
+    bool push_cleanup_now = false;
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
       if (input->input_closed) {
@@ -2604,47 +2599,18 @@ namespace input {
       }
       input->input_closed = true;
       input->input_queue.clear();
+      if (input->inline_worker_active) {
+        input->reset_cleanup_pending = true;
+      } else {
+        push_cleanup_now = true;
+      }
     }
 
     // Finish any in-flight packet on the single input worker, then release.
     // No producer may enqueue another press after the queue is sealed above.
-    task_pool.push([input]() {
-      task_pool.cancel(input->key_press_repeat_id);
-      input->key_press_repeat_id = nullptr;
-      task_pool.cancel(input->mouse_left_button_timeout);
-      input->mouse_left_button_timeout = nullptr;
-      for (int x = 1; x < mouse_press.size(); ++x) {
-        if (mouse_press_owner[x] == input.get()) {
-          platf::button_mouse(platf_input, x, true);
-          mouse_press[x] = false;
-          mouse_press_owner[x] = nullptr;
-        }
-      }
-      for (const auto &[client_key, held] : input->keys) {
-        release_key(held);
-      }
-      input->keys.clear();
-      input->shortcutFlags = 0;
-      input->guide_key_pressed = false;
-      for (auto &gamepad : input->gamepads) {
-        reset_gamepad(gamepad);
-      }
-      input->allocated_gamepads.store(0, std::memory_order_relaxed);
-      if (input->client_context) {
-        platf::touch_input_t touch {};
-        touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
-        platf::touch_update(input->client_context.get(), {}, touch);
-        platf::pen_input_t pen {};
-        pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
-        platf::pen_update(input->client_context.get(), {}, pen);
-        // Destroy per-client devices and cancel backend repeat timers on the
-        // same worker, even if transport callbacks still retain input_t.
-        input->client_context.reset();
-      }
-      input->accumulated_vscroll_delta = 0;
-      input->accumulated_hscroll_delta = 0;
-      BOOST_LOG(debug) << "Released disconnected client's keyboard, mouse, controllers, touch and pen input";
-    });
+    if (push_cleanup_now) {
+      task_pool.push(perform_reset_cleanup, input);
+    }
   }
 
   class deinit_t: public platf::deinit_t {

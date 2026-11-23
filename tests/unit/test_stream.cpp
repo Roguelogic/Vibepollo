@@ -626,3 +626,45 @@ TEST(SendResultObservation, LogsFirstSuccessAndFailureIndependently) {
   EXPECT_TRUE(stream::detail::claim_first_send_result_log(-1, success_logged, failure_logged));
   EXPECT_FALSE(stream::detail::claim_first_send_result_log(-1, success_logged, failure_logged));
 }
+
+TEST(AdaptiveFecPolicy, RestoresFullParityOnLargeMotionFramesWhileSavingStaticAirtime) {
+  constexpr std::int64_t sec = 1'000'000'000LL;
+  // Disabled or low FEC stays untouched.
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(0, false, 4, 30 * sec, std::nullopt), 0);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(5, false, 80, 30 * sec, std::nullopt), 5);
+  // IDR and warmup (<2s) always keep full configured FEC.
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, true, 10, 30 * sec, std::nullopt), 20);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 4, 1 * sec, std::nullopt), 20);
+  // Recent FEC hazard (<8s) keeps full configured FEC even on small frames.
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 4, 30 * sec, 3 * sec), 20);
+  // Clean 8..15s steps small/moderate frames to 10%, but >40 shards stays at 20%.
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 8, 10 * sec, std::nullopt), 10);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 30, 10 * sec, std::nullopt), 10);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 41, 10 * sec, std::nullopt), 20);
+  // Clean >=15s steps static/small frames (<=20 shards) to 5%, moderate (21..40) to 10%,
+  // and proactively restores full 20% on multi-batch burst frames (>40 shards).
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 20, 20 * sec, std::nullopt), 5);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 25, 20 * sec, std::nullopt), 10);
+  EXPECT_EQ(stream::pacing::adaptive_fec_percentage(20, false, 65, 20 * sec, std::nullopt), 20);
+}
+
+TEST(BurstGuardPolicy, LeavesOrdinaryFramesUnpacedAndSpacesOversizedOrIdrFrames) {
+  // Ordinary P-frames (<80 wire packets) and tiny IDRs (<48 wire packets) stay unpaced.
+  EXPECT_FALSE(stream::pacing::burst_guard_packets_per_ms(false, 12, 80000, 1392, 1482));
+  EXPECT_FALSE(stream::pacing::burst_guard_packets_per_ms(false, 79, 80000, 1392, 1482));
+  EXPECT_FALSE(stream::pacing::burst_guard_packets_per_ms(true, 47, 80000, 1392, 1482));
+
+  // Heavy IDR (>=48 packets) and oversized scene-change frames (>=80 packets) engage the guard.
+  const auto idr_pace = stream::pacing::burst_guard_packets_per_ms(true, 180, 78988, 1392, 1482);
+  ASSERT_TRUE(idr_pace);
+  EXPECT_EQ(*idr_pace, 20u);
+
+  const auto large_p_pace = stream::pacing::burst_guard_packets_per_ms(false, 120, 78988, 1392, 1482);
+  ASSERT_TRUE(large_p_pace);
+  EXPECT_EQ(*large_p_pace, 20u);
+
+  // Ultra-high-bitrate streams scale above the 20 packets/ms floor (>=1.5x nominal demand).
+  const auto high_br_pace = stream::pacing::burst_guard_packets_per_ms(true, 250, 300000, 1392, 1482);
+  ASSERT_TRUE(high_br_pace);
+  EXPECT_GT(*high_br_pace, 40u);
+}

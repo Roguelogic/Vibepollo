@@ -155,3 +155,24 @@ TEST(VideoFecStatusTracker, ForgetsFramesOutsideTheWindow) {
   EXPECT_FALSE(tracker.record(old_block, 2000));
   EXPECT_EQ(tracker.duplicate_reports(), 0u);
 }
+
+TEST(VideoFecStatusTracker, MarksFirstUnrecoverableOncePerFrame) {
+  fec_report_tracker_t tracker;
+  const auto recovered = tracker.record(report(42, 10, 2, 8, 2, 20, 0, 3), 42);
+  ASSERT_TRUE(recovered);
+  EXPECT_FALSE(recovered->first_unrecoverable_for_frame);
+
+  const auto first_failed = tracker.record(report(42, 10, 2, 7, 2, 20, 1, 3), 42);
+  ASSERT_TRUE(first_failed);
+  EXPECT_EQ(first_failed->block, fec_block_t::unrecoverable_block());
+  EXPECT_TRUE(first_failed->first_unrecoverable_for_frame);
+
+  const auto second_failed_same_frame = tracker.record(report(42, 10, 2, 6, 2, 20, 2, 3), 42);
+  ASSERT_TRUE(second_failed_same_frame);
+  EXPECT_EQ(second_failed_same_frame->block, fec_block_t::unrecoverable_block());
+  EXPECT_FALSE(second_failed_same_frame->first_unrecoverable_for_frame);
+
+  const auto next_frame_failed = tracker.record(report(43, 10, 2, 7, 2, 20, 0, 1), 43);
+  ASSERT_TRUE(next_frame_failed);
+  EXPECT_TRUE(next_frame_failed->first_unrecoverable_for_frame);
+}

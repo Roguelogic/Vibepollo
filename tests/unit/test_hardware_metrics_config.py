@@ -54,6 +54,8 @@ parser = between(config, '    bool_f(vars, "hardware_metrics",', '    bool_f(var
 publication = between(config, "    g_hardware_metrics_config.publish(", "\n") + "\n"
 hot_entry = between(config, "  void apply_config_now(const display_transition::before_mutation_f &before_display_mutation) {", "    try {")
 hot_install = between(config, "      auto install_effective_configuration = [&] {", "        if (sunshine.session_history_enabled")
+config_hot_policy = (function(config, "  bool is_restart_required_key(") +
+                     function(config, "  bool can_hot_apply_during_session("))
 hot_policy = between(http, "    bool can_hot_apply_during_session(", "\n  }  // namespace")
 access = between(nvhttp, "    hardware_metrics::access_t hardware_metrics_access(", "    void write_hardware_metrics(")
 verified_access = (function(nvhttp, "    inline verified_client_t get_verified_cert(") +
@@ -126,6 +128,7 @@ constexpr int default_video = 0, default_audio = 0, default_stream = 0,
       };
     install_effective_configuration();
   }
+''' + config_hot_policy + r'''
 }
 namespace hardware_metrics {
 ''' + access_type + advertised + r'''
@@ -174,7 +177,6 @@ void write_hardware_metrics(resp_https_t, const hardware_metrics::response_t &re
   last_response = result;
 }
 ''' + route_query + r'''
-bool is_rtx_hdr_live_key(const std::string &) { return false; }
 ''' + hot_policy + r'''
 
 void expect(config::hardware_metrics_settings_t expected) {

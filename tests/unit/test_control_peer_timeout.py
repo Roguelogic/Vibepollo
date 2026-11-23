@@ -43,6 +43,8 @@ initializers = between(config, "  stream_t stream {", "    APPS_JSON_PATH,")
 publication_state = between(config, "    std::atomic<std::uint32_t> g_control_peer_timeout_ms", "\n") + "\n"
 getter = function(config, "  std::chrono::milliseconds get_control_peer_timeout() {")
 publication = between(config, "    g_control_peer_timeout_ms.store(", "\n") + "\n"
+config_hot_policy = (function(config, "  bool is_restart_required_key(") +
+                     function(config, "  bool can_hot_apply_during_session("))
 hot_policy = between(http, "    bool can_hot_apply_during_session(", "\n  }  // namespace")
 hot_entry = between(config, "  void apply_config_now(const display_transition::before_mutation_f &before_display_mutation) {", "    try {")
 hot_install = between(config, "      auto install_effective_configuration = [&] {", "        if (sunshine.session_history_enabled")
@@ -118,8 +120,8 @@ const sunshine_t default_sunshine;
       };
     install_effective_configuration();
   }
+''' + config_hot_policy + r'''
 }
-bool is_rtx_hdr_live_key(const std::string &) { return false; }
 ''' + hot_policy + r'''
 
 constexpr int ENET_PEER_TIMEOUT_LIMIT = 32;

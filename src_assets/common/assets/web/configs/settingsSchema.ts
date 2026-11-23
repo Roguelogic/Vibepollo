@@ -50,12 +50,6 @@ export interface SettingsField {
 
 // Per-client / per-app runtime overrides supported on macOS.
 export const clientOverrideableKeys = new Set([
-  'controller',
-  'motion_as_ds4',
-  'touchpad_as_ds4',
-  'back_button_timeout',
-  'guide_button_key',
-  'guide_button_controller',
   'keyboard',
   'key_repeat_delay',
   'key_repeat_frequency',
@@ -65,9 +59,9 @@ export const clientOverrideableKeys = new Set([
   'native_pen_touch',
   'macos_scroll_inertia',
   'macos_pencil_mode',
+  'macos_palm_rejection',
   'keybindings',
   'audio_sink',
-  'virtual_sink',
   'stream_audio',
   'dd_hdr_request_override',
   'dd_paused_virtual_display_timeout_secs',
@@ -79,7 +73,6 @@ export const clientOverrideableKeys = new Set([
   'qp',
   'min_threads',
   'hevc_mode',
-  'av1_mode',
   'encoder',
   'vt_coder',
   'vt_software',
@@ -295,12 +288,12 @@ export const settingsCategories: SettingsCategory[] = [
         fields: [
           boolean('keyboard'),
           boolean('mouse'),
-          boolean('controller'),
+          boolean('controller', { platform: ['windows', 'linux'] }),
           boolean('enable_input_only_mode'),
-          boolean('forward_rumble'),
+          boolean('forward_rumble', { platform: ['windows', 'linux'] }),
           boolean('legacy_ordering'),
-          boolean('motion_as_ds4'),
-          boolean('touchpad_as_ds4'),
+          boolean('motion_as_ds4', { platform: ['windows', 'linux'] }),
+          boolean('touchpad_as_ds4', { platform: ['windows', 'linux'] }),
           boolean('high_resolution_scrolling'),
           select('macos_scroll_inertia', [
             option('macos', 'config.macos_scroll_inertia_macos'),
@@ -312,15 +305,16 @@ export const settingsCategories: SettingsCategory[] = [
             option('scroll', 'config.macos_pencil_mode_scroll'),
             option('draw', 'config.macos_pencil_mode_draw'),
           ]),
+          boolean('macos_palm_rejection'),
           boolean('native_pen_touch'),
         ],
       },
       {
         id: 'input_repeat',
         fields: [
-          extendedField('back_button_timeout'),
-          extendedField('guide_button_key'),
-          extendedField('guide_button_controller'),
+          extendedField('back_button_timeout', { platform: ['windows', 'linux'] }),
+          extendedField('guide_button_key', { platform: ['windows', 'linux'] }),
+          extendedField('guide_button_controller', { platform: ['windows', 'linux'] }),
           extendedField('key_rightalt_to_key_win'),
           { key: 'keybindings', kind: 'textarea', stacked: true },
           number('key_repeat_delay', { min: 0, step: 1 }),
@@ -336,8 +330,8 @@ export const settingsCategories: SettingsCategory[] = [
         id: 'audio_routing',
         fields: [
           boolean('stream_audio'),
-          boolean('keep_sink_default'),
-          boolean('auto_capture_sink'),
+          boolean('keep_sink_default', { platform: ['windows', 'linux'] }),
+          boolean('auto_capture_sink', { platform: ['windows', 'linux'] }),
           select('audio_format', [
             option('opus', 'config.audio_format_opus'),
             option('ac3', 'config.audio_format_ac3'),
@@ -347,7 +341,7 @@ export const settingsCategories: SettingsCategory[] = [
             visibleWhen: { key: 'audio_format', notEquals: 'opus' },
           }),
           text('audio_sink', { monospace: true, stacked: true }),
-          text('virtual_sink', { monospace: true, stacked: true }),
+          text('virtual_sink', { monospace: true, stacked: true, platform: ['windows', 'linux'] }),
         ],
       },
     ],
@@ -371,12 +365,16 @@ export const settingsCategories: SettingsCategory[] = [
             option('2', 'ui.settings.options.codec.eight_bit'),
             option('3', 'ui.settings.options.codec.hdr_ten_bit'),
           ]),
-          select('av1_mode', [
-            option('0', '_common.auto'),
-            option('1', '_common.disabled'),
-            option('2', 'ui.settings.options.codec.eight_bit'),
-            option('3', 'ui.settings.options.codec.hdr_ten_bit'),
-          ]),
+          select(
+            'av1_mode',
+            [
+              option('0', '_common.auto'),
+              option('1', '_common.disabled'),
+              option('2', 'ui.settings.options.codec.eight_bit'),
+              option('3', 'ui.settings.options.codec.hdr_ten_bit'),
+            ],
+            { platform: ['windows', 'linux'] },
+          ),
         ],
       },
       {
@@ -405,7 +403,7 @@ export const settingsCategories: SettingsCategory[] = [
             option('wan', 'ui.settings.options.origin.wan'),
           ]),
           boolean('upnp', { restartRequired: true }),
-          boolean('enable_discovery'),
+          boolean('enable_discovery', { restartRequired: true }),
           select(
             'address_family',
             [
@@ -487,7 +485,7 @@ export const settingsCategories: SettingsCategory[] = [
           extendedField('locale'),
           extendedField('update_check_interval'),
           text('sunshine_name', { placeholderKey: 'ui.settings.placeholders.host_name' }),
-          boolean('system_tray'),
+          boolean('system_tray', { restartRequired: true }),
           boolean('lid_close_ends_streams'),
           boolean('hide_tray_controls'),
           boolean('envvar_compatibility_mode'),
@@ -585,6 +583,7 @@ export const settingsDefaults: Record<string, unknown> = {
   high_resolution_scrolling: true,
   macos_scroll_inertia: 'macos',
   macos_pencil_mode: 'auto',
+  macos_palm_rejection: true,
   native_pen_touch: true,
   key_repeat_delay: 500,
   key_repeat_frequency: 24.9,
@@ -639,7 +638,15 @@ export const knownSettingsKeys = new Set(
   ),
 );
 
-export const restartRequiredKeys = new Set(['address_family', 'cert', 'pkey', 'port', 'upnp']);
+export const restartRequiredKeys = new Set([
+  'address_family',
+  'cert',
+  'enable_discovery',
+  'pkey',
+  'port',
+  'system_tray',
+  'upnp',
+]);
 
 export function matchesPlatform(
   field: { platform?: SettingsField['platform'] },

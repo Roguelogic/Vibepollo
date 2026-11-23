@@ -28,10 +28,10 @@ enum {
 
 typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 
-@property (nonatomic, assign) AVCaptureSession *session;
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, AVCaptureVideoDataOutput *> *videoOutputs;
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, FrameCallbackBlock> *captureCallbacks;
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, dispatch_semaphore_t> *captureSignals;
+@property (nonatomic, strong) AVCaptureSession *session;
+@property (nonatomic, strong) NSMapTable<AVCaptureConnection *, AVCaptureVideoDataOutput *> *videoOutputs;
+@property (nonatomic, strong) NSMapTable<AVCaptureConnection *, FrameCallbackBlock> *captureCallbacks;
+@property (nonatomic, strong) NSMapTable<AVCaptureConnection *, dispatch_semaphore_t> *captureSignals;
 
 + (NSArray<NSDictionary *> *)displayNames;
 + (NSString *)getDisplayName:(CGDirectDisplayID)displayID;
@@ -40,5 +40,7 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight;
 - (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback;
+- (void)stopCaptureForSignal:(dispatch_semaphore_t)signal;
+- (void)stopAllCaptures;
 
 @end

@@ -443,16 +443,7 @@ namespace confighttp {
     }
 
     bool has_active_stream_sessions() {
-      return rtsp_stream::session_count() > 0 || webrtc_stream::has_active_or_pending_sessions();
-    }
-
-    bool is_rtx_hdr_live_key(std::string_view key) {
-      return key == "rtx_hdr" ||
-             key == "rtx_hdr_sdr_brightness" ||
-             key == "rtx_hdr_contrast" ||
-             key == "rtx_hdr_saturation" ||
-             key == "rtx_hdr_middle_gray" ||
-             key == "rtx_hdr_peak_brightness";
+      return config::has_active_or_pending_stream_session();
     }
 
 #if defined(_WIN32) || defined(__linux__)
@@ -513,49 +504,7 @@ namespace confighttp {
     }
 
     bool can_hot_apply_during_session(const std::set<std::string> &keys) {
-      if (keys.empty()) {
-        return false;
-      }
-
-      for (const auto &key : keys) {
-        if (key.rfind("app_focus_", 0) == 0 || key.rfind("playnite_", 0) == 0) {
-          continue;
-        }
-
-        if (key.rfind("steam_", 0) == 0) {
-          continue;
-        }
-
-        if (key == "hardware_metrics" || key == "hardware_metrics_interval" || key.rfind("realtime_stats_", 0) == 0) {
-          continue;
-        }
-
-        if (is_rtx_hdr_live_key(key)) {
-          continue;
-        }
-
-        if (key == "macos_scroll_inertia" || key == "macos_pencil_mode" || key == "locale") {
-          continue;
-        }
-#ifdef __APPLE__
-        if (key == "dd_virtual_display_scale") {
-          continue;
-        }
-#endif
-
-        if (key == "session_history_enabled") {
-          return false;
-        }
-
-        if (key == "session_history_ttl_days" ||
-            key == "session_history_db_size_limit_mb") {
-          continue;
-        }
-
-        return false;
-      }
-
-      return true;
+      return config::can_hot_apply_during_session(keys);
     }
 
   }  // namespace
@@ -3550,38 +3499,32 @@ namespace confighttp {
     ss << request->content.rdbuf();
     try {
       // TODO: Input Validation
-      std::stringstream config_stream;
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       normalize_adapter_config_pair(input_tree);
       std::set<std::string> changed_keys;
+      std::set<std::string> non_restart_keys;
+      std::map<std::string, std::optional<std::string>> updates;
       for (const auto &[k, v] : input_tree.items()) {
         changed_keys.insert(k);
+        if (!config::is_restart_required_key(k)) {
+          non_restart_keys.insert(k);
+        }
         if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
+          updates[k] = std::nullopt;
           continue;
         }
-
-        // v.dump() will dump valid json, which we do not want for strings in the config right now
-        // we should migrate the config file to straight json and get rid of all this nonsense
-        config_stream << k << " = " << (v.is_string() ? v.get<std::string>() : v.dump()) << std::endl;
+        updates[k] = v.is_string() ? v.get<std::string>() : v.dump();
       }
-      file_handler::write_file(config::sunshine.config_file.c_str(), config_stream.str());
+      config::update_config_file(updates, true);
 
 #ifdef _WIN32
       reconcile_vulkan_hdr_layer_from_body(input_tree);
 #endif
 
-      // Detect restart-required keys
-      static const std::set<std::string> restart_required_keys = {
-        "port",
-        "address_family",
-        "upnp",
-        "pkey",
-        "cert"
-      };
       bool restart_required = false;
       for (const auto &k : changed_keys) {
-        if (restart_required_keys.count(k)) {
+        if (config::is_restart_required_key(k)) {
           restart_required = true;
           break;
         }
@@ -3590,19 +3533,19 @@ namespace confighttp {
       bool applied_now = false;
       bool deferred = false;
 
-      if (!restart_required) {
-        if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
+      if (!non_restart_keys.empty()) {
+        if (can_hot_apply_during_session(non_restart_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
 #ifdef __APPLE__
-          if (changed_keys.count("dd_virtual_display_scale")) {
+          if (non_restart_keys.count("dd_virtual_display_scale")) {
             platf::macos_virtual_display::reapply_scale();
           }
   #if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
           system_tray::refresh_macos_tray_checks();
   #endif
 #endif
-          applied_now = true;
+          applied_now = !restart_required;
         } else {
           config::mark_deferred_reload();
           deferred = true;
@@ -3647,58 +3590,37 @@ namespace confighttp {
       }
       normalize_adapter_config_patch(patch_tree);
 
-      // Load existing config into a map
-      std::unordered_map<std::string, std::string> current = config::parse_config(
-        file_handler::read_file(config::sunshine.config_file.c_str())
-      );
-
-      // Track which keys are being modified to detect restart requirements
       std::set<std::string> changed_keys;
+      std::set<std::string> non_restart_keys;
+      std::map<std::string, std::optional<std::string>> updates;
 
       for (auto it = patch_tree.begin(); it != patch_tree.end(); ++it) {
         const std::string key = it.key();
         const nlohmann::json &val = it.value();
         changed_keys.insert(key);
+        if (!config::is_restart_required_key(key)) {
+          non_restart_keys.insert(key);
+        }
 
-        // Remove key when explicitly null or empty string
-        if (val.is_null() || (val.is_string() && val.get<std::string>().empty())) {
-          auto curIt = current.find(key);
-          if (curIt != current.end()) {
-            current.erase(curIt);
-          }
+        if (val.is_null() ||
+            (val.is_string() && val.get<std::string>().empty()) ||
+            (val.is_array() && val.empty())) {
+          updates[key] = std::nullopt;
           continue;
         }
 
-        // Persist value: strings are raw, non-strings are dumped as JSON
-        if (val.is_string()) {
-          current[key] = val.get<std::string>();
-        } else {
-          current[key] = val.dump();
-        }
+        updates[key] = val.is_string() ? val.get<std::string>() : val.dump();
       }
 
-      // Write back full merged config file
-      std::stringstream config_stream;
-      for (const auto &kv : current) {
-        config_stream << kv.first << " = " << kv.second << std::endl;
-      }
-      file_handler::write_file(config::sunshine.config_file.c_str(), config_stream.str());
+      config::update_config_file(updates, false);
 
 #ifdef _WIN32
       reconcile_vulkan_hdr_layer_from_body(patch_tree);
 #endif
 
-      // Detect restart-required keys
-      static const std::set<std::string> restart_required_keys = {
-        "port",
-        "address_family",
-        "upnp",
-        "pkey",
-        "cert"
-      };
       bool restart_required = false;
       for (const auto &k : changed_keys) {
-        if (restart_required_keys.count(k)) {
+        if (config::is_restart_required_key(k)) {
           restart_required = true;
           break;
         }
@@ -3706,19 +3628,19 @@ namespace confighttp {
 
       bool applied_now = false;
       bool deferred = false;
-      if (!restart_required) {
-        if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
+      if (!non_restart_keys.empty()) {
+        if (can_hot_apply_during_session(non_restart_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
 #ifdef __APPLE__
-          if (changed_keys.count("dd_virtual_display_scale")) {
+          if (non_restart_keys.count("dd_virtual_display_scale")) {
             platf::macos_virtual_display::reapply_scale();
           }
   #if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
           system_tray::refresh_macos_tray_checks();
   #endif
 #endif
-          applied_now = true;
+          applied_now = !restart_required;
         } else {
           config::mark_deferred_reload();
           deferred = true;
