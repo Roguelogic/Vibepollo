@@ -477,7 +477,8 @@ namespace platf::macos_virtual_display {
       close(watchdog.fd);
       watchdog.fd = -1;
       wait_until([&watchdog]() {
-        return waitpid(watchdog.pid, nullptr, WNOHANG) != 0;
+        const pid_t r = waitpid(watchdog.pid, nullptr, WNOHANG);
+        return r > 0 || (r < 0 && errno != EINTR);
       },
                  3s);
       watchdog.pid = -1;
@@ -830,6 +831,7 @@ namespace platf::macos_virtual_display {
       const bool hdr,
       const bool skip_other_modes_restore = false
     ) {
+      @autoreleasepool {
       const Class descriptor_class = NSClassFromString(@"CGVirtualDisplayDescriptor");
       const Class display_class = NSClassFromString(@"CGVirtualDisplay");
       const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
@@ -925,6 +927,7 @@ namespace platf::macos_virtual_display {
                       << (geom.hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
                       << ", display id "sv << result->id;
       return result;
+      }
     }
 
     std::unique_ptr<virtual_display_t> create(const video::config_t &config) {
@@ -1000,9 +1003,22 @@ namespace platf::macos_virtual_display {
   }  // namespace
 
   namespace {
+    dispatch_queue_t hold_timer_queue() {
+      static dispatch_queue_t q = dispatch_queue_create("dev.vibepollo.virtual-display.hold", DISPATCH_QUEUE_SERIAL);
+      return q;
+    }
+
+    void cancel_timer_locked(__strong dispatch_source_t &timer) {
+      if (timer != nil) {
+        dispatch_source_cancel(timer);
+        timer = nil;
+      }
+    }
+
     std::mutex pause_hold_mutex;
     std::shared_ptr<void> pause_hold;
     std::uint64_t pause_hold_generation = 0;
+    dispatch_source_t pause_hold_timer = nil;
 
     // A paused game's display can only be reused by a stream that wants the same mode.
     bool pause_hold_is_stale(const video::config_t &config) {
@@ -1026,6 +1042,7 @@ namespace platf::macos_virtual_display {
       std::lock_guard lock {pause_hold_mutex};
       held = std::move(pause_hold);
       ++pause_hold_generation;
+      cancel_timer_locked(pause_hold_timer);
     }
   }
 
@@ -1059,6 +1076,7 @@ namespace platf::macos_virtual_display {
     std::mutex launch_hold_mutex;
     std::shared_ptr<void> launch_hold;
     std::uint64_t launch_hold_generation = 0;
+    dispatch_source_t launch_hold_timer = nil;
   }  // namespace
 
   void hold_for_launch(const video::config_t &config) {
@@ -1073,21 +1091,25 @@ namespace platf::macos_virtual_display {
       std::lock_guard lock {launch_hold_mutex};
       previous = std::exchange(launch_hold, std::move(held));
       generation = ++launch_hold_generation;
-    }
-
-    std::thread([generation]() {
-      std::this_thread::sleep_for(30s);
-      std::shared_ptr<void> expired;
-      {
-        std::lock_guard lock {launch_hold_mutex};
-        if (launch_hold_generation == generation) {
-          expired = std::move(launch_hold);
+      cancel_timer_locked(launch_hold_timer);
+      dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, hold_timer_queue());
+      dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC), DISPATCH_TIME_FOREVER, 500LL * NSEC_PER_MSEC);
+      dispatch_source_set_event_handler(timer, ^{
+        std::shared_ptr<void> expired;
+        {
+          std::lock_guard lg {launch_hold_mutex};
+          if (launch_hold_generation == generation) {
+            expired = std::move(launch_hold);
+            cancel_timer_locked(launch_hold_timer);
+          }
         }
-      }
-      if (expired) {
-        BOOST_LOG(info) << "Virtual display: no stream started within 30 seconds of the launch; removing it"sv;
-      }
-    }).detach();
+        if (expired) {
+          BOOST_LOG(info) << "Virtual display: no stream started within 30 seconds of the launch; removing it"sv;
+        }
+      });
+      launch_hold_timer = timer;
+      dispatch_resume(timer);
+    }
   }
 
   void hold_for_pause(const std::chrono::seconds timeout) {
@@ -1110,24 +1132,28 @@ namespace platf::macos_virtual_display {
       std::lock_guard lock {pause_hold_mutex};
       previous = std::exchange(pause_hold, std::move(held));
       generation = ++pause_hold_generation;
+      cancel_timer_locked(pause_hold_timer);
+      if (timeout.count() > 0) {
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, hold_timer_queue());
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, timeout.count() * NSEC_PER_SEC), DISPATCH_TIME_FOREVER, 1LL * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(timer, ^{
+          std::shared_ptr<void> expired;
+          {
+            std::lock_guard lg {pause_hold_mutex};
+            if (pause_hold_generation == generation) {
+              expired = std::move(pause_hold);
+              cancel_timer_locked(pause_hold_timer);
+            }
+          }
+          if (expired) {
+            BOOST_LOG(info) << "Virtual display: paused session timed out; removing it"sv;
+          }
+        });
+        pause_hold_timer = timer;
+        dispatch_resume(timer);
+      }
     }
     BOOST_LOG(info) << "Virtual display: keeping it while the session is paused"sv;
-
-    if (timeout.count() > 0) {
-      std::thread([generation, timeout]() {
-        std::this_thread::sleep_for(timeout);
-        std::shared_ptr<void> expired;
-        {
-          std::lock_guard lock {pause_hold_mutex};
-          if (pause_hold_generation == generation) {
-            expired = std::move(pause_hold);
-          }
-        }
-        if (expired) {
-          BOOST_LOG(info) << "Virtual display: paused session timed out; removing it"sv;
-        }
-      }).detach();
-    }
   }
 
   void end_launch_hold() {
@@ -1136,6 +1162,7 @@ namespace platf::macos_virtual_display {
       std::lock_guard lock {launch_hold_mutex};
       held = std::move(launch_hold);
       ++launch_hold_generation;
+      cancel_timer_locked(launch_hold_timer);
     }
   }
 

@@ -373,6 +373,27 @@ namespace session_history::storage {
     return exec(db, "PRAGMA wal_checkpoint(TRUNCATE)");
   }
 
+  int recover_orphaned_sessions(sqlite3 *db) {
+    if (!exec(
+          db,
+          "UPDATE sessions "
+          "SET end_time_unix = COALESCE("
+          "      (SELECT MAX(timestamp_unix) FROM samples WHERE session_uuid = sessions.uuid), "
+          "      start_time_unix), "
+          "    duration_seconds = MAX(0.0, COALESCE("
+          "      (SELECT MAX(timestamp_unix) FROM samples WHERE session_uuid = sessions.uuid), "
+          "      start_time_unix) - start_time_unix), "
+          "    verdict = 'interrupted' "
+          "WHERE end_time_unix IS NULL")) {
+      return -1;
+    }
+    const int recovered = sqlite3_changes(db);
+    if (recovered > 0) {
+      diagnostics::info() << "session_history: recovered " << recovered << " orphaned session(s) on startup";
+    }
+    return recovered;
+  }
+
 #ifdef SUNSHINE_TESTS
   bool force_set_end_time(sqlite3 *db, const std::string &uuid, double end_time_unix) {
     auto stmt = prepare(
@@ -601,6 +622,10 @@ namespace session_history::storage {
       table_exists(db, "samples") ||
       table_exists(db, "events");
 
+    if (!had_existing_history_tables) {
+      (void) exec(db, "PRAGMA auto_vacuum = FULL");
+    }
+
     if (!exec(db, SCHEMA_SQL)) {
       diagnostics::error() << "session_history: schema creation failed";
       return false;
@@ -783,7 +808,16 @@ namespace session_history::storage {
       }
     }
 
-    return exec(db, ("PRAGMA user_version = " + std::to_string(schema_version)).c_str());
+    if (!exec(db, ("PRAGMA user_version = " + std::to_string(schema_version)).c_str())) {
+      return false;
+    }
+
+    if (read_pragma_int(db, "PRAGMA auto_vacuum") != 1) {
+      if (exec(db, "PRAGMA auto_vacuum = FULL")) {
+        (void) exec(db, "VACUUM");
+      }
+    }
+    return true;
   }
 
   bool process_begin(sqlite3 *db, const session_metadata_t &metadata) {

@@ -65,7 +65,13 @@ final class HostStore: ObservableObject {
     }
     forwardStack.removeAll()
     currentRoute = route
-    syncFastUpdatePolling()
+    if route == .telemetry {
+      refreshLiveState()
+    } else if route == .softwareUpdate {
+      refreshSoftwareUpdate()
+    } else {
+      syncFastUpdatePolling()
+    }
   }
 
   func selectSidebar(_ section: SidebarSection) {
@@ -76,14 +82,26 @@ final class HostStore: ObservableObject {
     guard let prev = backStack.popLast() else { return }
     forwardStack.append(currentRoute)
     currentRoute = prev
-    syncFastUpdatePolling()
+    if prev == .telemetry {
+      refreshLiveState()
+    } else if prev == .softwareUpdate {
+      refreshSoftwareUpdate()
+    } else {
+      syncFastUpdatePolling()
+    }
   }
 
   func goForward() {
     guard let next = forwardStack.popLast() else { return }
     backStack.append(currentRoute)
     currentRoute = next
-    syncFastUpdatePolling()
+    if next == .telemetry {
+      refreshLiveState()
+    } else if next == .softwareUpdate {
+      refreshSoftwareUpdate()
+    } else {
+      syncFastUpdatePolling()
+    }
   }
 
   func popToSectionRoot(_ section: SidebarSection) {
@@ -120,6 +138,14 @@ final class HostStore: ObservableObject {
     bannerDismissTask?.cancel()
     bannerDismissTask = nil
     statusBanner = nil
+    showPinSheet = false
+    searchQuery = ""
+    logsText = ""
+    sessionHistory.removeAll()
+    clients.removeAll()
+    apps.removeAll()
+    backStack.removeAll()
+    forwardStack.removeAll()
   }
 
   func handleRoute(_ route: String?) {
@@ -155,10 +181,14 @@ final class HostStore: ObservableObject {
   }
 
   func refreshLiveState() {
-    let snapJSON = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON()
+    let snapJSON = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON(
+      includeHostStats: currentRoute == .telemetry
+    )
     if let data = snapJSON.data(using: .utf8),
        let decoded = try? JSONDecoder().decode(DashboardSnapshot.self, from: data) {
-      self.dashboard = decoded
+      if self.dashboard != decoded {
+        self.dashboard = decoded
+      }
       if decoded.sessions.isEmpty || !decoded.deferredReloadPending {
         bannerDismissTask?.cancel()
         bannerDismissTask = nil
@@ -175,7 +205,9 @@ final class HostStore: ObservableObject {
     let raw = VibepolloHostBridge.shared().fetchSoftwareUpdateStatusJSON()
     if let data = raw.data(using: .utf8),
        let decoded = try? JSONDecoder().decode(SoftwareUpdateSnapshot.self, from: data) {
-      self.softwareUpdate = decoded
+      if self.softwareUpdate != decoded {
+        self.softwareUpdate = decoded
+      }
       if decoded.hasAvailableUpdate != dashboard.updateAvailable ||
          (decoded.hasAvailableUpdate && decoded.availableVersion != dashboard.availableUpdateVersion) {
         dashboard.updateAvailable = decoded.hasAvailableUpdate
@@ -186,7 +218,7 @@ final class HostStore: ObservableObject {
   }
 
   private func syncFastUpdatePolling() {
-    let needsFastPoll = (currentRoute == .softwareUpdate) || softwareUpdate.isBusy
+    let needsFastPoll = softwareUpdate.isBusy
     if needsFastPoll {
       guard fastUpdateTimer == nil else { return }
       fastUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -230,7 +262,7 @@ final class HostStore: ObservableObject {
           let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
       return
     }
-    self.clients = arr.compactMap { dict -> PairedClientItem? in
+    let parsed: [PairedClientItem] = arr.compactMap { dict -> PairedClientItem? in
       guard let uuid = dict["uuid"] as? String, !uuid.isEmpty else { return nil }
       let name = (dict["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       let enabled = (dict["enabled"] as? Bool) ?? true
@@ -288,6 +320,9 @@ final class HostStore: ObservableObject {
         undoCommands: parseCmds("undo"),
         configOverrides: overrides
       )
+    }
+    if self.clients != parsed {
+      self.clients = parsed
     }
   }
 

@@ -2332,6 +2332,7 @@ namespace nvhttp {
     // uniqueID, session
     std::unordered_map<std::string, pair_session_t> map_id_sess;
     std::mutex pairing_sessions_mutex;
+    std::condition_variable pairing_sessions_cv;
     constexpr auto pairing_session_expiry = std::chrono::minutes(10);
     client_t client_root;
     std::mutex client_mutex;
@@ -3736,6 +3737,9 @@ namespace nvhttp {
         close_pending_pairing_response(session->second, 408, "Pairing request expired"sv);
         session = map_id_sess.erase(session);
       }
+      if (map_id_sess.empty() && !parked_superseded_pairing_responses.empty()) {
+        parked_superseded_pairing_responses.clear();
+      }
     }
 
     void fail_pair(pair_session_t &sess, pt::ptree &tree, const std::string status_msg) {
@@ -4235,6 +4239,7 @@ namespace nvhttp {
             tree.put("root.<xmlattr>.status_message", "Too many pending pairing sessions");
             return;
           }
+          pairing_sessions_cv.notify_one();
 
           ptr->second.async_insert_pin.salt = salt;
 
@@ -8009,6 +8014,7 @@ launch_session->exact_target_hold.reset();
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
     https_server.config.port = port_https;
+    https_server.config.max_request_streambuf_size = 16U * 1024U * 1024U;
 
     http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
     http_server.default_resource["POST"] = not_found<SimpleWeb::HTTP>;
@@ -8025,6 +8031,7 @@ launch_session->exact_target_hold.reset();
     http_server.config.reuse_address = true;
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
+    http_server.config.max_request_streambuf_size = 16U * 1024U * 1024U;
 
     auto accept_and_run = [&](auto *http_server) {
       try {
@@ -8127,14 +8134,22 @@ launch_session->exact_target_hold.reset();
 
     util::jthread pairing_expiry_worker([](util::stop_token stop_token) {
       platf::set_thread_name("pair_expiry");
+      std::unique_lock pairing_lock {pairing_sessions_mutex};
       while (!stop_token.stop_requested()) {
-        for (int interval = 0; interval < 10 && !stop_token.stop_requested(); ++interval) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (map_id_sess.empty()) {
+          pairing_sessions_cv.wait(pairing_lock, [&stop_token]() {
+            return stop_token.stop_requested() || !map_id_sess.empty();
+          });
+          if (stop_token.stop_requested()) {
+            break;
+          }
         }
+        pairing_sessions_cv.wait_for(pairing_lock, std::chrono::seconds(1), [&stop_token]() {
+          return stop_token.stop_requested();
+        });
         if (stop_token.stop_requested()) {
           break;
         }
-        std::lock_guard pairing_lock {pairing_sessions_mutex};
         expire_pairing_sessions_locked(std::chrono::steady_clock::now());
       }
     });
@@ -8158,9 +8173,14 @@ launch_session->exact_target_hold.reset();
 #endif
 #ifdef __APPLE__
     usb_stream_tunnel_worker.request_stop();
+    usb_stream_tunnel::wake_shutdown();
     usb_stream_tunnel_worker.join();
 #endif
     pairing_expiry_worker.request_stop();
+    {
+      std::lock_guard pairing_lock {pairing_sessions_mutex};
+    }
+    pairing_sessions_cv.notify_all();
     pairing_expiry_worker.join();
 
     {

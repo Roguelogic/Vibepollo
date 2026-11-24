@@ -53,6 +53,7 @@ namespace session_history::storage {
   bool open_read_db(const std::string &db_path, db_ptr &out_db);
   bool open_memory_db(db_ptr &out_db);
   bool apply_schema_and_migrations(sqlite3 *db, int schema_version);
+  int recover_orphaned_sessions(sqlite3 *db);
 
   bool process_begin(sqlite3 *db, const session_metadata_t &metadata);
   bool process_begin_at(sqlite3 *db, const session_metadata_t &metadata, double start_time_unix);

@@ -47,6 +47,11 @@ namespace {
         VTCompressionSessionInvalidate(session);
         CFRelease(session);
       }
+      if (range_transfer) {
+        VTPixelTransferSessionInvalidate(range_transfer.get());
+        range_transfer.reset();
+      }
+      last_transfer_result.reset();
       std::lock_guard lg {mutex};
       for (auto &slot : slots) {
         slot.clear();
@@ -620,6 +625,7 @@ namespace {
      * @return True when the session was created.
      */
     bool create_session(CMVideoCodecType codec, const video::config_t &config, bool low_latency) {
+      @autoreleasepool {
       CFMutableDictionaryRef specification = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
       // VideoToolbox's software encoder is far slower than Sunshine's own software encoder, so
       // fail without hardware and let encoder selection fall back to that instead.
@@ -641,6 +647,7 @@ namespace {
         return false;
       }
       return true;
+      }
     }
 
     /**

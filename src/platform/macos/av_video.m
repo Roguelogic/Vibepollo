@@ -75,8 +75,6 @@
     return nil;
   }
 
-  [self.session startRunning];
-
   return self;
 }
 
@@ -152,7 +150,7 @@
       (NSString *) AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
     }];
 
-    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
+    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
     dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);
     [videoOutput setSampleBufferDelegate:self queue:recordingQueue];
 
@@ -161,12 +159,20 @@
     if ([self.session canAddOutput:videoOutput]) {
       [self.session addOutput:videoOutput];
     } else {
+      [videoOutput setSampleBufferDelegate:nil queue:nil];
+      if (self.videoOutputs.count > 0) {
+        [self.session startRunning];
+      }
       return nil;
     }
 
     AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
     if (videoConnection == nil) {
+      [videoOutput setSampleBufferDelegate:nil queue:nil];
       [self.session removeOutput:videoOutput];
+      if (self.videoOutputs.count > 0) {
+        [self.session startRunning];
+      }
       return nil;
     }
     dispatch_semaphore_t signal = dispatch_semaphore_create(0);
@@ -191,21 +197,16 @@
 
   if (callback != nil) {
     if (!callback(sampleBuffer)) {
+      dispatch_semaphore_t signalToStop = nil;
       @synchronized(self) {
-        [self.session stopRunning];
         [self.captureCallbacks removeObjectForKey:connection];
-        AVCaptureVideoDataOutput *output = [self.videoOutputs objectForKey:connection];
-        if (output != nil) {
-          [output setSampleBufferDelegate:nil queue:nil];
-          [self.session removeOutput:output];
-          [self.videoOutputs removeObjectForKey:connection];
-        }
-        dispatch_semaphore_t signal = [self.captureSignals objectForKey:connection];
-        if (signal != nil) {
-          dispatch_semaphore_signal(signal);
-          [self.captureSignals removeObjectForKey:connection];
-        }
-        [self.session startRunning];
+        signalToStop = [self.captureSignals objectForKey:connection];
+      }
+      // Perform stopRunning off the sample callback queue to avoid AB-BA deadlock with stopCaptureForSignal:.
+      if (signalToStop != nil) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+          [self stopCaptureForSignal:signalToStop];
+        });
       }
     }
   }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -213,6 +214,10 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 }
 
 - (NSString *)fetchDashboardSnapshotJSON {
+  return [self fetchDashboardSnapshotJSONIncludingHostStats:YES];
+}
+
+- (NSString *)fetchDashboardSnapshotJSONIncludingHostStats:(BOOL)includeHostStats {
   nlohmann::json out;
   out["version"] = PROJECT_VERSION;
 
@@ -261,14 +266,20 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   }
   out["sessions"] = std::move(sessions_json);
 
-  const auto stats = host_stats::latest_for_consumer();
   const auto &info = host_stats::info();
   nlohmann::json hs;
-  hs["cpuPercent"] = stats.cpu_percent;
-  hs["gpuPercent"] = stats.gpu_percent;
-  hs["ramUsedGB"] = stats.ram_used_bytes > 0
-                      ? static_cast<double>(stats.ram_used_bytes) / (1024.0 * 1024.0 * 1024.0)
-                      : -1.0;
+  if (includeHostStats) {
+    const auto stats = host_stats::latest_for_consumer();
+    hs["cpuPercent"] = stats.cpu_percent;
+    hs["gpuPercent"] = stats.gpu_percent;
+    hs["ramUsedGB"] = stats.ram_used_bytes > 0
+                        ? static_cast<double>(stats.ram_used_bytes) / (1024.0 * 1024.0 * 1024.0)
+                        : -1.0;
+  } else {
+    hs["cpuPercent"] = -1.0;
+    hs["gpuPercent"] = -1.0;
+    hs["ramUsedGB"] = -1.0;
+  }
   hs["ramTotalGB"] = info.ram_total_bytes > 0
                        ? static_cast<double>(info.ram_total_bytes) / (1024.0 * 1024.0 * 1024.0)
                        : -1.0;
@@ -915,7 +926,27 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   if (log_path.empty()) {
     return @"";
   }
-  std::string content = file_handler::read_file(log_path.string().c_str());
+  std::ifstream in(log_path, std::ios::binary | std::ios::ate);
+  if (!in.is_open()) {
+    return @"";
+  }
+  const auto end_pos = in.tellg();
+  if (end_pos <= 0) {
+    return @"";
+  }
+  constexpr std::uint64_t MAX_TAIL_BYTES = 256U * 1024U;
+  const auto file_size = static_cast<std::uint64_t>(end_pos);
+  const bool truncated = file_size > MAX_TAIL_BYTES;
+  const auto read_bytes = truncated ? MAX_TAIL_BYTES : file_size;
+  in.seekg(static_cast<std::streamoff>(file_size - read_bytes), std::ios::beg);
+  std::string content(static_cast<std::size_t>(read_bytes), '\0');
+  in.read(content.data(), static_cast<std::streamsize>(read_bytes));
+  content.resize(static_cast<std::size_t>(in.gcount()));
+  if (truncated) {
+    if (const auto first_nl = content.find('\n'); first_nl != std::string::npos) {
+      content.erase(0, first_nl + 1);
+    }
+  }
   if (content.empty() || maxLines <= 0) {
     return to_nsstring(content);
   }

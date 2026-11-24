@@ -426,6 +426,7 @@ namespace update {
 
       bool should_auto_download = false;
       bool should_auto_install_now = false;
+      bool should_prune_update_cache = false;
 
       {
         std::lock_guard lock {g_runtime.mutex};
@@ -440,6 +441,7 @@ namespace update {
           g_runtime.total_bytes.store(0, std::memory_order_relaxed);
           g_runtime.scheduled_on_idle.store(false, std::memory_order_relaxed);
           g_runtime.phase.store(static_cast<int>(phase_e::up_to_date), std::memory_order_release);
+          should_prune_update_cache = true;
         } else {
           g_runtime.available_release = selected_info;
           g_runtime.target_asset = select_platform_asset(selected_info);
@@ -458,11 +460,16 @@ namespace update {
             g_runtime.downloaded_bytes.store(0, std::memory_order_relaxed);
             g_runtime.total_bytes.store(g_runtime.target_asset.size, std::memory_order_relaxed);
             g_runtime.phase.store(static_cast<int>(phase_e::available), std::memory_order_release);
+            should_prune_update_cache = true;
             if (auto_check && auto_download && rtsp_stream::session_count() == 0) {
               should_auto_download = true;
             }
           }
         }
+      }
+
+      if (should_prune_update_cache && !g_runtime.operation_in_progress.load(std::memory_order_acquire)) {
+        prune_cached_dmgs_except({});
       }
 
       if (!any.is_null()) {
@@ -745,6 +752,9 @@ namespace update {
           g_runtime.error_detail.clear();
           g_runtime.phase.store(static_cast<int>(phase_e::downloaded), std::memory_order_release);
         } else {
+          std::error_code rm_ec;
+          fs::remove(fs::path {dmg_path}, rm_ec);
+          g_runtime.downloaded_dmg_path.clear();
           g_runtime.error_code = err_code;
           g_runtime.error_detail = err_detail;
           g_runtime.scheduled_on_idle.store(false, std::memory_order_relaxed);
@@ -947,7 +957,7 @@ namespace update {
     }
     std::thread([]() {
       std::this_thread::sleep_for(3s);
-      trigger_check(true);
+      trigger_check(false);
     }).detach();
   }
 

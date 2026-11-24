@@ -8,13 +8,16 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <fcntl.h>
 #include <memory>
+#include <poll.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 
@@ -55,6 +58,60 @@ namespace usb_stream_tunnel {
 
     std::mutex video_offers_mutex;
     std::unordered_map<std::string, std::weak_ptr<video_channel>> video_offers;
+
+    std::mutex wake_pipe_mutex;
+    int wake_pipe_write_fd = -1;
+
+    struct wake_pipe_guard_t {
+      int fds[2] {-1, -1};
+
+      wake_pipe_guard_t() {
+        if (::pipe(fds) == 0) {
+          for (int fd : fds) {
+            const int fl = ::fcntl(fd, F_GETFL, 0);
+            if (fl >= 0) {
+              (void) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            }
+            (void) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+          }
+          std::lock_guard lock {wake_pipe_mutex};
+          wake_pipe_write_fd = fds[1];
+        }
+      }
+
+      ~wake_pipe_guard_t() {
+        {
+          std::lock_guard lock {wake_pipe_mutex};
+          if (wake_pipe_write_fd == fds[1]) {
+            wake_pipe_write_fd = -1;
+          }
+        }
+        if (fds[0] >= 0) ::close(fds[0]);
+        if (fds[1] >= 0) ::close(fds[1]);
+      }
+
+      void drain() const {
+        if (fds[0] < 0) return;
+        char buf[64];
+        while (::read(fds[0], buf, sizeof(buf)) > 0) {}
+      }
+    };
+
+    bool poll_readable(int fd, int wake_fd, int timeout_ms) {
+      struct pollfd pfds[2] {};
+      nfds_t nfds = 0;
+      if (fd >= 0) {
+        pfds[nfds++] = {fd, POLLIN, 0};
+      }
+      if (wake_fd >= 0) {
+        pfds[nfds++] = {wake_fd, POLLIN, 0};
+      }
+      if (nfds == 0) {
+        return false;
+      }
+      const int rc = ::poll(pfds, nfds, timeout_ms);
+      return rc > 0 && fd >= 0 && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+    }
 
     template<typename Socket>
     void disable_sigpipe(Socket &socket) {
@@ -105,6 +162,23 @@ namespace usb_stream_tunnel {
         value |= std::uint32_t(static_cast<unsigned char>(bytes[i])) << (8 * i);
       }
       return value;
+    }
+
+    pt::ptree read_mux_plist_frame(mux_socket &socket, const util::stop_token &stop) {
+      std::array<char, 16> header {};
+      transfer(socket, header.data(), header.size(), false, stop);
+      const auto size = get_u32(header.data());
+      if (size < header.size() || size > 256 * 1024) {
+        throw std::runtime_error("Invalid usbmux frame size");
+      }
+      std::string body(size - header.size(), '\0');
+      if (!body.empty()) {
+        transfer(socket, body.data(), body.size(), false, stop);
+      }
+      pt::ptree parsed;
+      std::istringstream stream {body};
+      pt::read_xml(stream, parsed, pt::xml_parser::trim_whitespace);
+      return parsed.get_child("plist.dict");
     }
 
     const pt::ptree *plist_value(const pt::ptree &dict, std::string_view name) {
@@ -674,6 +748,14 @@ namespace usb_stream_tunnel {
     return true;
   }
 
+  void wake_shutdown() {
+    std::lock_guard lock {wake_pipe_mutex};
+    if (wake_pipe_write_fd >= 0) {
+      const char byte = 1;
+      (void) ::write(wake_pipe_write_fd, &byte, 1);
+    }
+  }
+
   void run(
     util::stop_token stop,
     std::string host_id,
@@ -689,17 +771,125 @@ namespace usb_stream_tunnel {
     if (error || local.is_unspecified() || local.is_multicast() || mux_socket_path.empty()) {
       return;
     }
+
+    wake_pipe_guard_t wake_pipe;
     std::unordered_map<unsigned, worker_t> devices;
+    std::unordered_map<unsigned, std::chrono::steady_clock::time_point> retry_after;
+    asio::io_context reusable_io;
+
+    const auto spawn_device_if_ready = [&](unsigned id, std::chrono::steady_clock::time_point now) {
+      if (!id || devices.size() >= 8 || devices.contains(id)) {
+        return;
+      }
+      if (const auto it = retry_after.find(id); it != retry_after.end() && now < it->second) {
+        return;
+      }
+      auto session = make_session();
+      devices.try_emplace(
+        id,
+        [mux_socket_path, id, session = std::move(session), host_id, host_name, local, ports, make_session](util::stop_token device_stop) {
+          run_device(device_stop, mux_socket_path, id, session, host_id, host_name, local, ports, make_session);
+        }
+      );
+    };
+
+    const auto reap_finished_workers = [&](std::chrono::steady_clock::time_point now) {
+      for (auto it = devices.begin(); it != devices.end();) {
+        if (it->second.done->load(std::memory_order_acquire)) {
+          // Back off retries for attached devices without an active VoidLink listener
+          // so charging an iPhone/iPad doesn't churn OS threads every second.
+          retry_after[it->first] = now + 4s;
+          it = devices.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    };
+
+    bool use_listen_mode = true;
     while (!stop.stop_requested()) {
-      std::erase_if(devices, [](const auto &entry) {
-        return entry.second.done->load(std::memory_order_acquire);
-      });
+      reap_finished_workers(std::chrono::steady_clock::now());
+
+      if (use_listen_mode) {
+        try {
+          auto listen_sock = open_mux(reusable_io, mux_socket_path);
+          const auto listen_reply = mux_request(listen_sock, "Listen", {}, stop);
+          const auto *num = plist_value(listen_reply, "Number");
+          if (!num || num->get_value<int>(-1) != 0) {
+            use_listen_mode = false;
+            continue;
+          }
+
+          std::unordered_map<unsigned, bool> attached_usb_ids;
+          while (!stop.stop_requested()) {
+            const auto now = std::chrono::steady_clock::now();
+            reap_finished_workers(now);
+            for (const auto &[id, _] : attached_usb_ids) {
+              spawn_device_if_ready(id, now);
+            }
+
+            // When no USB iOS device is attached, block indefinitely on the usbmuxd Listen socket
+            // and shutdown wake-pipe (0 idle CPU wakeups/sec). When a device is attached, wake
+            // every 2s to reap exited workers or retry connecting once VoidLink opens.
+            const int wait_ms = attached_usb_ids.empty() ? -1 : 2000;
+            const bool readable = poll_readable(listen_sock.native_handle(), wake_pipe.fds[0], wait_ms);
+            wake_pipe.drain();
+            if (stop.stop_requested()) {
+              break;
+            }
+            if (!readable) {
+              continue;
+            }
+
+            const auto event = read_mux_plist_frame(listen_sock, stop);
+            const auto *msg_type = plist_value(event, "MessageType");
+            if (!msg_type) {
+              continue;
+            }
+            if (msg_type->data() == "Attached") {
+              const auto *props = plist_value(event, "Properties");
+              const auto *connection = props ? plist_value(*props, "ConnectionType") : nullptr;
+              const auto *id_field = plist_value(event, "DeviceID");
+              if (!id_field && props) {
+                id_field = plist_value(*props, "DeviceID");
+              }
+              const auto id = id_field ? id_field->get_value<unsigned>(0) : 0;
+              if (id && connection && connection->data() == "USB") {
+                attached_usb_ids[id] = true;
+                retry_after.erase(id);
+                spawn_device_if_ready(id, std::chrono::steady_clock::now());
+              }
+            } else if (msg_type->data() == "Detached") {
+              const auto *id_field = plist_value(event, "DeviceID");
+              const auto id = id_field ? id_field->get_value<unsigned>(0) : 0;
+              if (id) {
+                attached_usb_ids.erase(id);
+                retry_after.erase(id);
+                devices.erase(id);
+              }
+            }
+          }
+          continue;
+        } catch (const std::exception &) {
+          // Mock servers (e.g. unit tests) that only implement ListDevices close on Listen;
+          // if usbmuxd is temporarily restarting, reconnect after a brief wait.
+          if (mux_socket_path != default_mux_socket_path) {
+            use_listen_mode = false;
+            continue;
+          }
+        }
+        poll_readable(-1, wake_pipe.fds[0], 3000);
+        wake_pipe.drain();
+        continue;
+      }
+
+      // Fallback ListDevices polling path (used only by non-Listen mock servers).
       try {
-        asio::io_context io;
-        auto socket = open_mux(io, mux_socket_path);
+        auto socket = open_mux(reusable_io, mux_socket_path);
         const auto response = mux_request(socket, "ListDevices", {}, stop);
         const auto *list = plist_value(response, "DeviceList");
         if (list) {
+          const auto now = std::chrono::steady_clock::now();
           for (const auto &[type, device] : *list) {
             if (stop.stop_requested() || devices.size() >= 8) {
               break;
@@ -714,24 +904,17 @@ namespace usb_stream_tunnel {
               id_field = plist_value(*props, "DeviceID");
             }
             const auto id = id_field ? id_field->get_value<unsigned>(0) : 0;
-            if (!id || !connection || connection->data() != "USB" || devices.contains(id)) {
+            if (!id || !connection || connection->data() != "USB") {
               continue;
             }
-            auto session = make_session();
-            devices.try_emplace(
-              id,
-              [mux_socket_path, id, session = std::move(session), host_id, host_name, local, ports, make_session](util::stop_token device_stop) {
-                run_device(device_stop, mux_socket_path, id, session, host_id, host_name, local, ports, make_session);
-              }
-            );
+            spawn_device_if_ready(id, now);
           }
         }
       } catch (const std::exception &) {
         // usbmuxd may be temporarily restarting or no iPad listener is active yet.
       }
-      for (int i = 0; i < 15 && !stop.stop_requested(); ++i) {
-        std::this_thread::sleep_for(100ms);
-      }
+      poll_readable(-1, wake_pipe.fds[0], 1500);
+      wake_pipe.drain();
     }
   }
 

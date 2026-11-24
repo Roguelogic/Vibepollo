@@ -21,6 +21,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Dashboard & Live Sessions
 - (NSString *)fetchDashboardSnapshotJSON;
+- (NSString *)fetchDashboardSnapshotJSONIncludingHostStats:(BOOL)includeHostStats
+  NS_SWIFT_NAME(fetchDashboardSnapshotJSON(includeHostStats:));
 - (void)openScreenCapturePrivacySettings;
 - (void)openAccessibilityPrivacySettings;
 - (BOOL)pairWithPIN:(NSString *)pin deviceName:(NSString *)deviceName;

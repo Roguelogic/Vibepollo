@@ -77,7 +77,8 @@ typedef struct {
 }
 
 // AVFoundation microphone capture properties
-@property (nonatomic, assign, nullable) AVCaptureSession *audioCaptureSession;  ///< AVFoundation capture session for microphone input
+@property (nonatomic, retain, nullable) AVCaptureSession *audioCaptureSession;  ///< AVFoundation capture session for microphone input
+@property (nonatomic, retain, nullable) AVCaptureAudioDataOutput *audioDataOutput;  ///< Audio output delegate holder for clean teardown
 @property (nonatomic, assign, nullable) AVCaptureConnection *audioConnection;  ///< Audio connection within the capture session
 @property (nonatomic, assign) BOOL hostAudioEnabled;  ///< Whether host audio playback should be enabled (affects tap mute behavior)
 

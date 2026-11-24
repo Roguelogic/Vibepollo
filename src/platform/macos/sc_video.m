@@ -112,10 +112,12 @@ void macos_sc_set_cursor_visible(bool visible) {
       CFRelease(_latestFrame);
     }
     _latestFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
-    if (_keepaliveFrame != NULL) {
-      CFRelease(_keepaliveFrame);
+    if (_keepalive != nil) {
+      if (_keepaliveFrame != NULL) {
+        CFRelease(_keepaliveFrame);
+      }
+      _keepaliveFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
     }
-    _keepaliveFrame = (CMSampleBufferRef) CFRetain(sampleBuffer);
   }
   if (_frameSource != nil) {
     dispatch_source_merge_data(_frameSource, 1);

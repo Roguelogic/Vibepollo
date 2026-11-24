@@ -81,8 +81,11 @@ namespace {
   std::optional<cpu_ticks_t> read_cpu_ticks() {
     host_cpu_load_info_data_t load {};
     mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
-    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
-                        reinterpret_cast<host_info_t>(&load), &count) != KERN_SUCCESS) {
+    const mach_port_t host = mach_host_self();
+    const kern_return_t kr = host_statistics(host, HOST_CPU_LOAD_INFO,
+                                             reinterpret_cast<host_info_t>(&load), &count);
+    mach_port_deallocate(mach_task_self(), host);
+    if (kr != KERN_SUCCESS) {
       return std::nullopt;
     }
     cpu_ticks_t t;
@@ -103,14 +106,17 @@ namespace {
     m.total_bytes = sysctl_u64("hw.memsize");
     if (!m.total_bytes) return std::nullopt;
 
+    const mach_port_t host = mach_host_self();
     vm_size_t page_size = 0;
-    host_page_size(mach_host_self(), &page_size);
+    host_page_size(host, &page_size);
     if (!page_size) page_size = 4096;
 
     vm_statistics64_data_t stats {};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                          reinterpret_cast<host_info64_t>(&stats), &count) != KERN_SUCCESS) {
+    const kern_return_t kr = host_statistics64(host, HOST_VM_INFO64,
+                                               reinterpret_cast<host_info64_t>(&stats), &count);
+    mach_port_deallocate(mach_task_self(), host);
+    if (kr != KERN_SUCCESS) {
       return std::nullopt;
     }
     // "Used" approximates Activity Monitor's App Memory + Wired + Compressed.

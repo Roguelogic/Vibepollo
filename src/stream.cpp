@@ -879,6 +879,10 @@ namespace stream {
 
     ~session_t() {
       unregister_from_broadcast();
+      // Reset socket QoS guards before broadcast_ref.release() can close the underlying
+      // UDP sockets so ~qos_t() never issues setsockopt() on a closed or reused FD.
+      audio.qos.reset();
+      video.qos.reset();
       // Drop broadcast_ref before any member of session_t is destroyed so end_broadcast()
       // joins video/audio/control/recv threads while stats, shutdown_event, and buffers remain valid.
       if (broadcast_ref) {
@@ -3606,6 +3610,17 @@ namespace stream {
       return -1;
     }
 
+    auto rollback_sockets = util::fail_guard([&ctx]() {
+      boost::system::error_code close_ec;
+      if (ctx.audio_sock.is_open()) {
+        ctx.audio_sock.close(close_ec);
+      }
+      if (ctx.video_sock.is_open()) {
+        ctx.video_sock.close(close_ec);
+      }
+      ctx.control_server._host.reset();
+    });
+
     ctx.video_sock.open(protocol, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Video server: "sv << ec.message();
@@ -3665,6 +3680,8 @@ namespace stream {
     // Restart the io_context in case it was stopped from a previous session.
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
+
+    rollback_sockets.disable();
 
     ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx)};
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx)};

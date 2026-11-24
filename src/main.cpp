@@ -179,11 +179,17 @@ namespace {
 
     void run() {
       std::unique_lock lock {mutex_};
-      while (state_ == state_e::idle && (!signal_requested_ || !signal_requested_->load(std::memory_order_relaxed))) {
-        // The Linux signal-wait thread may publish shutdown before main reaches
-        // shutdown_event->view(). Poll the flag so that early startup remains
-        // covered without doing lock-taking work in asynchronous signal context.
-        cv_.wait_for(lock, std::chrono::milliseconds(50));
+      if (!signal_requested_) {
+        cv_.wait(lock, [this] {
+          return state_ != state_e::idle;
+        });
+      } else {
+        while (state_ == state_e::idle && !signal_requested_->load(std::memory_order_relaxed)) {
+          // The Linux signal-wait thread may publish shutdown before main reaches
+          // shutdown_event->view(). Poll the flag so that early startup remains
+          // covered without doing lock-taking work in asynchronous signal context.
+          cv_.wait_for(lock, std::chrono::milliseconds(50));
+        }
       }
       if (state_ == state_e::idle) {
         state_ = state_e::armed;
@@ -529,7 +535,13 @@ int main(int argc, char *argv[]) {
   auto shutdown_event = mail::man->event<bool>(mail::shutdown);
   auto &shutdown_signal_requested = lifetime::shutdown_signal_requested;
   shutdown_phase::tracker_t shutdown_phase_state;
+#ifdef __APPLE__
+  // macOS handles SIGINT/SIGTERM synchronously on the GCD main queue and arms
+  // shutdown_deadline directly, so avoid 20 Hz idle polling of signal_requested_.
+  shutdown_deadline_t shutdown_deadline {nullptr, supervised_machine_host, shutdown_phase_state};
+#else
   shutdown_deadline_t shutdown_deadline {&shutdown_signal_requested, supervised_machine_host, shutdown_phase_state};
+#endif
   // Later guards drain stream/probe users first, including on startup returns.
   // Final Vulkan instance release must run before the owned deadline completes:
   // a vendor wait during static teardown would otherwise escape supervision.
@@ -772,12 +784,13 @@ int main(int argc, char *argv[]) {
       update::trigger_check(true);
     }
 
-    auto schedule_periodic = std::make_shared<std::function<void()>>();
-    *schedule_periodic = [schedule_periodic]() {
-      update::periodic();
-      task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(30));
+    struct periodic_update_runner_t {
+      static void tick() {
+        update::periodic();
+        task_pool.pushDelayed(&periodic_update_runner_t::tick, std::chrono::seconds(60));
+      }
     };
-    task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(30));
+    task_pool.pushDelayed(&periodic_update_runner_t::tick, std::chrono::seconds(60));
   }
 #endif
 
@@ -787,13 +800,17 @@ int main(int argc, char *argv[]) {
   std::signal(SIGINT, SIG_IGN);
   std::signal(SIGTERM, SIG_IGN);
 
+  auto *shutdown_deadline_ptr = &shutdown_deadline;
+
   static dispatch_source_t s_macos_sigint = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, dispatch_get_main_queue());
   if (s_macos_sigint) {
     dispatch_source_set_event_handler(s_macos_sigint, ^{
       shutdown_signal_requested.store(true, std::memory_order_relaxed);
+      shutdown_deadline_ptr->arm();
       BOOST_LOG(info) << "Interrupt handler called"sv;
       proc::proc.terminate();
       shutdown_event->raise(true);
+      platf::wake_main_event_loop();
     });
     dispatch_resume(s_macos_sigint);
   }
@@ -817,8 +834,10 @@ int main(int argc, char *argv[]) {
         std::_Exit(0);
       }
       shutdown_signal_requested.store(true, std::memory_order_relaxed);
+      shutdown_deadline_ptr->arm();
       BOOST_LOG(info) << "Terminate handler called"sv;
       shutdown_event->raise(true);
+      platf::wake_main_event_loop();
     });
     dispatch_resume(s_macos_sigterm);
   }
@@ -1282,6 +1301,10 @@ int main(int argc, char *argv[]) {
       });
     }
   }
+  shutdown_event->subscribe([]() {
+    platf::wake_main_event_loop();
+    return false;
+  });
   platf::run_main_event_loop([&shutdown_event]() {
     return shutdown_event->peek();
   });

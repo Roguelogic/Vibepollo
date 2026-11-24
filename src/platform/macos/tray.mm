@@ -217,8 +217,8 @@ int tray_init(struct tray *tray) {
 int tray_loop(int blocking) {
   if (!exit_requested) {
     @autoreleasepool {
-      // Even when blocking, wake periodically so callers can also watch their own shutdown state.
-      NSDate *until = blocking ? [NSDate dateWithTimeIntervalSinceNow:0.5] : NSDate.distantPast;
+      // tray_exit() posts a synthetic NSEvent to wake a blocking loop immediately.
+      NSDate *until = blocking ? NSDate.distantFuture : NSDate.distantPast;
       NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
       if (event != nil) {
         [NSApp sendEvent:event];

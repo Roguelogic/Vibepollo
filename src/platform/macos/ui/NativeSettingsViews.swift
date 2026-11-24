@@ -1476,14 +1476,26 @@ private struct DevicesPane: View {
     }
     if client.lastSeen > 0 {
       let date = Date(timeIntervalSince1970: TimeInterval(client.lastSeen))
-      let formatter = RelativeDateTimeFormatter()
-      formatter.locale = Locale(identifier: l10n.isKo ? "ko_KR" : "en_US")
-      formatter.unitsStyle = .full
+      let formatter = l10n.isKo ? Self.relativeLastSeenKoFormatter : Self.relativeLastSeenEnFormatter
       let rel = formatter.localizedString(for: date, relativeTo: Date())
       return l10n.pick("연결 안 됨 · 마지막 접속 \(rel)", "Not Connected · Last seen \(rel)")
     }
     return l10n.pick("연결 안 됨", "Not Connected")
   }
+
+  private static let relativeLastSeenKoFormatter: RelativeDateTimeFormatter = {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.locale = Locale(identifier: "ko_KR")
+    formatter.unitsStyle = .full
+    return formatter
+  }()
+
+  private static let relativeLastSeenEnFormatter: RelativeDateTimeFormatter = {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.locale = Locale(identifier: "en_US")
+    formatter.unitsStyle = .full
+    return formatter
+  }()
 
   private func commitInlineRename(for client: PairedClientItem) {
     let target = String(editingName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
@@ -2679,14 +2691,27 @@ private struct TelemetryDetailView: View {
     }
   }
 
+  private static let historyDateKoFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "ko_KR")
+    f.dateStyle = .short
+    f.timeStyle = .short
+    return f
+  }()
+
+  private static let historyDateEnFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US")
+    f.dateStyle = .short
+    f.timeStyle = .short
+    return f
+  }()
+
   private func historySubtitle(_ item: SessionHistoryItem) -> String {
     let mins = max(1, Int(item.durationSeconds / 60.0))
     let dateStr: String = {
       guard item.startTimeUnix > 0 else { return "" }
-      let f = DateFormatter()
-      f.locale = Locale(identifier: l10n.isKo ? "ko_KR" : "en_US")
-      f.dateStyle = .short
-      f.timeStyle = .short
+      let f = l10n.isKo ? Self.historyDateKoFormatter : Self.historyDateEnFormatter
       return f.string(from: Date(timeIntervalSince1970: item.startTimeUnix))
     }()
     let spec = "\(item.width)×\(item.height) \(item.targetFps)Hz · \(item.codec)\(item.hdr ? " HDR" : "") · \(mins)\(l10n.pick("분", "m"))"

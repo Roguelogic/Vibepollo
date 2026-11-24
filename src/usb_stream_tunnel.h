@@ -53,6 +53,8 @@ namespace usb_stream_tunnel {
 
   bool append_video_datagram(std::vector<char> &batch, std::string_view prefix, std::string_view payload);
 
+  void wake_shutdown();
+
   void run(
     util::stop_token stop,
     std::string host_id,

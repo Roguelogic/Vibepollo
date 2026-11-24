@@ -251,12 +251,15 @@ namespace platf {
 
   BOOST_LOG(info) << "Setting up microphone: "sv << [[device localizedName] UTF8String] << " with "sv << sampleRate << "Hz, "sv << frameSize << " frames, "sv << (int) channels << " channels"sv;
 
-  self.audioCaptureSession = [[AVCaptureSession alloc] init];
+  AVCaptureSession *captureSession = [[AVCaptureSession alloc] init];
+  self.audioCaptureSession = captureSession;
+  [captureSession release];
 
-  NSError *nsError;
+  NSError *nsError = nil;
   AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&nsError];
   if (audioInput == nil) {
     BOOST_LOG(error) << "Failed to create audio input from device: "sv << (nsError ? [[nsError localizedDescription] UTF8String] : "unknown error"sv);
+    self.audioCaptureSession = nil;
     return -1;
   }
 
@@ -265,7 +268,7 @@ namespace platf {
     BOOST_LOG(debug) << "Successfully added audio input to capture session"sv;
   } else {
     BOOST_LOG(error) << "Cannot add audio input to capture session"sv;
-    [audioInput dealloc];
+    self.audioCaptureSession = nil;
     return -1;
   }
 
@@ -281,21 +284,24 @@ namespace platf {
   }];
   BOOST_LOG(debug) << "Configured audio output with settings: "sv << sampleRate << "Hz, "sv << (int) channels << " channels, 32-bit float"sv;
 
-  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
+  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
   dispatch_queue_t recordingQueue = dispatch_queue_create("audioSamplingQueue", qos);
 
   [audioOutput setSampleBufferDelegate:self queue:recordingQueue];
+  dispatch_release(recordingQueue);
 
   if ([self.audioCaptureSession canAddOutput:audioOutput]) {
     [self.audioCaptureSession addOutput:audioOutput];
     BOOST_LOG(debug) << "Successfully added audio output to capture session"sv;
   } else {
     BOOST_LOG(error) << "Cannot add audio output to capture session"sv;
-    [audioInput release];
+    [audioOutput setSampleBufferDelegate:nil queue:NULL];
     [audioOutput release];
+    self.audioCaptureSession = nil;
     return -1;
   }
 
+  self.audioDataOutput = audioOutput;
   self.audioConnection = [audioOutput connectionWithMediaType:AVMediaTypeAudio];
 
   // Initialize buffer and signal
@@ -305,7 +311,6 @@ namespace platf {
   [self.audioCaptureSession startRunning];
   BOOST_LOG(info) << "Audio capture session started successfully"sv;
 
-  [audioInput release];
   [audioOutput release];
 
   return 0;
@@ -323,19 +328,23 @@ namespace platf {
   didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
          fromConnection:(AVCaptureConnection *)connection {
   if (connection == self.audioConnection) {
-    AudioBufferList audioBufferList;
-    CMBlockBufferRef blockBuffer;
+    AudioBufferList audioBufferList {};
+    CMBlockBufferRef blockBuffer = NULL;
 
-    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, NULL, &audioBufferList, sizeof(audioBufferList), NULL, NULL, 0, &blockBuffer);
-
-    // NSAssert(audioBufferList.mNumberBuffers == 1, @"Expected interleaved PCM format but buffer contained %u streams", audioBufferList.mNumberBuffers);
-
-    // this is safe, because an interleaved PCM stream has exactly one buffer,
-    // and we don't want to do sanity checks in a performance critical exec path
-    AudioBuffer audioBuffer = audioBufferList.mBuffers[0];
-
-    TPCircularBufferProduceBytes(&self->audioSampleBuffer, audioBuffer.mData, audioBuffer.mDataByteSize);
-    dispatch_semaphore_signal(self->audioSemaphore);
+    const OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      sampleBuffer, NULL, &audioBufferList, sizeof(audioBufferList), NULL, NULL, 0, &blockBuffer
+    );
+    if (status == noErr && audioBufferList.mNumberBuffers > 0) {
+      // Interleaved PCM stream has a single buffer.
+      AudioBuffer audioBuffer = audioBufferList.mBuffers[0];
+      if (audioBuffer.mData != nullptr && audioBuffer.mDataByteSize > 0) {
+        TPCircularBufferProduceBytes(&self->audioSampleBuffer, audioBuffer.mData, audioBuffer.mDataByteSize);
+        dispatch_semaphore_signal(self->audioSemaphore);
+      }
+    }
+    if (blockBuffer != NULL) {
+      CFRelease(blockBuffer);
+    }
   }
 }
 
@@ -526,6 +535,10 @@ namespace platf {
   [self cleanupSystemTapContext:nil];
 
   // Cleanup microphone session (AVFoundation path)
+  if (self.audioDataOutput) {
+    [self.audioDataOutput setSampleBufferDelegate:nil queue:NULL];
+    self.audioDataOutput = nil;
+  }
   if (self.audioCaptureSession) {
     [self.audioCaptureSession stopRunning];
     self.audioCaptureSession = nil;
@@ -841,6 +854,7 @@ namespace platf {
   if (status != kAudioHardwareNoError) {
     BOOST_LOG(error) << "AudioDeviceStart failed: " << ca::Status(status);
     AudioDeviceDestroyIOProcID(self->aggregateDeviceID, self->ioProcID);
+    self->ioProcID = NULL;
     return status;
   }
 

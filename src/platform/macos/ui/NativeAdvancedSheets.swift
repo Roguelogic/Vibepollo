@@ -4,22 +4,40 @@ import SwiftUI
 // MARK: - 1. 소프트웨어 업데이트 하위 페이지 (Apple macOS Software Update 1:1)
 
 private enum SoftwareUpdateTextHelper {
-  static func formatBytes(_ bytes: Int64) -> String {
-    guard bytes > 0 else { return "" }
+  private static let byteFormatter: ByteCountFormatter = {
     let formatter = ByteCountFormatter()
     formatter.allowedUnits = [.useMB, .useGB]
     formatter.countStyle = .file
-    return formatter.string(fromByteCount: bytes)
+    return formatter
+  }()
+
+  private static let lastCheckedKoFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "ko_KR")
+    formatter.doesRelativeDateFormatting = true
+    formatter.dateStyle = .short
+    formatter.timeStyle = .short
+    return formatter
+  }()
+
+  private static let lastCheckedEnFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.doesRelativeDateFormatting = true
+    formatter.dateStyle = .short
+    formatter.timeStyle = .short
+    return formatter
+  }()
+
+  static func formatBytes(_ bytes: Int64) -> String {
+    guard bytes > 0 else { return "" }
+    return byteFormatter.string(fromByteCount: bytes)
   }
 
   static func formatLastChecked(_ unix: Int64, isKo: Bool) -> String? {
     guard unix > 0 else { return nil }
     let date = Date(timeIntervalSince1970: TimeInterval(unix))
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: isKo ? "ko_KR" : "en_US_POSIX")
-    formatter.doesRelativeDateFormatting = true
-    formatter.dateStyle = .short
-    formatter.timeStyle = .short
+    let formatter = isKo ? lastCheckedKoFormatter : lastCheckedEnFormatter
     return formatter.string(from: date)
   }
 

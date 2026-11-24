@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -115,6 +116,7 @@ namespace session_history::sampler {
     std::unordered_map<std::string, aggregator_t> g_aggregators;
 
     std::mutex g_active_mutex;
+    std::condition_variable g_active_cv;
     std::unordered_map<std::string, session_metadata_t> g_active_sessions;
 
     constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(2);
@@ -299,21 +301,34 @@ namespace session_history::sampler {
     }
 
     void sampler_loop() {
+      std::unique_lock lk {g_active_mutex};
       while (g_running.load(std::memory_order_acquire)) {
-        bool has_active = false;
-        {
-          std::lock_guard lk {g_active_mutex};
-          has_active = !g_active_sessions.empty();
+        if (g_active_sessions.empty()) {
+          g_active_cv.wait(lk, []() {
+            return !g_running.load(std::memory_order_acquire) || !g_active_sessions.empty();
+          });
+          if (!g_running.load(std::memory_order_acquire)) {
+            break;
+          }
         }
 
-        if (has_active && writer::is_available()) {
+        lk.unlock();
+        if (writer::is_available()) {
           const double ts = storage::now_unix();
           const auto host = host_stats::latest();
           sample_rtsp_sessions(ts, host);
           sample_webrtc_sessions(ts, host);
         }
+        lk.lock();
 
-        std::this_thread::sleep_for(SAMPLE_INTERVAL);
+        if (!g_running.load(std::memory_order_acquire)) {
+          break;
+        }
+        if (!g_active_sessions.empty()) {
+          g_active_cv.wait_for(lk, SAMPLE_INTERVAL, []() {
+            return !g_running.load(std::memory_order_acquire) || g_active_sessions.empty();
+          });
+        }
       }
     }
 
@@ -329,6 +344,10 @@ namespace session_history::sampler {
 
   void shutdown() {
     g_running.store(false, std::memory_order_release);
+    {
+      std::lock_guard lk {g_active_mutex};
+    }
+    g_active_cv.notify_all();
     if (g_sampler_thread.joinable()) {
       g_sampler_thread.join();
     }
@@ -344,8 +363,11 @@ namespace session_history::sampler {
   }
 
   void register_session(const session_metadata_t &metadata) {
-    std::lock_guard lk {g_active_mutex};
-    g_active_sessions[metadata.uuid] = metadata;
+    {
+      std::lock_guard lk {g_active_mutex};
+      g_active_sessions[metadata.uuid] = metadata;
+    }
+    g_active_cv.notify_one();
   }
 
   void unregister_session(const std::string &uuid) {
@@ -353,6 +375,7 @@ namespace session_history::sampler {
       std::lock_guard lk {g_active_mutex};
       g_active_sessions.erase(uuid);
     }
+    g_active_cv.notify_one();
     {
       std::lock_guard lk {g_aggregators_mutex};
       g_aggregators.erase(uuid);

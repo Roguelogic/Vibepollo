@@ -120,12 +120,28 @@ namespace platf {
     });
   }
 
+  void wake_main_event_loop() {
+    @autoreleasepool {
+      if (NSApp != nil) {
+        NSEvent *wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                           location:NSZeroPoint
+                                      modifierFlags:0
+                                          timestamp:0
+                                       windowNumber:0
+                                            context:nil
+                                            subtype:0
+                                              data1:0
+                                              data2:0];
+        [NSApp postEvent:wake atStart:YES];
+      }
+    }
+  }
+
   void run_main_event_loop(const std::function<bool()> &should_exit) {
     ensure_appkit_session();
     while (!should_exit()) {
       @autoreleasepool {
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:0.5];
-        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
+        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:NSDate.distantFuture inMode:NSDefaultRunLoopMode dequeue:YES];
         if (event != nil) {
           [NSApp sendEvent:event];
           [NSApp updateWindows];
@@ -142,16 +158,18 @@ namespace platf {
 
     // launchd stops the login agent when it's unregistered, so carry on in a copy of our own.
     void launch_replacement() {
-      NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
-      configuration.createsNewApplicationInstance = YES;
-      configuration.activates = NO;
-      [NSWorkspace.sharedWorkspace openApplicationAtURL:NSBundle.mainBundle.bundleURL
-                                          configuration:configuration
-                                      completionHandler:^(NSRunningApplication *, NSError *launch_error) {
-                                        if (launch_error != nil) {
-                                          BOOST_LOG(error) << "Couldn't start Vibepollo again without Open at Login: "sv << launch_error.localizedDescription.UTF8String;
-                                        }
-                                      }];
+      @autoreleasepool {
+        NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+        configuration.createsNewApplicationInstance = YES;
+        configuration.activates = NO;
+        [NSWorkspace.sharedWorkspace openApplicationAtURL:NSBundle.mainBundle.bundleURL
+                                            configuration:configuration
+                                        completionHandler:^(NSRunningApplication *, NSError *launch_error) {
+                                          if (launch_error != nil) {
+                                            BOOST_LOG(error) << "Couldn't start Vibepollo again without Open at Login: "sv << launch_error.localizedDescription.UTF8String;
+                                          }
+                                        }];
+      }
     }
 
     int run(const std::vector<std::string> &args) {
@@ -896,11 +914,13 @@ namespace platf {
   }
 
   bool opens_at_login() {
-    if (@available(macOS 13.0, *)) {
-      return [SMAppService mainAppService].status == SMAppServiceStatusEnabled ||
-             login_agent().status == SMAppServiceStatusEnabled;
+    @autoreleasepool {
+      if (@available(macOS 13.0, *)) {
+        return [SMAppService mainAppService].status == SMAppServiceStatusEnabled ||
+               login_agent().status == SMAppServiceStatusEnabled;
+      }
+      return false;
     }
-    return false;
   }
 
   int run_loginscreen_agent_helper(int argc, char *argv[]) {
@@ -1119,42 +1139,44 @@ namespace platf {
     }
 
     bool extract_bundle_signing_identity(const fs::path &bundle_path, std::string &out_bundle_id, std::string &out_team_id) {
-      out_bundle_id.clear();
-      out_team_id.clear();
+      @autoreleasepool {
+        out_bundle_id.clear();
+        out_team_id.clear();
 
-      NSURL *bundle_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:bundle_path.c_str()]];
-      if (bundle_url == nil) {
-        return false;
-      }
-
-      SecStaticCodeRef static_code = nullptr;
-      if (SecStaticCodeCreateWithPath((__bridge CFURLRef) bundle_url, kSecCSDefaultFlags, &static_code) != errSecSuccess || !static_code) {
-        return false;
-      }
-
-      CFDictionaryRef signing_info = nullptr;
-      const OSStatus copy_status = SecCodeCopySigningInformation(static_code, kSecCSSigningInformation, &signing_info);
-      CFRelease(static_code);
-      if (copy_status != errSecSuccess || !signing_info) {
-        return false;
-      }
-
-      if (const auto id_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoIdentifier));
-          id_ref && CFGetTypeID(id_ref) == CFStringGetTypeID()) {
-        const NSString *ns_id = (__bridge NSString *) id_ref;
-        if (ns_id.UTF8String) {
-          out_bundle_id = ns_id.UTF8String;
+        NSURL *bundle_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:bundle_path.c_str()]];
+        if (bundle_url == nil) {
+          return false;
         }
-      }
-      if (const auto team_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoTeamIdentifier));
-          team_ref && CFGetTypeID(team_ref) == CFStringGetTypeID()) {
-        const NSString *ns_team = (__bridge NSString *) team_ref;
-        if (ns_team.UTF8String) {
-          out_team_id = ns_team.UTF8String;
+
+        SecStaticCodeRef static_code = nullptr;
+        if (SecStaticCodeCreateWithPath((__bridge CFURLRef) bundle_url, kSecCSDefaultFlags, &static_code) != errSecSuccess || !static_code) {
+          return false;
         }
+
+        CFDictionaryRef signing_info = nullptr;
+        const OSStatus copy_status = SecCodeCopySigningInformation(static_code, kSecCSSigningInformation, &signing_info);
+        CFRelease(static_code);
+        if (copy_status != errSecSuccess || !signing_info) {
+          return false;
+        }
+
+        if (const auto id_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoIdentifier));
+            id_ref && CFGetTypeID(id_ref) == CFStringGetTypeID()) {
+          const NSString *ns_id = (__bridge NSString *) id_ref;
+          if (ns_id.UTF8String) {
+            out_bundle_id = ns_id.UTF8String;
+          }
+        }
+        if (const auto team_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoTeamIdentifier));
+            team_ref && CFGetTypeID(team_ref) == CFStringGetTypeID()) {
+          const NSString *ns_team = (__bridge NSString *) team_ref;
+          if (ns_team.UTF8String) {
+            out_team_id = ns_team.UTF8String;
+          }
+        }
+        CFRelease(signing_info);
+        return !out_bundle_id.empty();
       }
-      CFRelease(signing_info);
-      return !out_bundle_id.empty();
     }
 
     bool verify_candidate_bundle(const fs::path &candidate_app, const std::string &expected_team_id, std::string &out_detail) {
@@ -1543,6 +1565,7 @@ namespace platf {
   }
 
   bool set_opens_at_login(bool enabled) {
+    @autoreleasepool {
     if (@available(macOS 13.0, *)) {
       SMAppService *main_app = [SMAppService mainAppService];
       SMAppService *legacy_agent = login_agent();
@@ -1589,6 +1612,7 @@ namespace platf {
 
     BOOST_LOG(warning) << "Open at Login requires macOS 13 or later"sv;
     return false;
+    }
   }
 
   namespace {
@@ -1712,12 +1736,17 @@ namespace platf {
       return true;
     }
 
-    // Declaring user activity finishes a dark wake and turns the displays on. The assertion
-    // expires on its own after the display sleep delay.
-    IOPMAssertionID activity = kIOPMNullAssertionID;
-    if (IOPMAssertionDeclareUserActivity(CFSTR("Vibepollo is waking the displays for a stream"), kIOPMUserActiveLocal, &activity) != kIOReturnSuccess) {
-      BOOST_LOG(warning) << "Couldn't wake the displays for capture"sv;
-      return false;
+    // Declaring user activity finishes a dark wake and turns the displays on. Reuse the
+    // tracked assertion ID per IOPMLib.h so repeated wakes update one assertion instead of
+    // accumulating distinct assertion entries in powerd.
+    static std::mutex wake_assertion_mutex;
+    static IOPMAssertionID wake_assertion_id = kIOPMNullAssertionID;
+    {
+      std::lock_guard lock {wake_assertion_mutex};
+      if (IOPMAssertionDeclareUserActivity(CFSTR("Vibepollo is waking the displays for a stream"), kIOPMUserActiveLocal, &wake_assertion_id) != kIOReturnSuccess) {
+        BOOST_LOG(warning) << "Couldn't wake the displays for capture"sv;
+        return false;
+      }
     }
 
     // A Mac without a screen of its own (a headless Mac mini, a closed MacBook) has none to wait for.
@@ -1771,7 +1800,9 @@ namespace platf {
         BOOST_LOG(warning) << "Couldn't watch for sleep; streams will just stop when the Mac sleeps"sv;
         return;
       }
-      IONotificationPortSetDispatchQueue(sleep_watch.port, dispatch_queue_create("dev.vibepollo.sleep", DISPATCH_QUEUE_SERIAL));
+      dispatch_queue_t sleep_queue = dispatch_queue_create("dev.vibepollo.sleep", DISPATCH_QUEUE_SERIAL);
+      IONotificationPortSetDispatchQueue(sleep_watch.port, sleep_queue);
+      dispatch_release(sleep_queue);
     });
   }
 
@@ -1827,9 +1858,13 @@ namespace platf {
       lid_watch.closed_handler = std::move(closed);
       lid_watch.opened_handler = std::move(opened);
       lid_watch.port = IONotificationPortCreate(kIOMainPortDefault);
-      IONotificationPortSetDispatchQueue(lid_watch.port, dispatch_queue_create("dev.vibepollo.lid", DISPATCH_QUEUE_SERIAL));
+      dispatch_queue_t lid_queue = dispatch_queue_create("dev.vibepollo.lid", DISPATCH_QUEUE_SERIAL);
+      IONotificationPortSetDispatchQueue(lid_watch.port, lid_queue);
+      dispatch_release(lid_queue);
       if (IOServiceAddInterestNotification(lid_watch.port, root, kIOGeneralInterest, root_domain_message, nullptr, &lid_watch.notifier) != KERN_SUCCESS) {
         BOOST_LOG(warning) << "Couldn't watch the lid; closing it won't end streams"sv;
+        IONotificationPortDestroy(lid_watch.port);
+        lid_watch.port = nullptr;
       }
       IOObjectRelease(root);
     });
@@ -2070,17 +2105,14 @@ namespace platf {
    * @param url The url to open.
    */
   void open_url(const std::string &url) {
-    boost::filesystem::path working_dir;
-    std::string cmd = R"(open ")" + url + R"(")";
-
-    bp::environment _env = bp::this_process::env();
-    std::error_code ec;
-    auto child = run_command(false, false, cmd, working_dir, _env, nullptr, ec, nullptr);
-    if (ec) {
-      BOOST_LOG(warning) << "Couldn't open url ["sv << url << "]: System: "sv << ec.message();
-    } else {
-      BOOST_LOG(info) << "Opened url ["sv << url << "]"sv;
-      child.detach();
+    @autoreleasepool {
+      NSString *ns_url_str = [NSString stringWithUTF8String:url.c_str()];
+      NSURL *ns_url = ns_url_str ? [NSURL URLWithString:ns_url_str] : nil;
+      if (ns_url != nil && [[NSWorkspace sharedWorkspace] openURL:ns_url]) {
+        BOOST_LOG(info) << "Opened url ["sv << url << "]"sv;
+      } else {
+        BOOST_LOG(warning) << "Couldn't open url ["sv << url << "]"sv;
+      }
     }
   }
 
@@ -2120,7 +2152,7 @@ namespace platf {
         policy.constraint = ns_to_abs(8'000'000);   // 8.0 ms deadline within one 120 Hz VSync
         policy.preemptible = TRUE;
         thread_policy_set(
-          mach_thread_self(),
+          pthread_mach_thread_np(pthread_self()),
           THREAD_TIME_CONSTRAINT_POLICY,
           reinterpret_cast<thread_policy_t>(&policy),
           THREAD_TIME_CONSTRAINT_POLICY_COUNT
@@ -2878,8 +2910,13 @@ namespace {
     }
 
     if (!visible) {
-      if (sWindow != nil && sWindow.alphaValue > 0.0) {
-        [sWindow setAlphaValue:0.0];
+      if (sWindow != nil) {
+        if (sWindow.alphaValue > 0.0) {
+          [sWindow setAlphaValue:0.0];
+        }
+        if (sWindow.visible) {
+          [sWindow orderOut:nil];
+        }
       }
       return;
     }
@@ -2912,6 +2949,7 @@ namespace {
       sView = [[VibepolloPenHoverView alloc] initWithFrame:rect];
       sView.distanceStep = -1;
       [sWindow setContentView:sView];
+      [sView release];
       [sWindow setAlphaValue:1.0];
       [sWindow orderFrontRegardless];
     }

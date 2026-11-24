@@ -244,14 +244,24 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    let closingWindow = self.window
     vibepollo_set_macos_native_ui_visible(false)
-    window?.makeFirstResponder(focusSink)
+    closingWindow?.makeFirstResponder(focusSink)
     HostStore.shared.stopWindowSession()
+    storeCancellable?.cancel()
+    storeCancellable = nil
+    closingWindow?.delegate = nil
+    self.focusSink = nil
+    self.window = nil
+    self.lastObservedRoute = nil
+    self.handledSheetWindows.removeAll()
 
-    // Return cleanly to menu-bar-only mode once the Settings window closes.
+    // Release the SwiftUI hosting tree once AppKit finishes closing the window,
+    // and return cleanly to menu-bar-only mode.
     DispatchQueue.main.async {
+      closingWindow?.contentViewController = nil
       let hasVisibleStandardWindow = NSApp.windows.contains { w in
-        w !== self.window && w.isVisible && w.canBecomeMain
+        w !== closingWindow && w.isVisible && w.canBecomeMain
       }
       if !hasVisibleStandardWindow {
         NSApp.setActivationPolicy(.accessory)

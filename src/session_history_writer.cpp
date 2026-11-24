@@ -265,7 +265,9 @@ namespace session_history::writer {
       bool had_remaining_samples = false;
       {
         std::unique_lock lk {g_queue_mutex};
-        g_queue_cv.wait_for(lk, 500ms, [] { return has_pending_commands(); });
+        g_queue_cv.wait(lk, [] {
+          return !g_running.load(std::memory_order_acquire) || has_pending_commands();
+        });
         if (!has_pending_commands()) {
           return batch;
         }
@@ -436,10 +438,10 @@ namespace session_history::writer {
       }
 
       if (committed) {
-        const bool saw_prune = std::any_of(batch.begin(), batch.end(), [](const write_cmd_t &cmd) {
-          return cmd.type == cmd_type::prune;
+        const bool should_checkpoint = std::any_of(batch.begin(), batch.end(), [](const write_cmd_t &cmd) {
+          return cmd.type == cmd_type::prune || cmd.type == cmd_type::delete_session;
         });
-        if (saw_prune) {
+        if (should_checkpoint) {
           storage::checkpoint(g_write_db.get());
           if (!g_history_db_path.empty()) {
             storage::tighten_history_db_permissions(g_history_db_path);
@@ -543,6 +545,7 @@ namespace session_history::writer {
         g_write_db.reset();
         return;
       }
+      (void) storage::recover_orphaned_sessions(g_write_db.get());
     }
     storage::tighten_history_db_permissions(g_history_db_path);
 
@@ -568,6 +571,9 @@ namespace session_history::writer {
 
     {
       std::lock_guard lk {g_db_mutex};
+      if (g_write_db) {
+        storage::checkpoint(g_write_db.get());
+      }
       g_write_db.reset();
       g_history_db_path.clear();
     }

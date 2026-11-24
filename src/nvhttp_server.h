@@ -26,7 +26,7 @@ namespace nvhttp {
       // Try to send close_notify without waiting for the peer. This destructor
       // can run on the only HTTPS I/O thread after a response has been sent.
       SimpleWeb::error_code ec;
-#if defined(__linux__) && !defined(_WIN32)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(_WIN32)
       lowest_layer().non_blocking(true, ec);
 #endif
       if (!ec) shutdown(ec);

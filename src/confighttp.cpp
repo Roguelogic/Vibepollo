@@ -1319,6 +1319,7 @@ namespace confighttp {
   std::mutex csrf_tokens_mutex;
   constexpr auto CSRF_TOKEN_SIZE = 32;
   constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);
+  constexpr std::size_t MAX_CSRF_TOKENS = 2048;
 
   std::string get_client_id(const req_https_t &request) {
     if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
@@ -1335,6 +1336,19 @@ namespace confighttp {
     });
     if (const auto existing = csrf_tokens.find(client_id); existing != csrf_tokens.end()) {
       return existing->second.token;
+    }
+
+    if (csrf_tokens.size() >= MAX_CSRF_TOKENS) {
+      const auto oldest = std::min_element(
+        csrf_tokens.begin(),
+        csrf_tokens.end(),
+        [](const auto &lhs, const auto &rhs) {
+          return lhs.second.expiration < rhs.second.expiration;
+        }
+      );
+      if (oldest != csrf_tokens.end()) {
+        csrf_tokens.erase(oldest);
+      }
     }
 
     std::string token = crypto::rand_alphabet(CSRF_TOKEN_SIZE);
@@ -4675,6 +4689,10 @@ namespace confighttp {
           converted = true;
         }
       } else {
+        if (!src_tmp.empty()) {
+          std::error_code del_ec {};
+          std::filesystem::remove(src_tmp, del_ec);
+        }
         // Leave a clear error on non-Windows when not PNG
         bad_request(response, request, "Cover must be PNG on this platform");
         return;

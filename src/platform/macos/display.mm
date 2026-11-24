@@ -136,6 +136,7 @@ namespace {
   }
 
   CMSampleBufferRef create_dummy_sample(int width, int height, OSType pixel_format) {
+    @autoreleasepool {
     const size_t w = width > 0 ? static_cast<size_t>(width) : 1920;
     const size_t h = height > 0 ? static_cast<size_t>(height) : 1080;
     const OSType fmt = pixel_format != 0 ? pixel_format : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -189,6 +190,7 @@ namespace {
     CFRelease(format_desc);
     CVPixelBufferRelease(pixel_buffer);
     return sample;
+    }
   }
 
   struct cg_stream_slot_t {
@@ -590,7 +592,8 @@ namespace platf {
       auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
       auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf, lock_cpu);
 
-      auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
+      // Keep previous pixel/sample buffer alive on the stack until the replacement pointers are installed.
+      temp_retain_av_img_t old_data_retainer(
         av_img->sample_buffer,
         av_img->pixel_buffer,
         av_img->data
@@ -610,8 +613,6 @@ namespace platf {
       av_img->pixel_pitch = av_img->width > 0 ? av_img->row_pitch / av_img->width : 0;
       av_img->frame_timestamp = frame_timestamp;
       av_img->host_processing_timestamp = host_processing_timestamp;
-
-      old_data_retainer = nullptr;
     }
 
     bool is_hdr() override {
@@ -703,13 +704,22 @@ namespace platf {
         state->last_frame = std::chrono::steady_clock::now();
         return true;
       } copy];
-      auto signal = [av_capture capture:on_frame];
+      dispatch_semaphore_t signal = nil;
+      @autoreleasepool {
+        signal = [av_capture capture:on_frame];
+        if (signal != nil) {
+          dispatch_retain(signal);
+        }
+      }
       [on_frame release];  // the capture keeps its own reference
       if (signal == nil) {
         return capture_e::error;
       }
       auto stop_capture_guard = util::fail_guard([this, signal]() {
-        [av_capture stopCaptureForSignal:signal];
+        @autoreleasepool {
+          [av_capture stopCaptureForSignal:signal];
+        }
+        dispatch_release(signal);
       });
 
       // Frames stop while the display sleeps. After a second without one, re-send the last image
@@ -833,10 +843,14 @@ namespace platf {
       return vt::make_encode_device(
         pix_fmt, full_range,
         [capture](int width, int height) {
-          [capture setFrameWidth:width frameHeight:height];
+          @autoreleasepool {
+            [capture setFrameWidth:width frameHeight:height];
+          }
         },
         [capture](int pixel_format) {
-          capture.pixelFormat = pixel_format;
+          @autoreleasepool {
+            capture.pixelFormat = pixel_format;
+          }
         }
       );
     }
@@ -996,7 +1010,7 @@ namespace platf {
 
       auto av_img = static_cast<av_img_t *>(img);
       av_img->sample_buffer = std::make_shared<av_sample_buf_t>(black);
-      av_img->pixel_buffer = std::make_shared<av_pixel_buf_t>(av_img->sample_buffer->buf);
+      av_img->pixel_buffer = std::make_shared<av_pixel_buf_t>(av_img->sample_buffer->buf, lock_cpu_pixels);
       img->data = av_img->pixel_buffer->data();
       auto *pb = av_img->pixel_buffer->buf;
       img->width = (int) CVPixelBufferGetWidth(pb);
@@ -1011,10 +1025,12 @@ namespace platf {
 
     std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
       if (pix_fmt == pix_fmt_e::yuv420p) {
+        lock_cpu_pixels = true;
         set_format(kCVPixelFormatType_32BGRA, width, height);
         return std::make_unique<avcodec_encode_device_t>();
       }
       if (pix_fmt == pix_fmt_e::nv12 || pix_fmt == pix_fmt_e::p010) {
+        lock_cpu_pixels = false;
         auto device = std::make_unique<nv12_zero_device>();
         device->init(
           this,
@@ -1035,6 +1051,7 @@ namespace platf {
     }
 
     std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt, bool full_range) override {
+      lock_cpu_pixels = false;
       return vt::make_encode_device(
         pix_fmt, full_range,
         [this](int frame_width, int frame_height) {
@@ -1064,6 +1081,7 @@ namespace platf {
     std::mutex mutex;
     OSType pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     CMSampleBufferRef black = nullptr;
+    bool lock_cpu_pixels = false;
     int frame_rate;
   };
 
@@ -1090,9 +1108,9 @@ namespace platf {
 
     auto display = std::make_shared<av_display_t>();
     display->lock_cpu_pixels.store(hwdevice_type == platf::mem_type_e::system, std::memory_order_relaxed);
-    // Async VideoToolbox encoding never calls dummy_img() during streaming; avoid retaining the
-    // first captured SCStream IOSurface in latest_sample for the entire session.
-    display->need_bootstrap_sample.store(hwdevice_type != platf::mem_type_e::videotoolbox, std::memory_order_relaxed);
+    // create_dummy_sample() handles synthetic black bootstrap frames for both hardware and
+    // software paths; never pin the first captured SCStream IOSurface in latest_sample.
+    display->need_bootstrap_sample.store(false, std::memory_order_relaxed);
 
     // Default to main display
     display->display_id = CGMainDisplayID();

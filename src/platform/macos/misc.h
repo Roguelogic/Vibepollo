@@ -36,10 +36,15 @@ namespace platf {
 
   /**
    * @brief Run the AppKit event loop on the main thread until `should_exit` returns true.
-   * @details Delivers menu bar events and display reconfiguration notifications. `should_exit`
-   *          is checked at least twice a second.
+   * @details Delivers menu bar events and display reconfiguration notifications. Blocks until
+   *          an AppKit event arrives or `wake_main_event_loop()` is called.
    */
   void run_main_event_loop(const std::function<bool()> &should_exit);
+
+  /**
+   * @brief Wake a main thread blocked inside `run_main_event_loop()`. Safe from any thread.
+   */
+  void wake_main_event_loop();
 
   /**
    * @brief Whether Open at Login is on.

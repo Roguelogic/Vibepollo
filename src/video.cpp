@@ -3956,6 +3956,9 @@ namespace video {
       // Allow the encoding device a final opportunity to set/unset or override any options
       encode_device->init_codec_options(ctx.get(), &options);
 
+      auto free_options_guard = util::fail_guard([&options]() {
+        av_dict_free(&options);
+      });
       auto status = avcodec_open2(ctx.get(), codec, &options);
       if (status) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
@@ -6257,7 +6260,7 @@ namespace video {
     rtx_hdr_metadata_refresh_state_t rtx_hdr_metadata_refresh;
 
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
-#if defined(_WIN32) || (defined(__linux__) && defined(SUNSHINE_BUILD_CUDA))
+#if defined(_WIN32) || (defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)) || defined(__APPLE__)
     int consecutive_encoder_initialization_failures = 0;
 #endif
 #ifdef _WIN32
@@ -6281,11 +6284,11 @@ namespace video {
       std::shared_ptr<platf::display_t> display;
       {
         auto lg = source_ctx.display_wp.lock();
-        if (source_ctx.display_wp->expired()) {
-          continue;
-        }
-
         display = source_ctx.display_wp->lock();
+      }
+      if (!display) {
+        std::this_thread::sleep_for(1ms);
+        continue;
       }
 
       if (config.videoFormat == 3) {
@@ -6503,6 +6506,15 @@ namespace video {
                              << "ms without falling back to FFmpeg NVENC"sv;
           std::this_thread::sleep_for(retry_delay);
         }
+  #elif defined(__APPLE__)
+        ++consecutive_encoder_initialization_failures;
+        if (consecutive_encoder_initialization_failures >= 3) {
+          BOOST_LOG(error) << "Encoder initialization failed 3 times on macOS; ending the stream instead of spinning"sv;
+          return;
+        }
+        const auto retry_delay = std::chrono::milliseconds(100 * (1 << (consecutive_encoder_initialization_failures - 1)));
+        BOOST_LOG(warning) << "Encoder initialization failed; retrying in " << retry_delay.count() << "ms"sv;
+        std::this_thread::sleep_for(retry_delay);
   #endif
         continue;
 #endif
@@ -6511,7 +6523,7 @@ namespace video {
         std::this_thread::sleep_for(100ms);
         continue;
       }
-#if defined(_WIN32) || (defined(__linux__) && defined(SUNSHINE_BUILD_CUDA))
+#if defined(_WIN32) || (defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)) || defined(__APPLE__)
       consecutive_encoder_initialization_failures = 0;
 #endif
 #ifdef _WIN32

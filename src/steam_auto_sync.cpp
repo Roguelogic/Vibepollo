@@ -122,9 +122,15 @@ namespace platf::steam::autosync {
 
           std::unique_lock lock {mutex_};
           const auto wake_epoch = epoch_;
-          condition_.wait_for(lock, poll_interval, [this, wake_epoch] {
-            return stopping_ || epoch_ != wake_epoch;
-          });
+          if (settings_.enabled && settings_.auto_sync) {
+            condition_.wait_for(lock, poll_interval, [this, wake_epoch] {
+              return stopping_ || epoch_ != wake_epoch;
+            });
+          } else {
+            condition_.wait(lock, [this, wake_epoch] {
+              return stopping_ || epoch_ != wake_epoch;
+            });
+          }
           if (stopping_) {
             return;
           }
