@@ -827,11 +827,11 @@ namespace platf {
       }
     }
 
-    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
+    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt, bool full_range) override {
       lock_cpu_pixels.store(false, std::memory_order_relaxed);
       auto *capture = av_capture;
       return vt::make_encode_device(
-        pix_fmt,
+        pix_fmt, full_range,
         [capture](int width, int height) {
           [capture setFrameWidth:width frameHeight:height];
         },
@@ -928,7 +928,8 @@ namespace platf {
                                       (av_capture.pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ?
                                          pix_fmt_e::p010 :
                                          pix_fmt_e::nv12);
-              (void) fallback->make_vt_encode_device(fmt);
+              (void) fallback->make_vt_encode_device(fmt, av_capture.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                                                        av_capture.pixelFormat == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange);
             }
             if (fallback->dummy_img(img) == 0) {
               return 0;
@@ -987,7 +988,7 @@ namespace platf {
     int dummy_img(img_t *img) override {
       std::lock_guard lock {mutex};
       if (!black) {
-        black = make_black_sample();
+        black = create_dummy_sample(width, height, pixel_format);
         if (!black) {
           return 1;
         }
@@ -1033,9 +1034,9 @@ namespace platf {
       return nullptr;
     }
 
-    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
+    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt, bool full_range) override {
       return vt::make_encode_device(
-        pix_fmt,
+        pix_fmt, full_range,
         [this](int frame_width, int frame_height) {
           this->set_format(this->pixel_format, frame_width, frame_height);
         },
@@ -1058,48 +1059,6 @@ namespace platf {
         CFRelease(black);
         black = nullptr;
       }
-    }
-
-    // An IOSurface-backed buffer, which VideoToolbox encodes without copying.
-    CMSampleBufferRef make_black_sample() const {
-      NSDictionary *attributes = [NSDictionary dictionaryWithObject:[NSDictionary dictionary] forKey:(NSString *) kCVPixelBufferIOSurfacePropertiesKey];
-      CVPixelBufferRef buffer = nullptr;
-      if (CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixel_format, (__bridge CFDictionaryRef) attributes, &buffer) != kCVReturnSuccess) {
-        BOOST_LOG(error) << "Couldn't create a black image for Remote Input"sv;
-        return nullptr;
-      }
-
-      CVPixelBufferLockBaseAddress(buffer, 0);
-      if (CVPixelBufferIsPlanar(buffer)) {
-        // Video-range black: luma 16 and chroma 128, or 64 and 512 in the high bits of 10-bit samples;
-        // full-range 10-bit ('xf44') black: luma 0 and chroma 512 in the high bits.
-        const bool ten_bit = pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-                             pixel_format == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
-        const bool full_range = pixel_format == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
-        for (size_t plane = 0; plane < CVPixelBufferGetPlaneCount(buffer); ++plane) {
-          auto *base = static_cast<std::uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(buffer, plane));
-          const size_t size = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane) * CVPixelBufferGetHeightOfPlane(buffer, plane);
-          if (ten_bit) {
-            const std::uint16_t luma_black = full_range ? 0 : 64;
-            std::fill_n(reinterpret_cast<std::uint16_t *>(base), size / 2, static_cast<std::uint16_t>((plane == 0 ? luma_black : 512) << 6));
-          } else {
-            std::memset(base, plane == 0 ? 16 : 128, size);
-          }
-        }
-      } else {
-        std::memset(CVPixelBufferGetBaseAddress(buffer), 0, CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer));
-      }
-      CVPixelBufferUnlockBaseAddress(buffer, 0);
-
-      CMVideoFormatDescriptionRef format_description = nullptr;
-      CMSampleBufferRef sample = nullptr;
-      const CMSampleTimingInfo timing {kCMTimeInvalid, kCMTimeZero, kCMTimeInvalid};
-      if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, buffer, &format_description) == noErr) {
-        CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, buffer, format_description, &timing, &sample);
-        CFRelease(format_description);
-      }
-      CVPixelBufferRelease(buffer);
-      return sample;
     }
 
     std::mutex mutex;
@@ -1231,13 +1190,7 @@ namespace platf {
       // Pre-configure capture pixel format and output dimensions before captureThread starts SCStream;
       // otherwise async PARALLEL_ENCODING starts SCStream in 32BGRA SDR before make_vt_encode_device runs.
       const auto colorspace = video::colorspace_from_client_config(config, display->hdr);
-      if (config.chromaSamplingType == 1) {
-        display->av_capture.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
-      } else {
-        display->av_capture.pixelFormat = colorspace.bit_depth == 10 ?
-                                            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
-                                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-      }
+      display->av_capture.pixelFormat = vt::capture_pixel_format(config.chromaSamplingType == 1, colorspace.bit_depth == 10, colorspace.full_range);
       if (config.width > 0 && config.height > 0) {
         [display->av_capture setFrameWidth:config.width frameHeight:config.height];
       }

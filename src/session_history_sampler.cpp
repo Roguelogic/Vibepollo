@@ -104,6 +104,7 @@ namespace session_history::sampler {
       std::int64_t client_reported_losses = 0;
       std::uint32_t idr_requests = 0;
       std::uint32_t ref_invalidations = 0;
+      video::frame_timing_sample_t timing;
       double encode_latency_ms = 0;
     };
 
@@ -229,16 +230,18 @@ namespace session_history::sampler {
       sample.client_reported_losses = snapshot.client_reported_losses;
       sample.idr_requests = snapshot.idr_requests;
       sample.ref_invalidations = snapshot.ref_invalidations;
-      sample.encode_latency_ms = snapshot.encode_latency_ms;
+      sample.timing = snapshot.timing;
+      sample.encode_latency_ms = snapshot.timing.captured_frames == 0 ? -1 : snapshot.encode_latency_ms;
       sample.actual_fps = aggregated.actual_fps;
       sample.actual_bitrate_kbps = aggregated.actual_bitrate_kbps;
-      sample.frame_interval_jitter_ms = aggregated.frame_interval_jitter_ms;
+      sample.frame_interval_jitter_ms = snapshot.timing.captured_frames >= 0 ?
+        std::max(0.0, snapshot.timing.send_interval_jitter_ms) : aggregated.frame_interval_jitter_ms;
       populate_host_snapshot(sample, host);
       (void) writer::enqueue_sample(std::move(sample));
     }
 
     void sample_rtsp_sessions(double ts, const platf::host_stats_t &host) {
-      auto snapshot = stream::get_all_session_info();
+      auto snapshot = stream::get_all_session_info(true);
       const auto active_copy = snapshot_active_sessions();
 
       for (const auto &info : snapshot) {
@@ -255,6 +258,7 @@ namespace session_history::sampler {
           .client_reported_losses = info.client_reported_losses,
           .idr_requests = info.idr_requests,
           .ref_invalidations = info.invalidate_ref_count,
+          .timing = info.timing,
           .encode_latency_ms = info.encode_latency_ms,
         }, ts, host);
       }
@@ -390,7 +394,10 @@ namespace session_history::sampler {
       as.yuv444 = info.yuv444;
       as.stream_gpu_model = info.stream_gpu_model;
       as.uptime_seconds = info.uptime_seconds;
-      as.encode_latency_ms = info.encode_latency_ms;
+      as.timing = info.timing;
+      as.frame_interval_jitter_ms = info.timing.send_interval_jitter_ms >= 0 ?
+        info.timing.send_interval_jitter_ms : 0.0;
+      as.encode_latency_ms = info.timing.captured_frames == 0 ? 0.0 : info.encode_latency_ms;
       as.frames_sent = info.frames_sent;
       as.bytes_sent = info.bytes_sent;
       as.client_reported_losses = info.client_reported_losses;
@@ -402,7 +409,6 @@ namespace session_history::sampler {
         if (agg_it != g_aggregators.end()) {
           as.actual_fps = agg_it->second.last_actual_fps;
           as.actual_bitrate_kbps = agg_it->second.last_actual_bitrate_kbps;
-          as.frame_interval_jitter_ms = agg_it->second.last_jitter_ms;
         }
       }
 

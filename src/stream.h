@@ -24,6 +24,7 @@
 #include "input_session_config.h"
 #include "thread_safe.h"
 #include "video.h"
+#include "video_frame_timing.h"
 #include "stream_protocol.h"
 #include "remote_session.h"
 
@@ -169,12 +170,13 @@ namespace stream {
     std::uint32_t idr_requests;
     std::uint32_t invalidate_ref_count;
     std::int64_t client_reported_losses;
+    video::frame_timing_sample_t timing;
     double encode_latency_ms;  // last frame encode latency in ms
     std::int64_t last_frame_index;
     double uptime_seconds;
   };
 
-  std::vector<session_info_t> get_all_session_info();
+  std::vector<session_info_t> get_all_session_info(bool finish_timing_interval = false);
 
   void request_idr_for_all_sessions();
 

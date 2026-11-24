@@ -11,7 +11,7 @@
 #include <string>
 
 namespace {
-  constexpr int schema_version = 7;
+  constexpr int schema_version = 8;
 
   bool exec_sql(sqlite3 *db, const char *sql) {
     return sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
@@ -348,6 +348,8 @@ TEST(SessionHistoryStorage, SampleRoundTripPreservesMetricsAndHostTelemetry) {
   auto row = sample(uuid, 5.0, 42);
   row.encode_latency_ms = 7.5;
   row.actual_bitrate_kbps = 12345.0;
+  row.timing = {.captured_frames = 75, .repeated_frames = 4, .capture_to_submit_p95_ms = 2.5,
+                .encode_p95_ms = 8.25, .complete_to_send_p95_ms = 3.75};
   row.host_cpu_percent = 12.5;
   row.host_gpu_temp_c = 78.25;
   ASSERT_TRUE(session_history::storage::process_begin_at(db.get(), metadata(uuid), 1.0));
@@ -358,6 +360,11 @@ TEST(SessionHistoryStorage, SampleRoundTripPreservesMetricsAndHostTelemetry) {
   EXPECT_EQ(detail->samples[0].frames_sent, 42u);
   EXPECT_DOUBLE_EQ(detail->samples[0].encode_latency_ms, 7.5);
   EXPECT_DOUBLE_EQ(detail->samples[0].actual_bitrate_kbps, 12345.0);
+  EXPECT_EQ(detail->samples[0].timing.captured_frames, 75);
+  EXPECT_EQ(detail->samples[0].timing.repeated_frames, 4);
+  EXPECT_DOUBLE_EQ(detail->samples[0].timing.capture_to_submit_p95_ms, 2.5);
+  EXPECT_DOUBLE_EQ(detail->samples[0].timing.encode_p95_ms, 8.25);
+  EXPECT_DOUBLE_EQ(detail->samples[0].timing.complete_to_send_p95_ms, 3.75);
   EXPECT_DOUBLE_EQ(detail->samples[0].host_cpu_percent, 12.5);
   EXPECT_DOUBLE_EQ(detail->samples[0].host_gpu_temp_c, 78.25);
 }
@@ -552,4 +559,56 @@ TEST(SessionHistoryPolicy, StatusReportsAvailabilityAndBackpressureWithoutRuntim
 TEST(SessionHistoryPolicy, StoppedWriterIsUnavailableEvenWithADatabaseHandle) {
   const auto status = session_history::policy::make_status({.running = false, .has_write_db = true});
   EXPECT_FALSE(status.available);
+}
+
+TEST(VideoFrameTiming, SamplesRealFrameStagesAndIndividualSendIntervals) {
+  using namespace std::chrono_literals;
+  video::frame_timing_t timing;
+  const auto t = std::chrono::steady_clock::time_point {} + 1s;
+  timing.record(t, t + 2ms, t + 5ms, t + 10ms);
+  timing.record({}, {}, {}, t + 15ms);
+  timing.record(t + 20ms, t + 24ms, t + 30ms, t + 40ms);
+  EXPECT_EQ(timing.snapshot(false).captured_frames, -1);
+  const auto result = timing.snapshot(true);
+  EXPECT_EQ(result.captured_frames, 2);
+  EXPECT_EQ(result.repeated_frames, 1);
+  EXPECT_DOUBLE_EQ(result.capture_to_submit_p95_ms, 4);
+  EXPECT_DOUBLE_EQ(result.encode_p95_ms, 6);
+  EXPECT_DOUBLE_EQ(result.complete_to_send_p95_ms, 10);
+  EXPECT_NEAR(result.send_interval_jitter_ms, std::sqrt(200.0), 1e-9);
+  EXPECT_EQ(timing.snapshot(false).captured_frames, 2);
+  timing.record({}, {}, {}, t + 50ms);
+  const auto idle = timing.snapshot(true);
+  EXPECT_EQ(idle.captured_frames, 0);
+  EXPECT_EQ(idle.repeated_frames, 1);
+  EXPECT_EQ(idle.encode_p95_ms, -1);
+}
+
+TEST(SessionHistoryStorage, MigratesTimingWithoutInventingOldSamples) {
+  auto db = open_history();
+  ASSERT_TRUE(db);
+  const std::string uuid = "timing-upgrade";
+  ASSERT_TRUE(session_history::storage::process_begin_at(db.get(), metadata(uuid), 1));
+  ASSERT_TRUE(session_history::storage::process_sample(db.get(), sample(uuid, 2), 10));
+  ASSERT_TRUE(exec_sql(db.get(),
+    "ALTER TABLE samples DROP COLUMN captured_frames;"
+    "ALTER TABLE samples DROP COLUMN repeated_frames;"
+    "ALTER TABLE samples DROP COLUMN capture_to_submit_p95_ms;"
+    "ALTER TABLE samples DROP COLUMN encode_p95_ms;"
+    "ALTER TABLE samples DROP COLUMN complete_to_send_p95_ms;"
+    "PRAGMA user_version=7"));
+  ASSERT_TRUE(session_history::storage::apply_schema_and_migrations(db.get(), schema_version));
+  auto idle = sample(uuid, 3);
+  idle.timing = {.captured_frames = 0, .repeated_frames = 8};
+  idle.encode_latency_ms = -1;
+  ASSERT_TRUE(session_history::storage::process_sample(db.get(), idle, 10));
+  for (bool all : {false, true}) {
+    auto detail = session_history::storage::read_session_detail(db.get(), uuid, all, 20, 20);
+    ASSERT_TRUE(detail);
+    ASSERT_EQ(detail->samples.size(), 2u);
+    EXPECT_EQ(detail->samples.front().timing.captured_frames, -1);
+    EXPECT_EQ(detail->samples.back().timing.repeated_frames, 8);
+    EXPECT_EQ(detail->samples.back().encode_latency_ms, -1);
+    EXPECT_EQ(detail->samples.back().timing.encode_p95_ms, -1);
+  }
 }

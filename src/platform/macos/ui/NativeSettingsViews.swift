@@ -2622,10 +2622,15 @@ private struct TelemetryDetailView: View {
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
             }
-            LabeledContent(l10n.pick("프레임 인코딩 지연", "Encode Latency")) {
-              Text(String(format: "%.2f ms", s.encodeLatencyMs))
+            LabeledContent(l10n.pick("최근 호스트 처리 시간", "Last Host Processing Time")) {
+              Text(s.encodeLatencyMs > 0 ? String(format: "%.2f ms", s.encodeLatencyMs) : "—")
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
+            }
+            if let capture = s.captureToSubmitP95Ms, let encode = s.encodeP95Ms, let send = s.completeToSendP95Ms {
+              LabeledContent(l10n.pick("캡처 → 인코더 제출 (P95)", "Capture to Submit (P95)"), value: String(format: "%.2f ms", capture))
+              LabeledContent(l10n.pick("인코딩 (P95)", "Encoding (P95)"), value: String(format: "%.2f ms", encode))
+              LabeledContent(l10n.pick("인코딩 완료 → 호스트 전송 (P95)", "Completion to Host Send (P95)"), value: String(format: "%.2f ms", send))
             }
             LabeledContent(l10n.pick("전송 프레임 / 손실", "Frames / Losses")) {
               Text("\(s.framesSent) / \(max(0, s.losses))")

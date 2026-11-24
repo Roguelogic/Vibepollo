@@ -19,6 +19,7 @@
 #include <vector>
 
 // platform includes
+#import <Foundation/Foundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <VideoToolbox/VideoToolbox.h>
 
@@ -72,14 +73,21 @@ namespace {
       height = config.height;
       framerate = config.framerate;
       codec_type = codec;
+      requested_full_range = colorspace.full_range;
+      const bool yuv444_input = config.chromaSamplingType == 1;
+      encoder_pixel_format = platf::vt::capture_pixel_format(yuv444_input, colorspace.bit_depth == 10, requested_full_range);
+      if (yuv444_input && !requested_full_range) {
+        encoder_pixel_format = kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange;
+      } else if (!yuv444_input && colorspace.bit_depth == 10 && requested_full_range) {
+        encoder_pixel_format = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+      }
       is_hdr_colorspace = video::colorspace_is_hdr(colorspace);
       // AppleAVE2 is a 3-stage hardware ASIC (DMA tile -> ME -> CABAC): serializing to 1 in-flight
       // frame with synchronous CompleteFrames(pts) stalls XPC + all 3 stages and caps 4K at ~67fps
       // while increasing mailbox wait latency (22.1ms -> 23.0/34.5ms). Keep 3 stages up to 2752x2064
       // (~120fps) and 2 pipelined stages on 4K (>6.5M px -> ~108fps at 12.8ms min encode latency).
       const std::int64_t pixels_per_frame = static_cast<std::int64_t>(width) * height;
-      overloaded_4k_gate = (pixels_per_frame > 6'500'000 && framerate >= 100);
-      max_in_flight_limit = overloaded_4k_gate ? 2 : 3;
+      max_in_flight_limit = pixels_per_frame > 6'500'000 && framerate >= 100 ? 2 : 3;
 
 #if defined(__arm64__) || defined(__aarch64__)
       constexpr bool arm64 = true;
@@ -239,7 +247,8 @@ namespace {
       const platf::vt_frame_metadata_t &meta,
       bool force_idr,
       platf::vt_encode_device_t::packet_callback_t on_packet,
-      bool sync_flush
+      bool sync_flush,
+      uint64_t source_generation = 0
     ) {
       if (!session || !raw_pixel_buffer) {
         return -1;
@@ -251,6 +260,69 @@ namespace {
         return -1;
       }
 
+      // Capture directly into the encoder format when SCK supports it. When the
+      // ranges differ, convert once per captured source generation (keyed by monotonic
+      // generation rather than CVPixelBufferRef pointer identity so we never retain an
+      // SCStream IOSurface across frames or alias recycled pool buffers) and keep the
+      // converted buffer owned by the in-flight slot until VideoToolbox finishes encoding.
+      const auto input_format = CVPixelBufferGetPixelFormatType(raw_pixel_buffer);
+      platf::cf_ref_t<CVPixelBufferRef> slot_converted_buffer;
+      if (input_format != encoder_pixel_format) {
+        if (source_generation == 0 || source_generation != last_transfer_generation || !last_transfer_result) {
+          if (!range_transfer) {
+            VTPixelTransferSessionRef transfer = nullptr;
+            if (VTPixelTransferSessionCreate(nullptr, &transfer) != noErr) {
+              return -1;
+            }
+            range_transfer.reset(transfer);
+            if (color_primaries) {
+              (void) VTSessionSetProperty(range_transfer.get(), kVTPixelTransferPropertyKey_DestinationColorPrimaries, color_primaries);
+            }
+            if (color_transfer) {
+              (void) VTSessionSetProperty(range_transfer.get(), kVTPixelTransferPropertyKey_DestinationTransferFunction, color_transfer);
+            }
+            if (color_matrix) {
+              (void) VTSessionSetProperty(range_transfer.get(), kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, color_matrix);
+            }
+          }
+          auto pool = VTCompressionSessionGetPixelBufferPool(session);
+          CVPixelBufferRef buffer = nullptr;
+          if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &buffer) != kCVReturnSuccess || !buffer) {
+            return -1;
+          }
+          platf::cf_ref_t<CVPixelBufferRef> converted {buffer};
+          if (color_primaries) {
+            CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, color_primaries, kCVAttachmentMode_ShouldPropagate);
+          }
+          if (color_transfer) {
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, color_transfer, kCVAttachmentMode_ShouldPropagate);
+          }
+          if (color_matrix) {
+            CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, color_matrix, kCVAttachmentMode_ShouldPropagate);
+          }
+          if (CVPixelBufferGetPixelFormatType(buffer) != encoder_pixel_format ||
+              VTPixelTransferSessionTransferImage(range_transfer.get(), raw_pixel_buffer, buffer) != noErr) {
+            BOOST_LOG(error) << "VideoToolbox could not convert the capture to the negotiated pixel range";
+            return -1;
+          }
+          last_transfer_generation = source_generation;
+          last_transfer_result = std::move(converted);
+        }
+        // Release the SCStream IOSurface immediately since transfer has completed synchronously.
+        pixel_owner.reset();
+        sample_owner.reset();
+        raw_pixel_buffer = last_transfer_result.get();
+        slot_converted_buffer.reset(CVPixelBufferRetain(raw_pixel_buffer));
+      } else {
+        last_transfer_generation = 0;
+        last_transfer_result.reset();
+      }
+      if (!logged_input_format) {
+        const auto fourcc = [](OSType f) { return std::string {char(f >> 24), char(f >> 16), char(f >> 8), char(f)}; };
+        BOOST_LOG(info) << "VideoToolbox capture=" << fourcc(input_format) << " encoder input=" << fourcc(encoder_pixel_format)
+                        << " requested range=" << (requested_full_range ? "full" : "video");
+        logged_input_format = true;
+      }
       uint64_t seq = 0;
       {
         std::unique_lock lock {mutex};
@@ -275,8 +347,10 @@ namespace {
         slot.seq = seq;
         slot.force_idr = force_idr;
         slot.meta = meta;
+        slot.meta.submitted_at = std::chrono::steady_clock::now();
         slot.sample_buffer = std::move(sample_owner);
         slot.pixel_buffer = std::move(pixel_owner);
+        slot.converted_buffer = std::move(slot_converted_buffer);
         slot.on_packet = std::move(on_packet);
         ++in_flight;
         in_flight_atomic.store(in_flight, std::memory_order_relaxed);
@@ -339,10 +413,12 @@ namespace {
     }
 
     bool wait_for_slot() {
-      if (!session || !overloaded_4k_gate) {
-        return true;
+      if (!session) {
+        return false;
       }
       std::unique_lock lock {mutex};
+      // Keep the wait bounded (50ms) so transient GPU stalls never tear down the stream
+      // and shutdown/reinit checks stay responsive; only sticky_error is fatal.
       cv.wait_for(lock, 50ms, [this] {
         return sticky_error || in_flight < max_in_flight_limit;
       });
@@ -386,6 +462,7 @@ namespace {
       platf::vt_frame_metadata_t meta;
       std::shared_ptr<platf::av_sample_buf_t> sample_buffer;
       std::shared_ptr<platf::av_pixel_buf_t> pixel_buffer;
+      platf::cf_ref_t<CVPixelBufferRef> converted_buffer;
       platf::vt_encode_device_t::packet_callback_t on_packet;
 
       void clear() {
@@ -394,6 +471,7 @@ namespace {
         force_idr = false;
         meta = {};
         on_packet = nullptr;
+        converted_buffer.reset();
         // Unlock CVPixelBuffer before releasing the owning CMSampleBuffer.
         pixel_buffer.reset();
         sample_buffer.reset();
@@ -401,6 +479,7 @@ namespace {
     };
 
     static void output_callback(void *refcon, void *source_frame_refcon, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample_buffer) {
+      const auto completed_at = std::chrono::steady_clock::now();
       auto self = static_cast<vt_compression_session_t *>(refcon);
       const uint64_t seq = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source_frame_refcon));
 
@@ -409,6 +488,7 @@ namespace {
       platf::vt_encode_device_t::packet_callback_t local_on_packet;
       std::shared_ptr<platf::av_sample_buf_t> local_sample_buf;
       std::shared_ptr<platf::av_pixel_buf_t> local_pixel_buf;
+      platf::cf_ref_t<CVPixelBufferRef> local_converted_buf;
       platf::vt_encoded_frame encoded;
       bool ok = false;
       bool sync = true;
@@ -420,10 +500,12 @@ namespace {
         auto &slot = self->slots[seq & (slot_ring_size - 1)];
         if (slot.active && slot.seq == seq) {
           local_meta = slot.meta;
+          local_meta.completed_at = completed_at;
           local_force_idr = slot.force_idr;
           local_on_packet = std::move(slot.on_packet);
           local_sample_buf = std::move(slot.sample_buffer);
           local_pixel_buf = std::move(slot.pixel_buffer);
+          local_converted_buf = std::move(slot.converted_buffer);
           slot.active = false;
           slot.seq = 0;
           if (self->in_flight > 0) {
@@ -452,6 +534,12 @@ namespace {
               BOOST_LOG(warning) << "VideoToolbox format description changed without a keyframe, forcing IDR"sv;
               self->need_idr = true;
             }
+            const auto full_range = CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_FullRangeVideo);
+            const bool encoded_full = full_range && CFEqual(full_range, kCFBooleanTrue);
+            BOOST_LOG(info) << "VideoToolbox encoded range=" << (encoded_full ? "full" : "video");
+            if (encoded_full != self->requested_full_range) {
+              BOOST_LOG(warning) << "VideoToolbox output range differs from the negotiated range";
+            }
             CFRetain(format);
             self->last_format.reset(format);
             self->cached_parameter_sets = build_patched_parameter_sets(format);
@@ -472,7 +560,8 @@ namespace {
         self->cv.notify_all();
       }
 
-      // Return SCStream's IOSurface to WindowServer immediately before Annex-B packing & network enqueue.
+      // Return SCStream's IOSurface and any converted buffer immediately before Annex-B packing & network enqueue.
+      local_converted_buf.reset();
       local_pixel_buf.reset();
       local_sample_buf.reset();
 
@@ -518,7 +607,12 @@ namespace {
         CFDictionarySetValue(specification, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
       }
 
-      const auto status = VTCompressionSessionCreate(kCFAllocatorDefault, config.width, config.height, codec, specification, nullptr, nullptr, output_callback, this, &session);
+      NSDictionary *attributes = @{
+        (NSString *) kCVPixelBufferPixelFormatTypeKey: @(encoder_pixel_format),
+        (NSString *) kCVPixelBufferIOSurfacePropertiesKey: @{}
+      };
+      const auto status = VTCompressionSessionCreate(kCFAllocatorDefault, config.width, config.height, codec, specification,
+        (__bridge CFDictionaryRef) attributes, nullptr, output_callback, this, &session);
       CFRelease(specification);
       if (status != noErr || !session) {
         BOOST_LOG(warning) << "VTCompressionSessionCreate failed (low latency: "sv << low_latency << "): "sv << status;
@@ -597,6 +691,9 @@ namespace {
       set_property(kVTCompressionPropertyKey_ColorPrimaries, primaries, "ColorPrimaries"sv);
       set_property(kVTCompressionPropertyKey_TransferFunction, transfer, "TransferFunction"sv);
       set_property(kVTCompressionPropertyKey_YCbCrMatrix, matrix, "YCbCrMatrix"sv);
+      color_primaries = primaries;
+      color_transfer = transfer;
+      color_matrix = matrix;
     }
 
     // Sets VideoToolbox container extensions and caches an in-band Annex-B HEVC `PREFIX_SEI_NUT`
@@ -702,6 +799,15 @@ namespace {
 
     VTCompressionSessionRef session = nullptr;
     CMVideoCodecType codec_type = 0;
+    bool requested_full_range = false;
+    OSType encoder_pixel_format = 0;
+    CFStringRef color_primaries = nullptr;
+    CFStringRef color_transfer = nullptr;
+    CFStringRef color_matrix = nullptr;
+    platf::cf_ref_t<VTPixelTransferSessionRef> range_transfer;
+    uint64_t last_transfer_generation = 0;
+    platf::cf_ref_t<CVPixelBufferRef> last_transfer_result;
+    bool logged_input_format = false;
     int width = 0;
     int height = 0;
     int framerate = 60;
@@ -712,7 +818,6 @@ namespace {
     std::condition_variable cv;
     std::size_t in_flight = 0;
     std::size_t max_in_flight_limit = 3;
-    bool overloaded_4k_gate = false;
     std::atomic<std::size_t> in_flight_atomic {0};
     uint64_t next_slot_seq = 0;
     std::array<in_flight_slot_t, slot_ring_size> slots;
@@ -738,17 +843,12 @@ namespace {
      * @param pixel_format_fn Callback that selects the capture pixel format.
      * @return 0 on success.
      */
-    int init(platf::pix_fmt_e pix_fmt, platf::vt::resolution_fn_t resolution_fn, const platf::vt::pixel_format_fn_t &pixel_format_fn) {
+    int init(platf::pix_fmt_e pix_fmt, bool full_range, platf::vt::resolution_fn_t resolution_fn, const platf::vt::pixel_format_fn_t &pixel_format_fn) {
       this->resolution_fn = std::move(resolution_fn);
       // Must happen before capture starts; the capture backend snapshots it when the stream is created.
       // SCStream natively supports 'xf44' (2-plane 10-bit 4:4:4) for both 8-bit and 10-bit HEVC 4:4:4.
-      OSType cv_pix_fmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-      if (pix_fmt == platf::pix_fmt_e::ayuv || pix_fmt == platf::pix_fmt_e::yuv444p16) {
-        cv_pix_fmt = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
-      } else if (pix_fmt == platf::pix_fmt_e::p010) {
-        cv_pix_fmt = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
-      }
-      pixel_format_fn(cv_pix_fmt);
+      const bool yuv444 = pix_fmt == platf::pix_fmt_e::ayuv || pix_fmt == platf::pix_fmt_e::yuv444p16;
+      pixel_format_fn(platf::vt::capture_pixel_format(yuv444, pix_fmt == platf::pix_fmt_e::p010, full_range));
       return 0;
     }
 
@@ -789,6 +889,7 @@ namespace {
       // before the old sample buffer that owns it is released.
       pixel_buffer = av_img->pixel_buffer;
       sample_buffer = av_img->sample_buffer;
+      ++source_generation;
       return 0;
     }
 
@@ -803,7 +904,7 @@ namespace {
       if (!session || !pixel_buffer || !pixel_buffer->buf) {
         return -1;
       }
-      return session->submit(pixel_buffer->buf, sample_buffer, pixel_buffer, meta, force_idr, std::move(on_packet), false);
+      return session->submit(pixel_buffer->buf, sample_buffer, pixel_buffer, meta, force_idr, std::move(on_packet), false, source_generation);
     }
 
     bool flush_encoder() override {
@@ -833,6 +934,7 @@ namespace {
     std::unique_ptr<vt_compression_session_t> session;
     std::shared_ptr<platf::av_sample_buf_t> sample_buffer;
     std::shared_ptr<platf::av_pixel_buf_t> pixel_buffer;
+    uint64_t source_generation = 0;
   };
 }  // namespace
 
@@ -1060,6 +1162,13 @@ namespace platf::vt {
     return ok;
   }
 
+  OSType capture_pixel_format(bool yuv444, bool ten_bit, bool full_range) {
+    // ScreenCaptureKit supports a single range for each 10-bit chroma format.
+    if (yuv444) return kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    if (ten_bit) return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    return full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+  }
+
   bool try_low_latency(CMVideoCodecType codec, bool arm64) {
     if (arm64) {
       return false;
@@ -1090,7 +1199,7 @@ namespace platf::vt {
     return std::min(framerate, level_limit);
   }
 
-  std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn) {
+  std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, bool full_range, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn) {
     if (pix_fmt != pix_fmt_e::nv12 &&
         pix_fmt != pix_fmt_e::p010 &&
         pix_fmt != pix_fmt_e::ayuv &&
@@ -1100,7 +1209,7 @@ namespace platf::vt {
     }
 
     auto device = std::make_unique<::vt_encode_device>();
-    if (device->init(pix_fmt, std::move(resolution_fn), pixel_format_fn)) {
+    if (device->init(pix_fmt, full_range, std::move(resolution_fn), pixel_format_fn)) {
       return nullptr;
     }
     return device;

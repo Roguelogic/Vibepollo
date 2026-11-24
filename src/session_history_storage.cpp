@@ -79,7 +79,12 @@ namespace session_history::storage {
         host_cpu_temp_c REAL DEFAULT -1,
         host_gpu_temp_c REAL DEFAULT -1,
         host_net_rx_bps REAL DEFAULT -1,
-        host_net_tx_bps REAL DEFAULT -1
+        host_net_tx_bps REAL DEFAULT -1,
+        captured_frames INTEGER,
+        repeated_frames INTEGER,
+        capture_to_submit_p95_ms REAL,
+        encode_p95_ms REAL,
+        complete_to_send_p95_ms REAL
       );
 
       CREATE INDEX IF NOT EXISTS idx_samples_session ON samples(session_uuid);
@@ -687,6 +692,14 @@ namespace session_history::storage {
         return false;
       }
     }
+    if (!add_column("samples", "captured_frames", "INTEGER") ||
+        !add_column("samples", "repeated_frames", "INTEGER") ||
+        !add_column("samples", "capture_to_submit_p95_ms", "REAL") ||
+        !add_column("samples", "encode_p95_ms", "REAL") ||
+        !add_column("samples", "complete_to_send_p95_ms", "REAL")) {
+      return false;
+    }
+
     if (current_schema_version < 7 ||
         !table_has_delete_cascade(db, "samples", "sessions", "session_uuid") ||
         !table_has_delete_cascade(db, "events", "sessions", "session_uuid")) {
@@ -716,7 +729,12 @@ namespace session_history::storage {
           host_cpu_temp_c REAL DEFAULT -1,
           host_gpu_temp_c REAL DEFAULT -1,
           host_net_rx_bps REAL DEFAULT -1,
-          host_net_tx_bps REAL DEFAULT -1
+          host_net_tx_bps REAL DEFAULT -1,
+          captured_frames INTEGER,
+          repeated_frames INTEGER,
+          capture_to_submit_p95_ms REAL,
+          encode_p95_ms REAL,
+          complete_to_send_p95_ms REAL
         );
       )";
       constexpr const char *SAMPLES_COLUMNS =
@@ -724,7 +742,8 @@ namespace session_history::storage {
         "frames_sent, last_frame_index, video_dropped, audio_dropped, client_reported_losses, "
         "idr_requests, ref_invalidations, encode_latency_ms, actual_fps, actual_bitrate_kbps, "
         "frame_interval_jitter_ms, host_cpu_percent, host_gpu_percent, host_gpu_encoder_percent, "
-        "host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, host_net_rx_bps, host_net_tx_bps";
+        "host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, host_net_rx_bps, host_net_tx_bps, "
+        "captured_frames, repeated_frames, capture_to_submit_p95_ms, encode_p95_ms, complete_to_send_p95_ms";
       constexpr const char *SAMPLES_INDEXES =
         "CREATE INDEX IF NOT EXISTS idx_samples_session ON samples(session_uuid);"
         "CREATE INDEX IF NOT EXISTS idx_samples_time ON samples(session_uuid, timestamp_unix);";
@@ -884,8 +903,8 @@ namespace session_history::storage {
       " encode_latency_ms, actual_fps, actual_bitrate_kbps, frame_interval_jitter_ms, "
       " host_cpu_percent, host_gpu_percent, host_gpu_encoder_percent, "
       " host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, "
-      " host_net_rx_bps, host_net_tx_bps) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      " host_net_rx_bps, host_net_tx_bps, captured_frames, repeated_frames, capture_to_submit_p95_ms, encode_p95_ms, complete_to_send_p95_ms) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     if (!stmt) return false;
 
     sqlite3_bind_text(stmt.get(), 1, sample.session_uuid.c_str(), -1, SQLITE_TRANSIENT);
@@ -899,7 +918,7 @@ namespace session_history::storage {
     sqlite3_bind_int64(stmt.get(), 9, sample.client_reported_losses);
     sqlite3_bind_int(stmt.get(), 10, static_cast<int>(sample.idr_requests));
     sqlite3_bind_int(stmt.get(), 11, static_cast<int>(sample.ref_invalidations));
-    sqlite3_bind_double(stmt.get(), 12, sample.encode_latency_ms);
+    if (sample.encode_latency_ms >= 0) sqlite3_bind_double(stmt.get(), 12, sample.encode_latency_ms);
     sqlite3_bind_double(stmt.get(), 13, sample.actual_fps);
     sqlite3_bind_double(stmt.get(), 14, sample.actual_bitrate_kbps);
     sqlite3_bind_double(stmt.get(), 15, sample.frame_interval_jitter_ms);
@@ -912,6 +931,12 @@ namespace session_history::storage {
     sqlite3_bind_double(stmt.get(), 22, sample.host_gpu_temp_c);
     sqlite3_bind_double(stmt.get(), 23, sample.host_net_rx_bps);
     sqlite3_bind_double(stmt.get(), 24, sample.host_net_tx_bps);
+
+    if (sample.timing.captured_frames >= 0) sqlite3_bind_int64(stmt.get(), 25, sample.timing.captured_frames);
+    if (sample.timing.repeated_frames >= 0) sqlite3_bind_int64(stmt.get(), 26, sample.timing.repeated_frames);
+    if (sample.timing.capture_to_submit_p95_ms >= 0) sqlite3_bind_double(stmt.get(), 27, sample.timing.capture_to_submit_p95_ms);
+    if (sample.timing.encode_p95_ms >= 0) sqlite3_bind_double(stmt.get(), 28, sample.timing.encode_p95_ms);
+    if (sample.timing.complete_to_send_p95_ms >= 0) sqlite3_bind_double(stmt.get(), 29, sample.timing.complete_to_send_p95_ms);
 
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
       diagnostics::error() << "session_history: sample insert failed for uuid=" << sample.session_uuid
@@ -1070,7 +1095,7 @@ namespace session_history::storage {
         "encode_latency_ms, actual_fps, actual_bitrate_kbps, frame_interval_jitter_ms, "
         "host_cpu_percent, host_gpu_percent, host_gpu_encoder_percent, "
         "host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, "
-        "host_net_rx_bps, host_net_tx_bps "
+        "host_net_rx_bps, host_net_tx_bps, captured_frames, repeated_frames, capture_to_submit_p95_ms, encode_p95_ms, complete_to_send_p95_ms "
         "FROM samples WHERE session_uuid = ? ORDER BY timestamp_unix"
         :
         "SELECT session_uuid, timestamp_unix, bytes_sent_total, packets_sent_video, "
@@ -1079,7 +1104,7 @@ namespace session_history::storage {
         "encode_latency_ms, actual_fps, actual_bitrate_kbps, frame_interval_jitter_ms, "
         "host_cpu_percent, host_gpu_percent, host_gpu_encoder_percent, "
         "host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, "
-        "host_net_rx_bps, host_net_tx_bps "
+        "host_net_rx_bps, host_net_tx_bps, captured_frames, repeated_frames, capture_to_submit_p95_ms, encode_p95_ms, complete_to_send_p95_ms "
         "FROM ("
         "  SELECT session_uuid, timestamp_unix, bytes_sent_total, packets_sent_video, "
         "  frames_sent, last_frame_index, video_dropped, audio_dropped, "
@@ -1087,7 +1112,7 @@ namespace session_history::storage {
         "  encode_latency_ms, actual_fps, actual_bitrate_kbps, frame_interval_jitter_ms, "
         "  host_cpu_percent, host_gpu_percent, host_gpu_encoder_percent, "
         "  host_ram_percent, host_vram_percent, host_cpu_temp_c, host_gpu_temp_c, "
-        "  host_net_rx_bps, host_net_tx_bps "
+        "  host_net_rx_bps, host_net_tx_bps, captured_frames, repeated_frames, capture_to_submit_p95_ms, encode_p95_ms, complete_to_send_p95_ms "
         "  FROM samples WHERE session_uuid = ? ORDER BY timestamp_unix DESC LIMIT ?"
         ") ORDER BY timestamp_unix");
     if (sample_stmt) {
@@ -1109,7 +1134,8 @@ namespace session_history::storage {
         sample.client_reported_losses = sqlite3_column_int64(sample_stmt.get(), 8);
         sample.idr_requests = static_cast<std::uint32_t>(sqlite3_column_int(sample_stmt.get(), 9));
         sample.ref_invalidations = static_cast<std::uint32_t>(sqlite3_column_int(sample_stmt.get(), 10));
-        sample.encode_latency_ms = sqlite3_column_double(sample_stmt.get(), 11);
+        sample.encode_latency_ms = sqlite3_column_type(sample_stmt.get(), 11) == SQLITE_NULL ?
+          -1 : sqlite3_column_double(sample_stmt.get(), 11);
         sample.actual_fps = sqlite3_column_double(sample_stmt.get(), 12);
         sample.actual_bitrate_kbps = sqlite3_column_double(sample_stmt.get(), 13);
         sample.frame_interval_jitter_ms = sqlite3_column_double(sample_stmt.get(), 14);
@@ -1128,6 +1154,12 @@ namespace session_history::storage {
         sample.host_gpu_temp_c = read_optional_real(21, -1);
         sample.host_net_rx_bps = read_optional_real(22, -1);
         sample.host_net_tx_bps = read_optional_real(23, -1);
+        sample.timing.captured_frames = sqlite3_column_type(sample_stmt.get(), 24) == SQLITE_NULL ? -1 : sqlite3_column_int64(sample_stmt.get(), 24);
+        sample.timing.repeated_frames = sqlite3_column_type(sample_stmt.get(), 25) == SQLITE_NULL ? -1 : sqlite3_column_int64(sample_stmt.get(), 25);
+        sample.timing.capture_to_submit_p95_ms = read_optional_real(26, -1);
+        sample.timing.encode_p95_ms = read_optional_real(27, -1);
+        sample.timing.complete_to_send_p95_ms = read_optional_real(28, -1);
+        sample.timing.send_interval_jitter_ms = sample.timing.captured_frames >= 0 ? sample.frame_interval_jitter_ms : -1;
         detail.samples.push_back(std::move(sample));
       }
     }

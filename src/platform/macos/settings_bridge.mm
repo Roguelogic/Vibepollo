@@ -248,7 +248,12 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
     item["bitDepth"] = s.dynamic_range != 0 ? 10 : 8;
     item["yuv444"] = s.yuv444;
     item["directUsb"] = s.direct_usb;
-    item["encodeLatencyMs"] = s.encode_latency_ms;
+    item["encodeLatencyMs"] = s.timing.captured_frames == 0 ? 0.0 : s.encode_latency_ms;
+    if (s.timing.encode_p95_ms >= 0) {
+      item["captureToSubmitP95Ms"] = s.timing.capture_to_submit_p95_ms;
+      item["encodeP95Ms"] = s.timing.encode_p95_ms;
+      item["completeToSendP95Ms"] = s.timing.complete_to_send_p95_ms;
+    }
     item["framesSent"] = s.frames_sent;
     item["losses"] = s.client_reported_losses;
     item["uptimeSeconds"] = s.uptime_seconds;

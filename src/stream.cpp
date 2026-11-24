@@ -846,6 +846,7 @@ namespace stream {
       std::atomic<std::uint32_t> idr_requests {0};
       std::atomic<std::uint32_t> invalidate_ref_count {0};
       std::atomic<std::int64_t> client_reported_losses {0};
+      video::frame_timing_t timing;
       std::atomic<std::uint16_t> last_encode_latency_us10 {0};  // in 1/10 ms units
       std::atomic<std::int64_t> last_frame_index {0};
       /// Index of the newest frame whose send began, or -1 before the first one.
@@ -1039,7 +1040,7 @@ namespace stream {
     }
   }
 
-  std::vector<session_info_t> get_all_session_info() {
+  std::vector<session_info_t> get_all_session_info(bool finish_timing_interval) {
     std::vector<session_info_t> result;
     auto now = std::chrono::steady_clock::now();
     auto sessions = rtsp_stream::get_sessions_snapshot();
@@ -1078,6 +1079,7 @@ namespace stream {
       info.idr_requests = session->stats.idr_requests.load(std::memory_order_relaxed);
       info.invalidate_ref_count = session->stats.invalidate_ref_count.load(std::memory_order_relaxed);
       info.client_reported_losses = session->stats.client_reported_losses.load(std::memory_order_relaxed);
+      info.timing = session->stats.timing.snapshot(finish_timing_interval);
       info.encode_latency_ms = session->stats.last_encode_latency_us10.load(std::memory_order_relaxed) / 10.0;
       info.last_frame_index = session->stats.last_frame_index.load(std::memory_order_relaxed);
       info.uptime_seconds = std::chrono::duration<double>(now - session->stats.start_time).count();
@@ -2649,7 +2651,6 @@ namespace stream {
         session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
       } else {
         frame_header.frame_processing_latency = 0;
-        session->stats.last_encode_latency_us10.store(0, std::memory_order_relaxed);
       }
 
       // Insert space for packet headers
@@ -3333,6 +3334,10 @@ namespace stream {
         }
 
         const auto send_complete_timestamp = std::chrono::steady_clock::now();
+        const bool synthetic_input = session->config.monitor.input_only ||
+                                     session->config.monitor.capture_source == video::capture_source_e::synthetic_black;
+        session->stats.timing.record(frame_is_dupe || synthetic_input ? std::nullopt : packet->capture_timestamp,
+                                     packet->encoder_submitted_at, packet->encoder_completed_at, send_complete_timestamp);
         if (!frame_is_dupe) {
           const wire_timeline_frame_t current_wire_frame {
             .frame_index = packet->frame_index(),

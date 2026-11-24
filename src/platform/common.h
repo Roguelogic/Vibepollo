@@ -725,6 +725,8 @@ namespace platf {
 
   struct vt_frame_metadata_t {
     uint64_t frame_index = 0;
+    std::chrono::steady_clock::time_point submitted_at {};
+    std::chrono::steady_clock::time_point completed_at {};
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
@@ -906,7 +908,7 @@ namespace platf {
       return nullptr;
     }
 
-    virtual std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) {
+    virtual std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt, bool full_range) {
       return nullptr;
     }
 

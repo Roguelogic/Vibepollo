@@ -28,6 +28,8 @@ namespace platf::vt {
    */
   using pixel_format_fn_t = std::function<void(int pixel_format)>;
 
+  OSType capture_pixel_format(bool yuv444, bool ten_bit, bool full_range);
+
   /**
    * @brief Decide whether to request low-latency rate control before standard rate control.
    *
@@ -110,5 +112,5 @@ namespace platf::vt {
    * @param pixel_format_fn Callback that selects the capture pixel format; invoked before capture starts.
    * @return Constructed encode device object, or null on failure.
    */
-  std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn);
+  std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, bool full_range, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn);
 }  // namespace platf::vt

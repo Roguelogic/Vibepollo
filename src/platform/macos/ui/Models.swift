@@ -13,6 +13,9 @@ struct ActiveStreamSession: Codable, Identifiable, Equatable {
   var yuv444: Bool
   var directUsb: Bool
   var encodeLatencyMs: Double
+  var captureToSubmitP95Ms: Double?
+  var encodeP95Ms: Double?
+  var completeToSendP95Ms: Double?
   var framesSent: UInt64
   var losses: Int64
   var uptimeSeconds: Double

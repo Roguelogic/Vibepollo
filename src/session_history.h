@@ -6,13 +6,14 @@
  * performance samples, and discrete events. A dedicated writer thread
  * serializes all mutations; read queries use a separate read-only connection.
  *
- * Computed metrics (actual FPS, actual bitrate, frame-interval jitter) are
- * maintained in a private per-session aggregator inside this module and are
- * NOT added to session_t::stats or session_info_t.
+ * Frame-stage percentiles and RTSP send jitter are sampled at the sender.
+ * FPS and bitrate are derived from per-session counter deltas.
  */
 #pragma once
 
 // standard includes
+#include "video_frame_timing.h"
+
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -60,6 +61,7 @@ namespace session_history {
     std::uint32_t idr_requests = 0;
     std::uint32_t ref_invalidations = 0;
 
+    video::frame_timing_sample_t timing;
     double encode_latency_ms = 0;
 
     // Computed by the history module's aggregator (not from atomics)
@@ -152,6 +154,7 @@ namespace session_history {
     // Latest computed metrics
     double actual_fps = 0;
     double actual_bitrate_kbps = 0;
+    video::frame_timing_sample_t timing;
     double encode_latency_ms = 0;
     double frame_interval_jitter_ms = 0;
 

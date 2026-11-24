@@ -3272,6 +3272,8 @@ namespace video {
         packet->frame_timestamp = emitted_meta.frame_timestamp;
         packet->capture_timestamp = emitted_meta.capture_timestamp;
         packet->host_processing_timestamp = emitted_meta.host_processing_timestamp;
+        packet->encoder_submitted_at = emitted_meta.submitted_at;
+        packet->encoder_completed_at = emitted_meta.completed_at;
         if (webrtc_stream::has_active_sessions()) {
           webrtc_stream::submit_video_packet(*packet);
         }
@@ -4894,7 +4896,7 @@ namespace video {
     auto max_frametime = std::chrono::nanoseconds(1000ms) * 1000 / minimum_fps_target;
     auto encode_frame_threshold = std::chrono::nanoseconds(1000ms) * 1000 / config.encodingFramerate;
     auto frame_variation_threshold = encode_frame_threshold / 4;
-    BOOST_LOG(info) << "Minimum FPS target set to ~"sv << (minimum_fps_target / 2000) << "fps ("sv << max_frametime * 2 << ")"sv;
+    BOOST_LOG(info) << "Minimum FPS target set to ~"sv << (minimum_fps_target / 1000) << "fps ("sv << max_frametime << ")"sv;
     BOOST_LOG(info) << "Encoding Frame threshold: "sv << encode_frame_threshold;
 
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
@@ -5027,6 +5029,9 @@ namespace video {
     // A keyframe request that arrived with an input the conversion then reported as a repeat.
     bool retry_idr = false;
     auto *vt_session = dynamic_cast<vt_encode_session_t *>(session.get());
+    if (vt_session) {
+      BOOST_LOG(info) << "Static desktop pacing: after 90 duplicate frames, idle refresh is capped at 4 fps";
+    }
     bool prev_was_real_capture = false;
     std::uint32_t consecutive_static_frames = 0;
 
@@ -5112,6 +5117,13 @@ namespace video {
         break;
       }
 
+      // Keep the mailbox available for replacement until hardware can take an input,
+      // including when an IDR is requested during an otherwise static interval.
+      const auto admission_started = std::chrono::steady_clock::now();
+      if (vt_session && frame_nr > 1 && !vt_session->wait_for_slot()) {
+        BOOST_LOG(error) << "VideoToolbox entered an unrecoverable state while waiting for a free encoder slot";
+        break;
+      }
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         auto image_wait_budget = max_frametime;
@@ -5137,18 +5149,8 @@ namespace video {
 
         const auto image_wait_started = std::chrono::steady_clock::now();
         if (vt_session && frame_nr > 1) {
-          // Parsec-style zero-backlog admission gate: wait for an AppleAVE2 hardware slot BEFORE
-          // popping from the 1-slot `images` mailbox so SCStream overwrites stale frames in O(1)
-          // while the silicon is busy, eliminating multi-frame FIFO queue bloat (e.g. 44ms -> 11ms at 4K@144).
-          const auto slot_wait_started = std::chrono::steady_clock::now();
-          if (!vt_session->wait_for_slot()) {
-            BOOST_LOG(error) << "VideoToolbox entered an unrecoverable state while waiting for a slot"sv;
-            break;
-          }
-          const auto slot_waited = std::chrono::steady_clock::now() - slot_wait_started;
-          image_wait_budget = slot_waited < image_wait_budget ?
-                                image_wait_budget - slot_waited :
-                                decltype(max_frametime)::zero();
+          const auto waited = std::chrono::steady_clock::now() - admission_started;
+          image_wait_budget = waited < image_wait_budget ? image_wait_budget - waited : decltype(max_frametime)::zero();
         }
         if (auto *amf_session = native_session;
             amf_session && image_wait_budget > decltype(max_frametime)::zero()) {
@@ -5506,7 +5508,7 @@ namespace video {
     } else if (dynamic_cast<const encoder_platform_formats_amf *>(encoder.platform_formats.get())) {
       result = disp.make_amf_encode_device(pix_fmt);
     } else if (dynamic_cast<const encoder_platform_formats_vt *>(encoder.platform_formats.get())) {
-      result = disp.make_vt_encode_device(pix_fmt);
+      result = disp.make_vt_encode_device(pix_fmt, colorspace.full_range);
     }
 
     if (result) {

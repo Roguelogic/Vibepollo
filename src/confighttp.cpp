@@ -743,6 +743,15 @@ namespace confighttp {
     return std::round(value * factor) / factor;
   }
 
+  void append_frame_timing(nlohmann::json &output, const video::frame_timing_sample_t &timing) {
+    if (timing.captured_frames < 0) return;
+    output["captured_frames"] = timing.captured_frames;
+    output["repeated_frames"] = timing.repeated_frames;
+    if (timing.capture_to_submit_p95_ms >= 0) output["capture_to_submit_p95_ms"] = round_to(timing.capture_to_submit_p95_ms, 100.0);
+    if (timing.encode_p95_ms >= 0) output["encode_p95_ms"] = round_to(timing.encode_p95_ms, 100.0);
+    if (timing.complete_to_send_p95_ms >= 0) output["complete_to_send_p95_ms"] = round_to(timing.complete_to_send_p95_ms, 100.0);
+  }
+
   nlohmann::json rtsp_session_to_json(const stream::session_info_t &info) {
     nlohmann::json output;
     output["uuid"] = info.uuid;
@@ -765,6 +774,7 @@ namespace confighttp {
     output["idr_requests"] = info.idr_requests;
     output["invalidate_ref_count"] = info.invalidate_ref_count;
     output["client_reported_losses"] = info.client_reported_losses;
+    append_frame_timing(output, info.timing);
     output["encode_latency_ms"] = round_to(info.encode_latency_ms, 10.0);
     output["last_frame_index"] = info.last_frame_index;
     output["uptime_seconds"] = round_to(info.uptime_seconds, 10.0);
@@ -851,7 +861,8 @@ namespace confighttp {
     output["client_reported_losses"] = sample.client_reported_losses;
     output["idr_requests"] = sample.idr_requests;
     output["ref_invalidations"] = sample.ref_invalidations;
-    output["encode_latency_ms"] = round_to(sample.encode_latency_ms, 10.0);
+    append_frame_timing(output, sample.timing);
+    output["encode_latency_ms"] = sample.encode_latency_ms >= 0 ? nlohmann::json(round_to(sample.encode_latency_ms, 10.0)) : nlohmann::json(nullptr);
     output["actual_fps"] = round_to(sample.actual_fps, 10.0);
     output["actual_bitrate_kbps"] = round_to(sample.actual_bitrate_kbps, 10.0);
     output["frame_interval_jitter_ms"] = round_to(sample.frame_interval_jitter_ms, 100.0);
@@ -895,6 +906,7 @@ namespace confighttp {
     output["uptime_seconds"] = round_to(session.uptime_seconds, 10.0);
     output["actual_fps"] = round_to(session.actual_fps, 10.0);
     output["actual_bitrate_kbps"] = round_to(session.actual_bitrate_kbps, 10.0);
+    append_frame_timing(output, session.timing);
     output["encode_latency_ms"] = round_to(session.encode_latency_ms, 10.0);
     output["frame_interval_jitter_ms"] = round_to(session.frame_interval_jitter_ms, 100.0);
     output["frames_sent"] = session.frames_sent;
