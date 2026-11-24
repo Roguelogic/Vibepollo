@@ -111,9 +111,6 @@ jobs:
             pkgconf \
             miniupnpc \
             opus
-          # Runner images ship icu4c@78 unlinked, and installing it again only warns about that.
-          # Configure finds it through brew --prefix, linked or not.
-          brew list --versions icu4c@78 > /dev/null || brew install icu4c@78
 
       - name: Cache OpenSSL
         id: openssl_cache
@@ -156,7 +153,6 @@ jobs:
             -DBUILD_TESTS=ON \
             -DBUILD_WERROR=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DICU_ROOT="$(brew --prefix icu4c@78 2>/dev/null)" \
             -DOPENSSL_ROOT_DIR="${RUNNER_TEMP}/openssl" \
             -DOPENSSL_USE_STATIC_LIBS=ON \
             -DOpus_ROOT_DIR="$(brew --prefix opus 2>/dev/null)" \

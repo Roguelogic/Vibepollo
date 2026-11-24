@@ -15,7 +15,9 @@ set(BOOST_COMPONENTS
 )
 # system is not used by Sunshine, but by Simple-Web-Server, added here for convenience
 
-if(NOT WIN32)
+# Boost.Locale is unused on macOS (main.cpp configures UTF-8 via std::codecvt_utf8);
+# skipping it avoids pulling 37 MB of Homebrew ICU libraries into the app bundle.
+if(NOT WIN32 AND NOT APPLE)
     list(APPEND BOOST_COMPONENTS locale)
 endif()
 
@@ -82,6 +84,7 @@ if(NOT Boost_FOUND OR _boost_targets_missing)
     list(REMOVE_DUPLICATES BOOST_COMPONENTS)
 
     set(BOOST_ENABLE_CMAKE ON)
+    set(BOOST_LOCALE_ENABLE_ICU OFF CACHE BOOL "Disable ICU backend in Boost.Locale" FORCE)
 
     # Limit boost to the required libraries only
     set(BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS})

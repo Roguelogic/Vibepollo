@@ -90,6 +90,18 @@ else()
             message(FATAL_ERROR \"codesign failed to remove existing signatures\")
         endif()
 
+        # Strip non-global/local symbol tables from Release executables (~9 MB reduction)
+        # after removing signatures, while preserving Swift metadata and __CGPreLoginApp.
+        if(NOT \"${CMAKE_BUILD_TYPE}\" STREQUAL \"Debug\")
+            execute_process(
+                COMMAND /usr/bin/strip -x \"\${_app}/Contents/MacOS/${CMAKE_PROJECT_NAME}\"
+                RESULT_VARIABLE strip_rc
+            )
+            if(NOT strip_rc EQUAL 0)
+                message(FATAL_ERROR \"strip -x failed for \${_app}/Contents/MacOS/${CMAKE_PROJECT_NAME}\")
+            endif()
+        endif()
+
         # SHOULD_SIGN is set only when publish_release is true or when manually building
         if(\"\$ENV{SHOULD_SIGN}\" STREQUAL \"true\")
           # Sign anything inside Contents/Frameworks

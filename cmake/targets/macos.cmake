@@ -28,6 +28,7 @@ else()
     set(_bundle_launch_agents_dir "$<TARGET_FILE_DIR:sunshine>/../Library/LaunchAgents")
     add_custom_command(TARGET sunshine POST_BUILD
             COMMENT "Copying bundle resources to build tree"
+            COMMAND "${CMAKE_COMMAND}" -E remove_directory "${_bundle_resources_dir}/assets"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bundle_resources_dir}"
             COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_BINARY_DIR}/assets" "${_bundle_resources_dir}/assets"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -40,7 +41,10 @@ else()
 endif()
 
 # Tell linker to dynamically load these symbols at runtime, in case they're unavailable:
-target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,-U,_CGRequestScreenCaptureAccess)
+target_link_options(sunshine PRIVATE
+        -Wl,-U,_CGPreflightScreenCaptureAccess
+        -Wl,-U,_CGRequestScreenCaptureAccess
+        $<$<CONFIG:Release>:-Wl,-dead_strip>)
 
 if(SUNSHINE_ENABLE_TRAY)
     add_library(vibepollo_macos_ui STATIC

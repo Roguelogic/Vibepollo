@@ -59,6 +59,7 @@ fi
 cmake -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTS=OFF \
+  -DOPENSSL_USE_STATIC_LIBS=ON \
   -DAPPLE_CODESIGN_IDENTITY="$DEV_ID" \
   "${OPENSSL_ARGS[@]}"
 cmake --build build --target sunshine -j"$(sysctl -n hw.ncpu)"

@@ -1,6 +1,11 @@
 # load macOS dependencies
 
 # Resolve OpenSSL before subprojects run their own find_package(OpenSSL) calls.
+# Prefer static archives for self-contained .app bundles so dead_strip removes unused
+# crypto algorithms and avoids bundling libssl/libcrypto dylibs in Contents/Frameworks.
+if(NOT SUNSHINE_BUILD_HOMEBREW AND NOT DEFINED OPENSSL_USE_STATIC_LIBS)
+    set(OPENSSL_USE_STATIC_LIBS ON CACHE BOOL "Use static OpenSSL libraries for self-contained .app bundles")
+endif()
 find_package(OpenSSL REQUIRED)
 
 # boost, this should be before Simple-Web-Server as it also depends on boost
@@ -29,9 +34,18 @@ pkg_check_modules(CURL REQUIRED libcurl)
 # SQLite3 (session history persistence)
 pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 
-# miniupnp
+# miniupnp (prefer static archive for self-contained .app bundles with zero third-party dylibs)
 pkg_check_modules(MINIUPNP miniupnpc REQUIRED)
 include_directories(SYSTEM ${MINIUPNP_INCLUDE_DIRS})
+if(NOT SUNSHINE_BUILD_HOMEBREW)
+    find_library(MINIUPNP_STATIC_LIBRARY
+            NAMES libminiupnpc.a
+            PATHS ${MINIUPNP_LIBRARY_DIRS}
+            NO_DEFAULT_PATH)
+    if(MINIUPNP_STATIC_LIBRARY)
+        set(MINIUPNP_LIBRARIES "${MINIUPNP_STATIC_LIBRARY}")
+    endif()
+endif()
 
 # ffmpeg pre-compiled binaries
 include("${CMAKE_MODULE_PATH}/dependencies/ffmpeg.cmake")

@@ -1,21 +1,106 @@
-<!doctype html>
-<html lang="en" data-theme="dark">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#101218" />
-    <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-title" content="Vibepollo" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="%BASE_URL%vibepollo.webmanifest" />
-    <link rel="apple-touch-icon" href="%BASE_URL%images/logo-apollo-45.png" />
-    <link rel="icon" href="%BASE_URL%images/apollo.ico" />
-    <title>Vibepollo</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/main.ts"></script>
-  </body>
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vibepollo — Remote Console</title>
+  <link rel="icon" type="image/x-icon" href="/images/apollo.ico">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/images/logo-apollo-45.png" alt="Vibepollo" width="32" height="32">
+        <div>
+          <h1>Vibepollo</h1>
+          <p id="host-meta" class="muted" data-i18n="subtitle">macOS 원격 페어링 콘솔</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button id="lang-toggle" type="button" class="btn btn-ghost">EN</button>
+        <button id="logout-btn" type="button" class="btn btn-ghost hidden" data-i18n="logout">로그아웃</button>
+      </div>
+    </header>
+
+    <div id="banner" class="banner hidden" role="status" aria-live="polite"></div>
+
+    <!-- First-time credential setup -->
+    <section id="view-setup" class="card hidden">
+      <h2 data-i18n="setupTitle">관리자 계정 설정</h2>
+      <p class="muted" data-i18n="setupDesc">원격 웹 페어링 콘솔을 보호할 계정을 생성하세요.</p>
+      <form id="setup-form" class="form">
+        <label class="field">
+          <span data-i18n="username">사용자 이름</span>
+          <input id="setup-user" type="text" autocomplete="username" required value="admin">
+        </label>
+        <label class="field">
+          <span data-i18n="password">비밀번호</span>
+          <input id="setup-pass" type="password" autocomplete="new-password" required>
+        </label>
+        <label class="field">
+          <span data-i18n="confirmPassword">비밀번호 확인</span>
+          <input id="setup-confirm" type="password" autocomplete="new-password" required>
+        </label>
+        <button type="submit" class="btn btn-primary" data-i18n="createAccount">계정 생성</button>
+      </form>
+    </section>
+
+    <!-- Login -->
+    <section id="view-login" class="card hidden">
+      <h2 data-i18n="loginTitle">로그인</h2>
+      <p class="muted" data-i18n="loginDesc">Vibepollo 관리자 계정으로 로그인하세요.</p>
+      <form id="login-form" class="form">
+        <label class="field">
+          <span data-i18n="username">사용자 이름</span>
+          <input id="login-user" type="text" autocomplete="username" required>
+        </label>
+        <label class="field">
+          <span data-i18n="password">비밀번호</span>
+          <input id="login-pass" type="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="btn btn-primary" data-i18n="signIn">로그인</button>
+      </form>
+    </section>
+
+    <!-- Authenticated console -->
+    <div id="view-console" class="stack hidden">
+      <section class="card">
+        <h2 data-i18n="pinTitle">기기 페어링 (PIN)</h2>
+        <p class="muted" data-i18n="pinDesc">Moonlight / VoidLink 클라이언트에 표시된 4자리 PIN을 입력하세요.</p>
+        <form id="pin-form" class="form">
+          <div class="row">
+            <label class="field pin-field">
+              <span data-i18n="pinLabel">4자리 PIN</span>
+              <input id="pin-code" type="text" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="1234" required>
+            </label>
+            <label class="field grow">
+              <span data-i18n="deviceName">기기 이름</span>
+              <input id="pin-name" type="text" maxlength="64" placeholder="iPad Pro" required>
+            </label>
+          </div>
+          <button type="submit" class="btn btn-primary" data-i18n="pairDevice">페어링 완료</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2 data-i18n="clientsTitle">페어링된 기기</h2>
+          <button id="refresh-clients" type="button" class="btn btn-ghost" data-i18n="refresh">새로고침</button>
+        </div>
+        <ul id="clients-list" class="list"></ul>
+        <p id="clients-empty" class="muted hidden" data-i18n="clientsEmpty">페어링된 기기가 없습니다.</p>
+      </section>
+
+      <section class="card">
+        <h2 data-i18n="hostTitle">호스트 관리</h2>
+        <p class="muted" data-i18n="nativeHint">상세 디스플레이·화질·입력 설정은 Mac의 Vibepollo 네이티브 설정 창(⌘,)에서 관리할 수 있습니다.</p>
+        <div class="actions">
+          <button id="restart-btn" type="button" class="btn btn-secondary" data-i18n="restartHost">호스트 재시작</button>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
 </html>
