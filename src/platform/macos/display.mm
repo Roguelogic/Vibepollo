@@ -509,9 +509,9 @@ namespace platf {
       std::chrono::steady_clock::time_point last_frame = std::chrono::steady_clock::now();
     };
 
-    // Canonical HDR SDR reference white (ITU-R BT.2408 / Apple ColorSync PQ white = 203 nits),
-    // matching SCCaptureDynamicRangeHDRCanonicalDisplay (2).
-    constexpr double sdr_white_nits = 203.0;
+    // SDR white in ScreenCaptureKit's HDRLocalDisplay (1) frames, measured from an HDR virtual
+    // display on macOS 27 (~140 nits SDR white, ~700 nits peak at 5x headroom).
+    constexpr double sdr_white_nits = 140.0;
     // macOS 27 gives an HDR virtual display this much EDR headroom.
     constexpr double virtual_display_headroom = 5.0;
     // The brightest Apple displays peak at 1600 nits.

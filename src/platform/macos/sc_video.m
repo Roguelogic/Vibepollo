@@ -295,10 +295,11 @@ void macos_sc_set_cursor_visible(bool visible) {
                                 self.pixelFormat == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange);
   if (self.hdr && tenBitHdrFormat) {
     if ([configuration respondsToSelector:NSSelectorFromString(@"setCaptureDynamicRange:")]) {
-      // SCCaptureDynamicRangeHDRCanonicalDisplay (2): standardizes HDR output for remote HDR
-      // displays (~203 nits SDR reference white per ITU-R BT.2408) instead of HDRLocalDisplay (1),
-      // which compresses virtual-display SDR desktop content down to ~140 nits.
-      [configuration setValue:@2 forKey:@"captureDynamicRange"];
+      // Keep SCCaptureDynamicRangeHDRLocalDisplay (1) so WindowServer stays on the direct
+      // display composite tap. HDRCanonicalDisplay (2) triggers a second FP16 per-window/backdrop
+      // re-composition pass (+25~30%p M4 GPU load at 2752x2064@120Hz), saturating the GPU to
+      // 85~98% and causing 120Hz VSync misses under Liquid Glass and Apple Music windows.
+      [configuration setValue:@1 forKey:@"captureDynamicRange"];
     }
     configuration.colorSpaceName = kCGColorSpaceITUR_2100_PQ;
     configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020;
