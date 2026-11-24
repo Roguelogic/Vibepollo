@@ -170,3 +170,53 @@ TEST(MacosInputEvents, ContinuousScrollAndTabletPointCGEventsRoundTripThroughNSE
     EXPECT_NEAR([ns_pen rotation], 135.0f, 0.5f);
   }
 }
+
+TEST(MacosInputEvents, PenPressureSanitizerBlocksSpikesAndZeroFallbackJumps) {
+  mip::pen_pressure_sanitizer_t sanitizer;
+
+  // 1. Legacy non-pressure stylus (always 0.0) retains 0.5 default.
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(true, 0.0f, false, false, 30), 0.5);
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(false, 0.0f, false, false, 30), 0.0);
+
+  // 2. Variable-pressure Apple Pencil stroke with normal progression & smooth ramp to 1.0.
+  EXPECT_NEAR(sanitizer.resolve(true, 0.12f, false, false, 35), 0.12, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 0.25f, false, false, 35), 0.25, 1e-4);
+
+  // 3. Invalid raw wire pressure (+Inf / NaN / >1.5 divide-by-zero blowup) holds previous pressure.
+  EXPECT_NEAR(sanitizer.resolve(true, 0.0f, true, false, 90), 0.25, 1e-4);
+
+  // 4. Client-clamped 1.0 spike paired with altitude==0 (tilt==90) holds previous pressure across multiple frames.
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 90), 0.25, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 89), 0.25, 1e-4);
+
+  // 5. Isolated single-sample jump to 1.0 mid-stroke (even with normal/disabled tilt) is held and discarded.
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 0), 0.25, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 0.28f, false, false, 35), 0.28, 1e-4);
+
+  // 6. Genuine sustained hard press confirms on the very next sample (4-8ms later).
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 35), 0.28, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 35), 1.0, 1e-4);
+
+  // 7. Smooth ramp to 1.0 emits immediately without delay.
+  EXPECT_NEAR(sanitizer.resolve(true, 0.40f, false, false, 35), 0.40, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 0.72f, false, false, 35), 0.72, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 1.00f, false, false, 35), 1.00, 1e-4);
+
+  // 8. BUTTON_ONLY mid-stroke keeps current pressure rather than jumping to 0.5.
+  EXPECT_NEAR(sanitizer.resolve(true, 0.30f, false, false, 35), 0.30, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 0.0f, false, true, 35), 0.30, 1e-4);
+
+  // 9. Genuine 0.0 feathering taper before UP does NOT jump back up to 0.5.
+  EXPECT_NEAR(sanitizer.resolve(true, 0.0f, false, false, 35), mip::pen_pressure_sanitizer_t::light_contact_floor, 1e-4);
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(false, 0.0f, false, false, 35), 0.0);
+
+  // 10. Stroke onset (DOWN) with client-clamped 1.0 spike holds soft floor until confirmed.
+  EXPECT_NEAR(sanitizer.resolve(true, 1.0f, false, false, 35), mip::pen_pressure_sanitizer_t::light_contact_floor, 1e-4);
+  EXPECT_NEAR(sanitizer.resolve(true, 0.15f, false, false, 35), 0.15, 1e-4);
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(false, 0.0f, false, false, 35), 0.0);
+
+  // 11. Binary stylus (only ever sends 1.0) is never damped on onset.
+  sanitizer.reset();
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(true, 1.0f, false, false, 35), 1.0);
+  EXPECT_DOUBLE_EQ(sanitizer.resolve(true, 1.0f, false, false, 35), 1.0);
+}

@@ -569,6 +569,7 @@ namespace platf {
     float contactAreaMinor;
     std::uint16_t barrelRoll {0xFFFF};  // Degrees (0..359) or LI_ROT_UNKNOWN
     bool voidlink_extended {false};  // True when sent via VoidLink SS_PEN_BARREL_ROLL_MAGIC
+    bool pressure_invalid {false};  // True when raw wire pressure was non-finite or overflowed
   };
 
   struct pencil_side_button_input_t {

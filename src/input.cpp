@@ -90,7 +90,11 @@ namespace input {
    * @return Clamped native endianess float value.
    */
   float from_clamped_netfloat(netfloat f, float min, float max) {
-    return std::clamp(from_netfloat(f), min, max);
+    const float value = from_netfloat(f);
+    if (!std::isfinite(value)) {
+      return min;
+    }
+    return std::clamp(value, min, max);
   }
 
   struct held_key_t {
@@ -1515,6 +1519,19 @@ namespace input {
       {abs_port->width / 65535.f, abs_port->height / 65535.f}
     );
 
+    const float raw_pressure_or_distance = from_netfloat(packet->pressureOrDistance);
+    const bool is_pen_contact =
+      packet->eventType == LI_TOUCH_EVENT_DOWN || packet->eventType == LI_TOUCH_EVENT_MOVE;
+    // Some iPadOS clients compute `(force / maxForce) / sin(altitude)` without a lower angle
+    // floor; transient altitude==0 or tiny estimated angles blow up to +Inf/NaN/>1.5 instead
+    // of genuine full pressure. Flag those so the platform backend holds prior stroke pressure
+    // rather than injecting a maximum-pressure blotch.
+    const bool pressure_invalid =
+      !std::isfinite(raw_pressure_or_distance) ||
+      (is_pen_contact && raw_pressure_or_distance > 1.5f);
+    const float clamped_pressure_or_distance =
+      pressure_invalid ? 0.0f : std::clamp(raw_pressure_or_distance, 0.0f, 1.0f);
+
     platf::pen_input_t pen {
       packet->eventType,
       packet->toolType,
@@ -1523,11 +1540,12 @@ namespace input {
       rotation,
       coords->first,
       coords->second,
-      from_clamped_netfloat(packet->pressureOrDistance, 0.0f, 1.0f),
+      clamped_pressure_or_distance,
       contact_area.first,
       contact_area.second,
       barrel_roll,
       voidlink_extended,
+      pressure_invalid,
     };
 
     platf::pen_update(input->client_context.get(), *abs_port, pen);

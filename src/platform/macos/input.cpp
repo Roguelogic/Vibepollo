@@ -191,7 +191,22 @@ namespace platf {
     macos_input_policy::trackpad_gesture_emitter_t trackpad_gesture_emitter {};
     std::mutex gesture_dispatch_mutex;
     cf_ref_t<CGEventRef> reusable_gesture_event {};
+
+    // Active Apple Pencil tip contact guard: prevents stray mouse/trackpad moves
+    // from injecting default-subtype (pressure=1.0) drags mid-stroke.
+    std::atomic<bool> pen_tip_active {false};
+    std::atomic<std::int64_t> pen_tip_last_activity_ns {0};
   };
+
+  bool is_pen_tip_guard_active(const macos_input_t *macos_input) noexcept {
+    if (!macos_input || !macos_input->pen_tip_active.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const auto now_ns = static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    const auto last_ns = macos_input->pen_tip_last_activity_ns.load(std::memory_order_relaxed);
+    constexpr std::int64_t max_hold_ns = 2'000'000'000LL;
+    return last_ns > 0 && (now_ns - last_ns) <= max_hold_ns;
+  }
 
   void cancel_scroll_momentum(macos_input_t *macos_input);
   double current_scroll_momentum_speed(macos_input_t *macos_input);
@@ -614,6 +629,7 @@ namespace platf {
       const double deltaY = raw_location.y - previous_location.y;
       CGEventSetDoubleValueField(event, kCGMouseEventDeltaX, deltaX);
       CGEventSetDoubleValueField(event, kCGMouseEventDeltaY, deltaY);
+      CGEventSetIntegerValueField(event, kCGMouseEventSubtype, kCGEventMouseSubtypeDefault);
 
       CGEventSetFlags(event, macos_input->kb_flags.load(std::memory_order_relaxed));
       CGEventSetTimestamp(event, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
@@ -654,6 +670,10 @@ namespace platf {
   }
 
   void move_mouse(input_t &input, const int deltaX, const int deltaY) {
+    const auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (is_pen_tip_guard_active(macos_input)) {
+      return;
+    }
     const auto current = consume_trackpad_cursor_loc(input);
     const auto location = util::point_t {current.x + deltaX, current.y + deltaY};
     const auto [btn, ev_type] = active_mouse_move_state(input);
@@ -667,6 +687,9 @@ namespace platf {
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, const float x, const float y) {
     const auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (is_pen_tip_guard_active(macos_input)) {
+      return;
+    }
     const auto location = stream_location(macos_input, touch_port, x, y);
     const auto prev = consume_trackpad_cursor_loc(input);
     const auto [btn, ev_type] = active_mouse_move_state(input);
@@ -1341,7 +1364,9 @@ namespace platf {
       if (!macos_input_policy::trackpad_gesture_emitter_t::is_allowed_packet(pkt)) {
         continue;
       }
-      if (!primed_target && pkt.phase == macos_input_policy::trackpad_gesture_emitter_t::phase_began) {
+      if (!primed_target &&
+          pkt.phase == macos_input_policy::trackpad_gesture_emitter_t::phase_began &&
+          !is_pen_tip_guard_active(macos_input)) {
         primed_target = true;
         CGWarpMouseCursorPosition(loc);
         CGAssociateMouseAndMouseCursorPosition(true);
@@ -1491,7 +1516,8 @@ namespace platf {
     ) {
       ensure_event_sources(macos_input);
       const bool is_down = (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown);
-      if (is_down || type == kCGEventMouseMoved) {
+      const bool location_changed = !have_location || location.x != last_location.x || location.y != last_location.y;
+      if ((is_down || type == kCGEventMouseMoved) && location_changed) {
         CGWarpMouseCursorPosition(location);
       }
 
@@ -1550,9 +1576,23 @@ namespace platf {
                                  type != kCGEventLeftMouseUp &&
                                  pen->eventType != LI_TOUCH_EVENT_UP &&
                                  pen->eventType != LI_TOUCH_EVENT_HOVER;
-        const double pressure = tip_pressed ?
-                                  (pen->pressureOrDistance > 0.0f ? std::clamp<double>(pen->pressureOrDistance, 0.0, 1.0) : 0.5) :
-                                  0.0;
+        double pressure = 0.0;
+        if (!tip_pressed) {
+          if (!pen_down[PEN_TIP] || type == kCGEventLeftMouseUp || pen->eventType == LI_TOUCH_EVENT_UP) {
+            pen_pressure_sanitizer.end_stroke();
+          }
+          pressure = 0.0;
+        } else if (type == kCGEventLeftMouseDown || type == kCGEventLeftMouseDragged) {
+          pressure = pen_pressure_sanitizer.resolve(
+            true,
+            pen->pressureOrDistance,
+            pen->pressure_invalid,
+            pen->eventType == LI_TOUCH_EVENT_BUTTON_ONLY,
+            pen->tilt
+          );
+        } else {
+          pressure = pen_pressure_sanitizer.last_pressure();
+        }
         CGEventSetDoubleValueField(event, kCGTabletEventPointPressure, pressure);
         CGEventSetDoubleValueField(event, kCGMouseEventPressure, pressure);
         CGEventSetDoubleValueField(event, kCGTabletEventTiltX, tilt_x);
@@ -1604,11 +1644,38 @@ namespace platf {
       post_event(event);
     }
 
+    void set_pen_tip_down(const bool down) noexcept {
+      pen_down[PEN_TIP] = down;
+      if (macos_input) {
+        if (down) {
+          macos_input->pen_tip_last_activity_ns.store(
+            static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)),
+            std::memory_order_relaxed
+          );
+          macos_input->pen_tip_active.store(true, std::memory_order_release);
+        } else {
+          macos_input->pen_tip_active.store(false, std::memory_order_release);
+        }
+      }
+    }
+
+    void touch_pen_tip_activity() const noexcept {
+      if (macos_input && pen_down[PEN_TIP]) {
+        macos_input->pen_tip_last_activity_ns.store(
+          static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)),
+          std::memory_order_relaxed
+        );
+      }
+    }
+
     void pen_release() {
       macos_pen_hover_cursor_hide();
       pen_squeeze_primary_down = false;
       pen_draw_saw_air_hover = false;
+      pen_draw_air_hover_during_contact = 0;
+      pen_pressure_sanitizer.end_stroke();
       if (!pen_in_proximity) {
+        set_pen_tip_down(false);
         return;
       }
 
@@ -1617,10 +1684,15 @@ namespace platf {
       pen.rotation = LI_ROT_UNKNOWN;
       for (int i = PEN_BUTTON_COUNT - 1; i >= 0; --i) {
         if (pen_down[i]) {
-          pen_down[i] = false;
+          if (i == PEN_TIP) {
+            set_pen_tip_down(false);
+          } else {
+            pen_down[i] = false;
+          }
           post_mouse_event(button_event(i, false, false), mouse_button(i), last_location, i == PEN_TIP ? pen_click_count : 1, &pen, true);
         }
       }
+      set_pen_tip_down(false);
       post_proximity(false);
       pen_in_proximity = false;
     }
@@ -1655,7 +1727,7 @@ namespace platf {
         return;
       }
       if (pen_scroll_mode_ == contact_mode_e::dragging) {
-        pen_down[PEN_TIP] = false;
+        set_pen_tip_down(false);
         post_mouse_event(kCGEventLeftMouseUp, kCGMouseButtonLeft, last_location, 1);
       } else if (pen_scroll_mode_ == contact_mode_e::scrolling) {
         finish_continuous_scroll_gesture(macos_input);
@@ -1694,7 +1766,7 @@ namespace platf {
         scroll_remainder_y += delta_y;
         scroll_by_remainder();
       } else if (pen_scroll_mode_ == contact_mode_e::dragging) {
-        pen_down[PEN_TIP] = true;
+        set_pen_tip_down(true);
         if (!have_location || location.x != last_location.x || location.y != last_location.y) {
           post_mouse_event(kCGEventLeftMouseDragged, kCGMouseButtonLeft, location, 0);
         }
@@ -1704,7 +1776,7 @@ namespace platf {
         macos_pen_hover_cursor_hide();
         if (drag_intent) {
           pen_scroll_mode_ = contact_mode_e::dragging;
-          pen_down[PEN_TIP] = true;
+          set_pen_tip_down(true);
           post_mouse_event(kCGEventLeftMouseDown, kCGMouseButtonLeft, pen_start, 1);
           post_mouse_event(kCGEventLeftMouseDragged, kCGMouseButtonLeft, location, 0);
         } else {
@@ -1725,7 +1797,7 @@ namespace platf {
       pen_scroll_mode_ = contact_mode_e::idle;
       pen_caught_momentum = false;
       pen_air_hover_during_contact = 0;
-      pen_down[PEN_TIP] = false;
+      set_pen_tip_down(false);
       macos_pen_hover_cursor_hide();
 
       if (prev_mode == contact_mode_e::dragging) {
@@ -1850,7 +1922,10 @@ namespace platf {
     bool pen_eraser_latched {};
     bool pen_squeeze_primary_down {};
     bool pen_draw_saw_air_hover {};
+    int pen_draw_air_hover_during_contact {};
+    std::chrono::steady_clock::time_point pen_draw_last_contact_time {};
     std::chrono::steady_clock::time_point pen_draw_last_up_time {};
+    macos_input_policy::pen_pressure_sanitizer_t pen_pressure_sanitizer {};
 
     // Minimal standard touch state
     std::map<std::uint32_t, touch_point_t> touch_points;
@@ -1987,8 +2062,10 @@ namespace platf {
     }
     if (pen.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
       pen_roll_probe.reset();
+      pen_pressure_sanitizer.reset();
       pen_eraser_latched = false;
       pen_squeeze_primary_down = false;
+      pen_draw_air_hover_during_contact = 0;
     }
 
     if (!use_pen_draw_mode()) {
@@ -2022,11 +2099,22 @@ namespace platf {
     }
 
     const auto now = std::chrono::steady_clock::now();
-    note_pen_activity_for_palm_rejection(
-      now,
-      input::voidlink::should_press_pen_tip(pen.eventType, pen_down[PEN_TIP])
-    );
     if (pen.eventType == LI_TOUCH_EVENT_HOVER) {
+      if (pen_down[PEN_TIP]) {
+        ++pen_draw_air_hover_during_contact;
+        const auto since_contact = pen_draw_last_contact_time.time_since_epoch().count() != 0
+                                     ? std::chrono::duration_cast<std::chrono::milliseconds>(now - pen_draw_last_contact_time)
+                                     : std::chrono::milliseconds(100);
+        if (!macos_input_policy::should_finish_pen_contact_on_hover(
+              pen.pressureOrDistance,
+              pen_draw_air_hover_during_contact,
+              since_contact
+            )) {
+          note_pen_activity_for_palm_rejection(now, true);
+          touch_pen_tip_activity();
+          return;
+        }
+      }
       if (!pen_down[PEN_TIP] &&
           pen.pressureOrDistance <= 0.0005f &&
           pen_draw_last_up_time.time_since_epoch().count() != 0 &&
@@ -2036,9 +2124,19 @@ namespace platf {
       if (pen.pressureOrDistance > 0.0005f) {
         pen_draw_saw_air_hover = true;
       }
+    } else if (pen.eventType == LI_TOUCH_EVENT_DOWN || pen.eventType == LI_TOUCH_EVENT_MOVE) {
+      pen_draw_air_hover_during_contact = 0;
+      pen_draw_last_contact_time = now;
+      touch_pen_tip_activity();
     } else if (pen.eventType == LI_TOUCH_EVENT_UP) {
+      pen_draw_air_hover_during_contact = 0;
       pen_draw_last_up_time = now;
     }
+
+    note_pen_activity_for_palm_rejection(
+      now,
+      input::voidlink::should_press_pen_tip(pen.eventType, pen_down[PEN_TIP])
+    );
 
     const auto location = clamp_to_display(stream_location(macos_input, touch_port, pen.x * touch_port.width, pen.y * touch_port.height));
     const std::uint8_t effective_tool =
@@ -2095,7 +2193,11 @@ namespace platf {
       if (wanted[i] == pen_down[i]) {
         continue;
       }
-      pen_down[i] = wanted[i];
+      if (i == PEN_TIP) {
+        set_pen_tip_down(wanted[i]);
+      } else {
+        pen_down[i] = wanted[i];
+      }
 
       int clicks = 1;
       if (i == PEN_TIP && wanted[i]) {
@@ -2346,6 +2448,11 @@ namespace platf {
   void mac_trackpad_gesture(input_t &input, const mac_trackpad_gesture_t &gesture) {
     auto *macos_input = static_cast<macos_input_t *>(input.get());
     if (!macos_input || !config::input.mouse) {
+      return;
+    }
+    if (is_pen_tip_guard_active(macos_input) &&
+        gesture.phase != input::voidlink::mac_gesture_end &&
+        gesture.phase != input::voidlink::mac_gesture_cancel) {
       return;
     }
     using emitter_t = macos_input_policy::trackpad_gesture_emitter_t;

@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -210,6 +211,148 @@ namespace platf::macos_input_policy {
 
     bool magnify_active_ {};
     bool rotate_active_ {};
+  };
+
+  /**
+   * @brief Sanitizes Apple Pencil / stylus contact pressure against client-side altitude
+   *        divide-by-zero blowups (`+Inf`/`NaN`/`>1.5`), single-sample jumps to `1.0` (e.g.
+   *        when a client LUT clamps `+Inf` to `1.0`), and spurious `0.0 -> 0.5` jumps on light
+   *        touch onset/taper or side-button packets.
+   */
+  class pen_pressure_sanitizer_t {
+  public:
+    static constexpr double legacy_default_pressure = 0.5;
+    static constexpr double light_contact_floor = 0.005;
+    static constexpr double max_spike_threshold = 0.98;
+    static constexpr double confirm_high_threshold = 0.85;
+    static constexpr double sudden_jump_delta = 0.35;
+    static constexpr double high_baseline_threshold = 0.65;
+    static constexpr std::uint8_t tilt_unknown = 0xFF;
+
+    void reset() noexcept {
+      in_stroke_ = false;
+      has_seen_real_pressure_ = false;
+      has_seen_variable_pressure_ = false;
+      has_seen_normal_tilt_ = false;
+      pending_max_spike_ = false;
+      last_emitted_pressure_ = 0.0;
+    }
+
+    void end_stroke() noexcept {
+      in_stroke_ = false;
+      pending_max_spike_ = false;
+      last_emitted_pressure_ = 0.0;
+    }
+
+    double last_pressure() const noexcept {
+      return in_stroke_ ? last_emitted_pressure_ : 0.0;
+    }
+
+    double resolve(
+      const bool tip_pressed,
+      const float clamped_pressure,
+      const bool pressure_invalid,
+      const bool is_button_only,
+      const std::uint8_t tilt_deg
+    ) noexcept {
+      if (!tip_pressed) {
+        end_stroke();
+        return 0.0;
+      }
+
+      if (tilt_deg != tilt_unknown && tilt_deg <= 78) {
+        has_seen_normal_tilt_ = true;
+      }
+
+      if (is_button_only) {
+        if (in_stroke_) {
+          return last_emitted_pressure_;
+        }
+        return has_seen_real_pressure_ ? light_contact_floor : legacy_default_pressure;
+      }
+
+      const bool bad_altitude_spike =
+        has_seen_normal_tilt_ &&
+        tilt_deg != tilt_unknown &&
+        tilt_deg >= 88 &&
+        clamped_pressure >= 0.95f &&
+        (!in_stroke_ || last_emitted_pressure_ < high_baseline_threshold);
+
+      if (pressure_invalid || bad_altitude_spike) {
+        pending_max_spike_ = false;
+        if (in_stroke_) {
+          return last_emitted_pressure_;
+        }
+        const double fallback = has_seen_variable_pressure_ ? light_contact_floor : legacy_default_pressure;
+        in_stroke_ = true;
+        last_emitted_pressure_ = fallback;
+        return fallback;
+      }
+
+      const double p = std::isfinite(clamped_pressure) ? std::clamp<double>(clamped_pressure, 0.0, 1.0) : 0.0;
+      if (p > 0.0) {
+        has_seen_real_pressure_ = true;
+        if (p > 0.01 && p < 0.95) {
+          has_seen_variable_pressure_ = true;
+        }
+      }
+
+      if (p <= 0.0) {
+        pending_max_spike_ = false;
+        if (!has_seen_real_pressure_) {
+          in_stroke_ = true;
+          last_emitted_pressure_ = legacy_default_pressure;
+          return legacy_default_pressure;
+        }
+        const double soft = in_stroke_ ? std::min(last_emitted_pressure_, light_contact_floor) : light_contact_floor;
+        in_stroke_ = true;
+        last_emitted_pressure_ = soft;
+        return soft;
+      }
+
+      if (pending_max_spike_) {
+        pending_max_spike_ = false;
+        // Confirmed sustained hard press on the next sample (4-8ms later): emit immediately.
+        if (p >= confirm_high_threshold) {
+          in_stroke_ = true;
+          last_emitted_pressure_ = p;
+          return p;
+        }
+        // Previous sample was an isolated single-frame spike to max; emit current normal sample.
+        in_stroke_ = true;
+        last_emitted_pressure_ = p;
+        return p;
+      }
+
+      // Single-sample guard against isolated client-clamped 1.0 spikes mid-stroke or on onset.
+      if (has_seen_variable_pressure_ && p >= max_spike_threshold) {
+        const bool sudden_mid_stroke =
+          in_stroke_ &&
+          last_emitted_pressure_ < high_baseline_threshold &&
+          (p - last_emitted_pressure_) >= sudden_jump_delta;
+        const bool sudden_onset = !in_stroke_;
+        if (sudden_mid_stroke || sudden_onset) {
+          pending_max_spike_ = true;
+          if (!in_stroke_) {
+            in_stroke_ = true;
+            last_emitted_pressure_ = light_contact_floor;
+          }
+          return last_emitted_pressure_;
+        }
+      }
+
+      in_stroke_ = true;
+      last_emitted_pressure_ = p;
+      return p;
+    }
+
+  private:
+    bool in_stroke_ {};
+    bool has_seen_real_pressure_ {};
+    bool has_seen_variable_pressure_ {};
+    bool has_seen_normal_tilt_ {};
+    bool pending_max_spike_ {};
+    double last_emitted_pressure_ {};
   };
 
 }  // namespace platf::macos_input_policy
