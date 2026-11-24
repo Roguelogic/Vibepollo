@@ -82,12 +82,17 @@ namespace {
         encoder_pixel_format = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
       }
       is_hdr_colorspace = video::colorspace_is_hdr(colorspace);
-      // AppleAVE2 is a 3-stage hardware ASIC (DMA tile -> ME -> CABAC): serializing to 1 in-flight
-      // frame with synchronous CompleteFrames(pts) stalls XPC + all 3 stages and caps 4K at ~67fps
-      // while increasing mailbox wait latency (22.1ms -> 23.0/34.5ms). Keep 3 stages up to 2752x2064
-      // (~120fps) and 2 pipelined stages on 4K (>6.5M px -> ~108fps at 12.8ms min encode latency).
+      // AppleAVE2 HEVC is a 3-stage hardware ASIC at 497.7 Mpx/s Turbo: keep 3 stages up to 2752x2064
+      // (~120fps) and 2 pipelined stages on 4K (>6.5M px). By contrast, M4 H.264 has no Turbo mode
+      // (capped at 248.8 Mpx/s) and gains <8% throughput from 3-stage pipelining while tripling
+      // queuing latency (11.7ms -> 32.6ms at 2752x2064, 4.6ms -> 12.5ms at 1080p); keep H.264 at 1
+      // in-flight frame so `wait_for_slot()` always feeds the freshest SCStream capture with zero backlog.
       const std::int64_t pixels_per_frame = static_cast<std::int64_t>(width) * height;
-      max_in_flight_limit = pixels_per_frame > 6'500'000 && framerate >= 100 ? 2 : 3;
+      if (codec == kCMVideoCodecType_H264) {
+        max_in_flight_limit = 1;
+      } else {
+        max_in_flight_limit = pixels_per_frame > 6'500'000 && framerate >= 100 ? 2 : 3;
+      }
 
 #if defined(__arm64__) || defined(__aarch64__)
       constexpr bool arm64 = true;
@@ -137,45 +142,61 @@ namespace {
         return false;
       }
 
-      if (codec == kCMVideoCodecType_HEVC) {
-        // Select AppleAVE2's highest hardware pixel clock mode ("turbo", e.g. ThroughputModeID=5 on M4
-        // for 497.7 Mpx/s vs 248.8 Mpx/s normal across both 4:2:0 and 4:4:4). Must be applied after
-        // ProfileLevel so profile reconfiguration does not reset the throughput table.
-        int turbo_mode_id = 0;
-        CFTypeRef tp_modes_ref = nullptr;
-        if (VTSessionCopyProperty(session, CFSTR("SupportedThroughputModes"), kCFAllocatorDefault, &tp_modes_ref) == noErr && tp_modes_ref) {
-          if (CFGetTypeID(tp_modes_ref) == CFDictionaryGetTypeID()) {
-            auto tp_modes = static_cast<CFDictionaryRef>(tp_modes_ref);
-            if (auto turbo_list = static_cast<CFArrayRef>(CFDictionaryGetValue(tp_modes, CFSTR("turbo")));
-                turbo_list && CFGetTypeID(turbo_list) == CFArrayGetTypeID() && CFArrayGetCount(turbo_list) > 0) {
-              if (auto first = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(turbo_list, 0));
+      // Select AppleAVE2's highest supported hardware pixel clock mode ("turbo" first, e.g. ID=5
+      // at 497.7 Mpx/s on M4 HEVC; falling back to "normal", e.g. ID=3 at 248.8 Mpx/s on M4 H.264
+      // so H.264 never drops to half-rate 124.4 Mpx/s "full" mode). Must be applied after ProfileLevel.
+      int selected_tp_mode_id = 0;
+      std::string_view selected_tp_tier;
+      CFTypeRef tp_modes_ref = nullptr;
+      if (VTSessionCopyProperty(session, CFSTR("SupportedThroughputModes"), kCFAllocatorDefault, &tp_modes_ref) == noErr && tp_modes_ref) {
+        if (CFGetTypeID(tp_modes_ref) == CFDictionaryGetTypeID()) {
+          auto tp_modes = static_cast<CFDictionaryRef>(tp_modes_ref);
+          const auto pick_tier = [&](CFStringRef key, std::string_view tier_name) {
+            if (selected_tp_mode_id > 0) {
+              return;
+            }
+            if (auto list = static_cast<CFArrayRef>(CFDictionaryGetValue(tp_modes, key));
+                list && CFGetTypeID(list) == CFArrayGetTypeID() && CFArrayGetCount(list) > 0) {
+              if (auto first = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(list, 0));
                   first && CFGetTypeID(first) == CFDictionaryGetTypeID()) {
                 if (auto id_num = static_cast<CFNumberRef>(CFDictionaryGetValue(first, CFSTR("ThroughputModeID")));
                     id_num && CFGetTypeID(id_num) == CFNumberGetTypeID()) {
-                  CFNumberGetValue(id_num, kCFNumberIntType, &turbo_mode_id);
+                  CFNumberGetValue(id_num, kCFNumberIntType, &selected_tp_mode_id);
+                  if (selected_tp_mode_id > 0) {
+                    selected_tp_tier = tier_name;
+                  }
                 }
               }
             }
-          }
-          CFRelease(tp_modes_ref);
+          };
+          pick_tier(CFSTR("turbo"), "turbo"sv);
+          pick_tier(CFSTR("normal"), "normal"sv);
         }
-        if (turbo_mode_id > 0 && set_int_property(CFSTR("ThroughputMode"), turbo_mode_id, "ThroughputMode"sv)) {
-          BOOST_LOG(info) << "VideoToolbox: enabled hardware turbo ThroughputMode="sv << turbo_mode_id;
-        }
+        CFRelease(tp_modes_ref);
+      }
+      if (selected_tp_mode_id > 0 && set_int_property(CFSTR("ThroughputMode"), selected_tp_mode_id, "ThroughputMode"sv)) {
+        BOOST_LOG(info) << "VideoToolbox: enabled hardware "sv << selected_tp_tier << " ThroughputMode="sv << selected_tp_mode_id;
+      }
+      set_property(CFSTR("EnableVUIBitstreamRestriction"), kCFBooleanTrue, "EnableVUIBitstreamRestriction"sv);
+      set_property(CFSTR("ThrottleForBackground"), kCFBooleanFalse, "ThrottleForBackground"sv);
+      if (codec == kCMVideoCodecType_HEVC) {
         set_property(CFSTR("PerceptualQualityOptimization"), kCFBooleanTrue, "PerceptualQualityOptimization"sv);
-        set_property(CFSTR("EnableVUIBitstreamRestriction"), kCFBooleanTrue, "EnableVUIBitstreamRestriction"sv);
-        set_property(CFSTR("ThrottleForBackground"), kCFBooleanFalse, "ThrottleForBackground"sv);
         // GFN NVENC-P1 equivalent on AppleAVE2: narrow hardware motion search window (Mode 6 = 96x64
         // vs default Mode 4 = 320x192), boosting M4 2752x2064 4:4:4 10-bit throughput by +37.7%.
         if (set_int_property(CFSTR("MotionEstimationSearchMode"), 6, "MotionEstimationSearchMode"sv)) {
           BOOST_LOG(info) << "VideoToolbox: enabled ultra-low-latency MotionEstimationSearchMode=6 (96x64)"sv;
         }
-        // GFN Multi-Slice parallel encoding: enforce >= 4 slices per frame on Retina HEVC even when
-        // the client negotiates slicesPerFrame=1 so AppleAVE2 encodes and decodes slices concurrently.
-        const int target_slices = std::max(config.slicesPerFrame, 4);
-        if (set_int_property(CFSTR("NumberOfSlices"), target_slices, "NumberOfSlices"sv)) {
-          BOOST_LOG(info) << "VideoToolbox: enabled hardware multi-slice encoding ("sv << target_slices << " slices/frame)"sv;
+      } else if (codec == kCMVideoCodecType_H264) {
+        // Narrowest supported H.264 motion search window on AppleAVE2 (Mode 1 = 128x64 vs default Mode 0 = 192x96).
+        if (set_int_property(CFSTR("MotionEstimationSearchMode"), 1, "MotionEstimationSearchMode"sv)) {
+          BOOST_LOG(info) << "VideoToolbox: enabled low-latency H.264 MotionEstimationSearchMode=1 (128x64)"sv;
         }
+      }
+      // GFN Multi-Slice parallel encoding: enforce >= 4 slices per frame on Retina streams even when
+      // the client negotiates slicesPerFrame=1 so encoders and client decoders pipeline slices concurrently.
+      const int target_slices = std::max(config.slicesPerFrame, 4);
+      if (set_int_property(CFSTR("NumberOfSlices"), target_slices, "NumberOfSlices"sv)) {
+        BOOST_LOG(info) << "VideoToolbox: enabled hardware multi-slice encoding ("sv << target_slices << " slices/frame)"sv;
       }
 
       // Honor the host-side bitrate ceiling, matching the avcodec path
