@@ -546,6 +546,12 @@ if(Python3_Interpreter_FOUND AND SUNSHINE_TEST_ENABLE_COMPONENT)
             --compiler "${CMAKE_CXX_COMPILER}")
     set_tests_properties(test_component_macos_launch_role PROPERTIES LABELS "component" TIMEOUT 60)
 
+    add_test(NAME regression_macos_loginwindow_handoff
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/unit/platform/macos/test_loginwindow_handoff.py"
+            --compiler "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(regression_macos_loginwindow_handoff PROPERTIES LABELS "component" TIMEOUT 60)
+
     add_test(NAME regression_macos_link_dependencies
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_LIST_DIR}/unit/platform/macos/test_link_dependencies.py"

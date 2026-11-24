@@ -41,6 +41,7 @@ enum SidebarSection: String, CaseIterable, Identifiable, Hashable {
 
 enum NavigationRoute: Equatable, Hashable {
   case section(SidebarSection)
+  case softwareUpdate
   case hostAutomation
   case deviceDetail(String)
   case logs
@@ -49,7 +50,7 @@ enum NavigationRoute: Equatable, Hashable {
   var parentSection: SidebarSection {
     switch self {
     case .section(let sec): return sec
-    case .hostAutomation: return .general
+    case .softwareUpdate, .hostAutomation: return .general
     case .deviceDetail: return .devices
     case .logs, .telemetry: return .networkSystem
     }
@@ -82,7 +83,7 @@ struct L10n {
   func sectionKeywords(_ section: SidebarSection) -> [String] {
     switch section {
     case .general:
-      return ["일반", "언어", "한국어", "호스트", "이름", "로그인", "시동", "권한", "화면 기록", "손쉬운 사용", "원격 입력", "업데이트", "재시작", "자동화", "준비 명령어", "상태 명령어", "서버 명령어", "포커스", "인증서", "경로", "프리릴리스", "general", "language", "login", "permission", "accessibility", "screen", "update", "automation", "focus", "cert"]
+      return ["일반", "언어", "한국어", "호스트", "이름", "로그인", "시동", "권한", "화면 기록", "손쉬운 사용", "원격 입력", "소프트웨어 업데이트", "자동 업데이트", "베타 업데이트", "버전", "업데이트", "재시작", "자동화", "준비 명령어", "상태 명령어", "서버 명령어", "포커스", "인증서", "경로", "프리릴리스", "general", "language", "login", "permission", "accessibility", "screen", "software update", "automatic updates", "beta updates", "version", "update", "automation", "focus", "cert"]
     case .display:
       return ["디스플레이", "모니터", "가상", "해상도", "레티나", "hidpi", "배율", "배치", "덮개", "클램셸", "hdr", "일시정지", "원격 모니터", "대체 해상도", "고급", "display", "retina", "scale", "lid", "clamshell", "fallback"]
     case .video:

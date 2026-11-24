@@ -6551,6 +6551,36 @@ namespace confighttp {
     auto accept_and_run = [&](auto *server) {
       try {
         platf::set_thread_name("confighttp::tcp");
+        {
+          boost::system::error_code probe_ec;
+          const auto bind_addr = boost::asio::ip::make_address(server->config.address, probe_ec);
+          if (!probe_ec) {
+            boost::asio::io_context probe_io;
+            const auto deadline = std::chrono::steady_clock::now() + 35s;
+            bool logged_wait = false;
+            while (!shutdown_event->peek()) {
+              boost::asio::ip::tcp::acceptor probe_acc {probe_io};
+              probe_acc.open(net::tcp_protocol_for_address(bind_addr), probe_ec);
+              if (!probe_ec) {
+                probe_acc.set_option(boost::asio::socket_base::reuse_address {true}, probe_ec);
+              }
+              if (!probe_ec) {
+                probe_acc.bind(boost::asio::ip::tcp::endpoint {bind_addr, server->config.port}, probe_ec);
+              }
+              boost::system::error_code close_ec;
+              probe_acc.close(close_ec);
+              if (probe_ec != boost::asio::error::address_in_use ||
+                  std::chrono::steady_clock::now() >= deadline) {
+                break;
+              }
+              if (!logged_wait) {
+                logged_wait = true;
+                BOOST_LOG(info) << "Waiting for Configuration HTTPS port ["sv << server->config.port << "] to finish releasing..."sv;
+              }
+              std::this_thread::sleep_for(200ms);
+            }
+          }
+        }
         server->start([](unsigned short) {
           BOOST_LOG(info) << "Configuration UI available at ["sv << get_web_ui_url() << "]";
         });
@@ -6560,6 +6590,7 @@ namespace confighttp {
           return;
         }
         BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server on port ["sv << port_https << "]: "sv << err.what();
+        lifetime::desired_exit_code = 1;
         shutdown_event->raise(true);
         return;
       }

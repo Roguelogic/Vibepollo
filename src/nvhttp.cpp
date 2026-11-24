@@ -4669,7 +4669,11 @@ namespace nvhttp {
       headers.emplace("Cache-Control", "no-store, no-cache, must-revalidate");
       headers.emplace("Pragma", "no-cache");
       response->write(SimpleWeb::StatusCode::success_ok, data.str(), headers);
+#ifdef __APPLE__
+      response->close_connection_after_response = !platf::is_loginwindow_session();
+#else
       response->close_connection_after_response = true;
+#endif
     }
 
     bool get_client_prefer_10bit_sdr(const std::string &uuid) {
@@ -4854,7 +4858,11 @@ namespace nvhttp {
         headers.emplace("Cache-Control", "no-store, no-cache, must-revalidate");
         headers.emplace("Pragma", "no-cache");
         response->write(SimpleWeb::StatusCode::success_ok, data.str(), headers);
+#ifdef __APPLE__
+        response->close_connection_after_response = !platf::is_loginwindow_session();
+#else
         response->close_connection_after_response = true;
+#endif
       });
 
       auto &apps = tree.add_child("root", pt::ptree {});
@@ -5006,6 +5014,28 @@ namespace nvhttp {
     void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, bool normal_app_transition = true, bool launched_from_applist = false, std::uint64_t trace_id = 0);
     void cancel(resp_https_t response, req_https_t request);
 
+#ifdef __APPLE__
+    std::optional<proc::ctx_t> find_macos_desktop_app_fallback() {
+      const auto apps = proc::proc.get_apps();
+      std::optional<proc::ctx_t> fallback;
+      for (const auto &candidate : apps) {
+        if (!candidate.cmd.empty() || !candidate.detached.empty() || candidate.remote_monitor_profile) {
+          continue;
+        }
+        if (candidate.uuid == TERMINATE_APP_UUID || candidate.uuid == REMOTE_INPUT_UUID) {
+          continue;
+        }
+        if (candidate.name == "Desktop") {
+          return candidate;
+        }
+        if (!fallback) {
+          fallback = candidate;
+        }
+      }
+      return fallback;
+    }
+#endif
+
     static bool bind_direct_usb_video(
       const req_https_t &request,
       const verified_client_t &verified_client,
@@ -5063,7 +5093,11 @@ namespace nvhttp {
 
         pt::write_xml(data, tree);
         response->write(data.str());
+#ifdef __APPLE__
+        response->close_connection_after_response = !platf::is_loginwindow_session();
+#else
         response->close_connection_after_response = true;
+#endif
 
         if (revert_display_configuration) {
           display_helper_integration::revert();
@@ -5620,7 +5654,7 @@ launch_session->exact_target_hold.reset();
 #endif
               return addr;
             }()),
-            static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
+            static_cast<int>(net::map_port(rtsp_stream::runtime_rtsp_setup_port_offset()))
           )
         );
         tree.put(session_ok_key, 1);
@@ -5630,12 +5664,21 @@ launch_session->exact_target_hold.reset();
       auto requested_app = proc::proc.resolve_app(appid_str, appuuid_str);
 #ifdef __APPLE__
       const bool loginwindow_desktop = platf::is_loginwindow_session();
-      if (!requested_app && loginwindow_desktop) {
-        // Pre-login LoginWindow sessions expose only the locked-down Desktop stream; map any
-        // cached client tile launch directly to Desktop so remote sign-in always succeeds.
-        const auto login_apps = proc::proc.get_apps();
-        if (!login_apps.empty()) {
-          requested_app = login_apps.front();
+      if (!requested_app && (loginwindow_desktop || current_appid <= 0) &&
+          appuuid_str != TERMINATE_APP_UUID && appuuid_str != REMOTE_INPUT_UUID) {
+        // Map stale cached Desktop tiles (e.g. from an earlier pre-login session or client shortcut)
+        // directly to the configured commandless Desktop entry so connection succeeds immediately.
+        requested_app = find_macos_desktop_app_fallback();
+        if (requested_app) {
+          BOOST_LOG(info) << "Mapped unrecognized client tile launch directly to macOS Desktop app."sv;
+          appid_str = requested_app->id;
+          appuuid_str = requested_app->uuid;
+          args.erase("appid");
+          args.emplace("appid", appid_str);
+          args.erase("appuuid");
+          if (!appuuid_str.empty()) {
+            args.emplace("appuuid", appuuid_str);
+          }
         }
       }
 #else
@@ -5683,6 +5726,18 @@ launch_session->exact_target_hold.reset();
           tree.put("root.<xmlattr>.status_message", "App terminated.");
 
 
+          return;
+        }
+
+        if (current_appid <= 0 && (appid > 0 || !appuuid_str.empty()) && !requested_app) {
+          if (dispatch::include_request_identity_log_fields(trace_id)) {
+            BOOST_LOG(error) << "Couldn't find app with ID ["sv << appid_str << "] or UUID ["sv << appuuid_str << ']';
+          } else {
+            BOOST_LOG(error) << "NVHTTP launch trace #" << trace_id << " requested app was not found.";
+          }
+          tree.put("root.<xmlattr>.status_code", 404);
+          tree.put("root.<xmlattr>.status_message", "Cannot find requested application");
+          tree.put("root.gamesession", 0);
           return;
         }
 
@@ -6207,7 +6262,7 @@ launch_session->exact_target_hold.reset();
 #endif
             return addr;
           }()),
-          static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
+          static_cast<int>(net::map_port(rtsp_stream::runtime_rtsp_setup_port_offset()))
         )
       );
       keep_runtime_overrides = true;
@@ -6292,7 +6347,11 @@ launch_session->exact_target_hold.reset();
                         << "; server response write call starting.";
       }
       response->write(response_body);
+#ifdef __APPLE__
+      response->close_connection_after_response = !platf::is_loginwindow_session();
+#else
       response->close_connection_after_response = true;
+#endif
       if (trace_id != 0) {
         BOOST_LOG(info) << "NVHTTP Resume trace #" << trace_id
                         << " server response write call returned; client receipt is not implied.";
@@ -6326,11 +6385,13 @@ launch_session->exact_target_hold.reset();
     // stale /resume run the whole resume path for an app that no longer exists.
     if (current_appid <= 0) {
 #ifdef __APPLE__
-      if (platf::is_loginwindow_session()) {
-        const auto login_apps = proc::proc.get_apps();
-        if (!login_apps.empty()) {
+      if (platf::is_loginwindow_session() || has_client_perm(verified_client, PERM::launch)) {
+        if (const auto desktop_app = find_macos_desktop_app_fallback()) {
           g.disable();
-          std::string rebuilt_qs = "appid=" + login_apps.front().id + "&localAudioPlayMode=0";
+          std::string rebuilt_qs = "appid=" + desktop_app->id + "&localAudioPlayMode=0";
+          if (!desktop_app->uuid.empty()) {
+            rebuilt_qs += "&appuuid=" + desktop_app->uuid;
+          }
           for (const auto &[k, v] : request->parse_query_string()) {
             if (k != "appid" && k != "appuuid" && k != "localAudioPlayMode") {
               rebuilt_qs += "&" + k + "=" + v;
@@ -6986,7 +7047,7 @@ launch_session->exact_target_hold.reset();
 #endif
           return addr;
         }()),
-        static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
+        static_cast<int>(net::map_port(rtsp_stream::runtime_rtsp_setup_port_offset()))
       )
     );
     tree.put(std::string {"root."} + std::string {remote_session::stream_start_response_key(launched_from_applist)}, 1);
@@ -7969,6 +8030,36 @@ launch_session->exact_target_hold.reset();
       try {
         std::string name = "nvhttp::" + std::to_string(http_server->config.port);
         platf::set_thread_name(name);
+        {
+          boost::system::error_code probe_ec;
+          const auto bind_addr = boost::asio::ip::make_address(http_server->config.address, probe_ec);
+          if (!probe_ec) {
+            boost::asio::io_context probe_io;
+            const auto deadline = std::chrono::steady_clock::now() + 35s;
+            bool logged_wait = false;
+            while (!shutdown_event->peek()) {
+              boost::asio::ip::tcp::acceptor probe_acc {probe_io};
+              probe_acc.open(net::tcp_protocol_for_address(bind_addr), probe_ec);
+              if (!probe_ec) {
+                probe_acc.set_option(boost::asio::socket_base::reuse_address {true}, probe_ec);
+              }
+              if (!probe_ec) {
+                probe_acc.bind(boost::asio::ip::tcp::endpoint {bind_addr, http_server->config.port}, probe_ec);
+              }
+              boost::system::error_code close_ec;
+              probe_acc.close(close_ec);
+              if (probe_ec != boost::asio::error::address_in_use ||
+                  std::chrono::steady_clock::now() >= deadline) {
+                break;
+              }
+              if (!logged_wait) {
+                logged_wait = true;
+                BOOST_LOG(info) << "Waiting for HTTP port ["sv << http_server->config.port << "] to finish releasing..."sv;
+              }
+              std::this_thread::sleep_for(200ms);
+            }
+          }
+        }
         http_server->start();
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
@@ -7976,7 +8067,8 @@ launch_session->exact_target_hold.reset();
           return;
         }
 
-        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_https << "]: "sv << err.what();
+        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_http << "]: "sv << err.what();
+        lifetime::desired_exit_code = 1;
         shutdown_event->raise(true);
         return;
       }
@@ -8024,7 +8116,7 @@ launch_session->exact_target_hold.reset();
       usb_stream_tunnel::ports_t {
         port_http,
         port_https,
-        net::map_port(rtsp_stream::RTSP_SETUP_PORT),
+        net::map_port(rtsp_stream::runtime_rtsp_setup_port_offset()),
         net::map_port(stream::VIDEO_STREAM_PORT),
         net::map_port(stream::CONTROL_PORT),
         net::map_port(stream::AUDIO_STREAM_PORT),

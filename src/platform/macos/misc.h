@@ -109,6 +109,8 @@ namespace platf {
 
   inline constexpr std::string_view install_loginscreen_agent_arg = "--macos-install-loginscreen-agent";
   inline constexpr std::string_view remove_loginscreen_agent_arg = "--macos-remove-loginscreen-agent";
+  inline constexpr std::string_view aqua_handoff_arg = "--macos-aqua-handoff";
+  inline constexpr std::string_view install_update_arg = "--macos-install-update";
 
   /**
    * @brief Whether this process is running inside the pre-login macOS LoginWindow session.
@@ -116,8 +118,8 @@ namespace platf {
   bool is_loginwindow_session();
 
   /**
-   * @brief Whether a non-root Open-at-Login background launch occurred while macOS has no active
-   *        interactive Aqua session for this user (e.g. sitting at LoginWindow after logout).
+   * @brief Whether a non-root LaunchAgent launch occurred for a non-owner macOS account or while
+   *        macOS has no active interactive Aqua session for this user.
    */
   bool should_exit_for_inactive_gui_session();
 
@@ -126,6 +128,31 @@ namespace platf {
    *        when running in the pre-login macOS LoginWindow session.
    */
   void prepare_loginwindow_runtime();
+
+  /**
+   * @brief Wait briefly during the LoginWindow -> Aqua transition for the exiting pre-login agent
+   *        to finish releasing its lock and listening ports before binding in the user session.
+   */
+  void wait_for_loginwindow_handoff(std::uint16_t base_port, std::chrono::milliseconds timeout = std::chrono::seconds {5});
+
+  /**
+   * @brief Abort any open accepted TCP client sockets with `SO_LINGER {1, 0}` right before
+   *        `LoginWindow` exits so root-owned HTTP keep-alive sockets leave zero `TIME_WAIT` PCBs.
+   */
+  void abort_open_loginwindow_tcp_clients();
+
+  /**
+   * @brief Bootstrap a one-shot `system` domain handoff job right before `LoginWindow` exits so
+   *        the incoming `Aqua` session launches Vibepollo immediately (~0.5s) instead of waiting
+   *        up to 60s for `launchd` `on-demand-only mode` / TAL relaunch completion.
+   */
+  void spawn_loginwindow_aqua_handoff();
+
+  /**
+   * @brief Privileged one-shot helper that wakes the owner's `Aqua` Vibepollo instance as soon as
+   *        `gui/<uid>` comes online after login.
+   */
+  int run_aqua_handoff_helper(int argc, char *argv[]);
 
   /**
    * @brief Whether the system-wide `/Library/LaunchAgents` agent (`Aqua` + `LoginWindow`) is installed.
@@ -143,6 +170,39 @@ namespace platf {
    *        `/Library/LaunchAgents` plist cleanly.
    */
   int run_loginscreen_agent_helper(int argc, char *argv[]);
+
+  /**
+   * @brief Privileged helper entrypoint invoked with administrator rights to atomically replace a
+   *        root-owned `/Applications/Vibepollo.app` bundle from a verified mounted DMG bundle.
+   */
+  int run_macos_update_helper(int argc, char *argv[]);
+
+  /**
+   * @brief Check whether this running process resides inside a writable/updatable `.app` bundle.
+   */
+  bool can_self_update_macos_bundle(std::string *out_bundle_path = nullptr, std::string *out_reason = nullptr);
+
+  /**
+   * @brief Mount a verified `.dmg`, validate code signatures and bundle/team identity, atomically
+   *        swap the `.app` bundle in place (prompting for macOS administrator credentials if needed),
+   *        and stage the new executable path for `platf::restart()`.
+   */
+  bool install_macos_update_dmg(const std::string &dmg_path, std::string &out_error_code, std::string &out_error_detail);
+
+  /**
+   * @brief Record a one-shot native Settings route to reopen immediately after `platf::restart()`.
+   */
+  void set_pending_reopen_ui_route(std::string_view route);
+
+  /**
+   * @brief Atomically read and remove any pending post-restart native Settings route.
+   */
+  std::string consume_pending_reopen_ui_route();
+
+  /**
+   * @brief Whether the native macOS Settings window is currently open and visible.
+   */
+  bool is_native_settings_window_visible();
 }
 
 namespace dyn {

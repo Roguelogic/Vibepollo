@@ -135,6 +135,62 @@ namespace {
     return sample;
   }
 
+  CMSampleBufferRef create_dummy_sample(int width, int height, OSType pixel_format) {
+    const size_t w = width > 0 ? static_cast<size_t>(width) : 1920;
+    const size_t h = height > 0 ? static_cast<size_t>(height) : 1080;
+    const OSType fmt = pixel_format != 0 ? pixel_format : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    NSDictionary *attrs = @{
+      (__bridge NSString *) kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef pixel_buffer = nullptr;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, (__bridge CFDictionaryRef) attrs, &pixel_buffer) != kCVReturnSuccess || !pixel_buffer) {
+      return nullptr;
+    }
+
+    // Fill with neutral black (zeroed YCbCr planes decode as bright green!).
+    CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+    if (CVPixelBufferIsPlanar(pixel_buffer)) {
+      const bool ten_bit = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                           fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
+                           fmt == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange ||
+                           fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+      const bool full_range = fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                              fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
+                              fmt == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ||
+                              fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+      for (size_t plane = 0; plane < CVPixelBufferGetPlaneCount(pixel_buffer); ++plane) {
+        auto *base = static_cast<std::uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane));
+        const size_t size = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane) * CVPixelBufferGetHeightOfPlane(pixel_buffer, plane);
+        if (!base || size == 0) {
+          continue;
+        }
+        if (ten_bit) {
+          const std::uint16_t luma_black = full_range ? 0 : 64;
+          const std::uint16_t fill_value = static_cast<std::uint16_t>((plane == 0 ? luma_black : 512) << 6);
+          std::fill_n(reinterpret_cast<std::uint16_t *>(base), size / sizeof(std::uint16_t), fill_value);
+        } else {
+          const std::uint8_t luma_black = full_range ? 0 : 16;
+          std::memset(base, plane == 0 ? luma_black : 128, size);
+        }
+      }
+    } else if (void *base = CVPixelBufferGetBaseAddress(pixel_buffer)) {
+      std::memset(base, 0, CVPixelBufferGetBytesPerRow(pixel_buffer) * CVPixelBufferGetHeight(pixel_buffer));
+    }
+    CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+
+    CMVideoFormatDescriptionRef format_desc = nullptr;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixel_buffer, &format_desc) != noErr || !format_desc) {
+      CVPixelBufferRelease(pixel_buffer);
+      return nullptr;
+    }
+    const CMSampleTimingInfo timing {kCMTimeInvalid, CMClockGetTime(CMClockGetHostTimeClock()), kCMTimeInvalid};
+    CMSampleBufferRef sample = nullptr;
+    CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixel_buffer, format_desc, &timing, &sample);
+    CFRelease(format_desc);
+    CVPixelBufferRelease(pixel_buffer);
+    return sample;
+  }
+
   struct cg_stream_slot_t {
     std::mutex mutex;
     bool stopped = false;
@@ -794,6 +850,11 @@ namespace platf {
       }
 
       const bool lock_cpu = lock_cpu_pixels.load(std::memory_order_relaxed);
+      if (CMSampleBufferRef synthetic = create_dummy_sample(av_capture.frameWidth, av_capture.frameHeight, av_capture.pixelFormat)) {
+        populate_captured_img(static_cast<av_img_t *>(img), synthetic, lock_cpu);
+        CFRelease(synthetic);
+        return 0;
+      }
       {
         CMSampleBufferRef cached = nullptr;
         {

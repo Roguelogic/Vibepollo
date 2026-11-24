@@ -1,9 +1,12 @@
 #pragma once
 
 #include "version_compare.h"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <nlohmann/json.hpp>
 #include <regex>
+#include <sstream>
 
 // Notification policy only: this does not download/install application packages.
 namespace release_selection {
@@ -225,5 +228,72 @@ namespace release_selection {
       } catch (const json::exception &) { /* Ignore malformed entries independently. */ }
     }
     return best;
+  }
+
+  inline std::string normalize_sha256_hex(std::string_view candidate) {
+    if (candidate.starts_with("sha256:") || candidate.starts_with("SHA256:")) {
+      candidate.remove_prefix(7);
+    }
+    if (candidate.size() != 64) {
+      return {};
+    }
+    std::string out;
+    out.reserve(64);
+    for (const char ch : candidate) {
+      if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+        return {};
+      }
+      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return out;
+  }
+
+  inline std::string parse_sha256_for_filename(std::string_view text, std::string_view filename) {
+    if (text.empty() || filename.empty()) {
+      return {};
+    }
+    std::istringstream stream {std::string(text)};
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      const auto first = line.find_first_not_of(" \t`");
+      if (first == std::string::npos || line.size() - first < 66) {
+        continue;
+      }
+      const std::string hash = normalize_sha256_hex(std::string_view(line).substr(first, 64));
+      if (hash.empty()) {
+        continue;
+      }
+      std::string_view rest = std::string_view(line).substr(first + 64);
+      const auto sep = rest.find_first_not_of(" \t*");
+      if (sep == std::string::npos) {
+        continue;
+      }
+      rest.remove_prefix(sep);
+      while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' || rest.back() == '`')) {
+        rest.remove_suffix(1);
+      }
+      if (rest == filename || (rest.size() > filename.size() && rest.ends_with(filename) && rest[rest.size() - filename.size() - 1] == '/')) {
+        return hash;
+      }
+    }
+    return {};
+  }
+
+  inline std::string extract_asset_sha256(const json &asset_json, std::string_view release_body = {}) {
+    if (asset_json.is_object()) {
+      if (asset_json.contains("digest") && asset_json["digest"].is_string()) {
+        const auto from_digest = normalize_sha256_hex(asset_json["digest"].get<std::string>());
+        if (!from_digest.empty()) {
+          return from_digest;
+        }
+      }
+      if (asset_json.contains("name") && asset_json["name"].is_string()) {
+        return parse_sha256_for_filename(release_body, asset_json["name"].get<std::string>());
+      }
+    }
+    return {};
   }
 }

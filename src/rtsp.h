@@ -44,6 +44,13 @@ namespace usb_stream_tunnel {
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
 
+  /**
+   * @brief Active RTSP setup port offset from `config::sunshine.port`.
+   * @details On macOS pre-login LoginWindow sessions, uses `RTSP_SETUP_PORT + 1` (48011) so
+   *          root-owned TCP TIME_WAIT sockets never block the incoming Aqua user session on 48010.
+   */
+  int runtime_rtsp_setup_port_offset();
+
   struct launch_session_t {
     // Pending Linux launches must keep the display awake before capture and
     // until the active capture has acquired its own reference. Deliberately

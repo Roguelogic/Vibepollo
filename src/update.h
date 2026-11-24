@@ -31,6 +31,36 @@ namespace update {
     std::vector<asset_info_t> assets;  ///< Available binary assets
   };
 
+  enum class phase_e : int {
+    idle = 0,
+    checking = 1,
+    up_to_date = 2,
+    available = 3,
+    downloading = 4,
+    verifying = 5,
+    downloaded = 6,
+    installing = 7,
+    restarting = 8,
+    error = 9
+  };
+
+  struct status_snapshot_t {
+    phase_e phase {phase_e::idle};
+    std::string current_version;
+    std::string current_channel;
+    std::string current_commit;
+    release_info_t available_release;
+    asset_info_t target_asset;
+    std::int64_t downloaded_bytes {0};
+    std::int64_t total_bytes {0};
+    std::int64_t last_checked_unix {0};
+    bool scheduled_on_idle {false};
+    bool check_in_progress {false};
+    std::string downloaded_dmg_path;
+    std::string error_code;
+    std::string error_detail;
+  };
+
   struct state_t {
     std::mutex notification_mutex;
     std::vector<std::string> notified_versions;  ///< Persisted notification identities
@@ -51,6 +81,39 @@ namespace update {
    * @param force If true, forces the check regardless of throttling.
    */
   void trigger_check(bool force);
+
+  /**
+   * @brief Retrieve a thread-safe snapshot of the Software Update engine state for native/web UI.
+   */
+  status_snapshot_t get_status_snapshot();
+
+  /**
+   * @brief Start downloading the currently available update package in the background.
+   * @param auto_install_when_idle If true, schedules automatic installation once idle after download completes.
+   */
+  void start_download(bool auto_install_when_idle = false);
+
+  /**
+   * @brief Cancel an in-progress update package download.
+   */
+  void cancel_download();
+
+  /**
+   * @brief Download (if needed), verify, install the available update, and restart Vibepollo.
+   * @param reopen_settings_ui If true, reopens the native Settings window on the Software Update pane after restart.
+   */
+  void start_install_now(bool reopen_settings_ui = true);
+
+  /**
+   * @brief Schedule or cancel automatic update installation when all streaming sessions end.
+   */
+  void schedule_install_on_idle(bool enabled);
+
+  /**
+   * @brief React to live changes in Automatic Updates or Beta Updates preferences.
+   * @param rescan If true, immediately triggers a forced update scan on the updated channel.
+   */
+  void on_policy_changed(bool rescan);
 
   /**
    * @brief Handle stream start event for update notification.

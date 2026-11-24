@@ -47,6 +47,8 @@ extern "C" {
   #include "platform/windows/misc.h"
 #elif defined(__linux__)
   #include "platform/linux/routed_link.h"
+#elif defined(__APPLE__)
+  #include "platform/macos/misc.h"
 #endif
 #include "hardware_metrics_session.h"
 #include "rtsp.h"
@@ -776,16 +778,39 @@ namespace rtsp_stream {
         return -1;
       }
 
-      acceptor.open(net::tcp_protocol_for_address(bind_addr), ec);
-      if (ec) {
-        return -1;
-      }
+      const auto deadline = std::chrono::steady_clock::now() + 35s;
+      auto shutdown_event = mail::man ? mail::man->event<bool>(mail::shutdown) : nullptr;
+      bool logged_wait = false;
+      while (true) {
+        acceptor.open(net::tcp_protocol_for_address(bind_addr), ec);
+        if (ec) {
+          return -1;
+        }
 
-      acceptor.set_option(boost::asio::socket_base::reuse_address {true});
+        acceptor.set_option(boost::asio::socket_base::reuse_address {true}, ec);
+        if (ec) {
+          boost::system::error_code close_ec;
+          acceptor.close(close_ec);
+          return -1;
+        }
 
-      acceptor.bind(tcp::endpoint(bind_addr, port), ec);
-      if (ec) {
-        return -1;
+        acceptor.bind(tcp::endpoint(bind_addr, port), ec);
+        if (!ec) {
+          break;
+        }
+
+        boost::system::error_code close_ec;
+        acceptor.close(close_ec);
+        if (ec != boost::asio::error::address_in_use ||
+            std::chrono::steady_clock::now() >= deadline ||
+            (shutdown_event && shutdown_event->peek())) {
+          return -1;
+        }
+        if (!logged_wait) {
+          logged_wait = true;
+          BOOST_LOG(info) << "Waiting for RTSP port ["sv << port << "] to finish releasing..."sv;
+        }
+        std::this_thread::sleep_for(200ms);
       }
 
       acceptor.listen(4096, ec);
@@ -2916,6 +2941,15 @@ namespace rtsp_stream {
     return false;
   }
 
+  int runtime_rtsp_setup_port_offset() {
+#ifdef __APPLE__
+    if (platf::is_loginwindow_session()) {
+      return RTSP_SETUP_PORT + 1;
+    }
+#endif
+    return RTSP_SETUP_PORT;
+  }
+
   void start() {
     platf::set_thread_name("rtsp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -2927,8 +2961,10 @@ namespace rtsp_stream {
     server.map("PLAY"sv, &cmd_play);
 
     boost::system::error_code ec;
-    if (server.bind(net::af_from_enum_string(config::sunshine.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
-      BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << net::map_port(rtsp_stream::RTSP_SETUP_PORT) << "], " << ec.message();
+    const auto rtsp_port = net::map_port(runtime_rtsp_setup_port_offset());
+    if (server.bind(net::af_from_enum_string(config::sunshine.address_family), rtsp_port, ec)) {
+      BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << rtsp_port << "], " << ec.message();
+      lifetime::desired_exit_code = 1;
       shutdown_event->raise(true);
 
       return;

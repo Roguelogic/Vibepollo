@@ -43,10 +43,12 @@
 #include <poll.h>
 #include <pwd.h>
 #include <ScreenCaptureKit/ScreenCaptureKit.h>
+#include <Security/Security.h>
 #include <ServiceManagement/ServiceManagement.h>
 #include <spawn.h>
 #include <sys/file.h>
 #include <sys/qos.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 
 // lib includes
@@ -56,6 +58,7 @@
 #include <boost/program_options/parsers.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <nlohmann/json.hpp>
 
 // local includes
 #include "misc.h"
@@ -172,6 +175,84 @@ namespace platf {
     constexpr std::string_view loginscreen_label = PROJECT_FQDN ".loginscreen";
     constexpr std::string_view loginscreen_plist_path = "/Library/LaunchAgents/" PROJECT_FQDN ".loginscreen.plist";
     constexpr std::string_view loginwindow_runtime_root = "/Library/Application Support/Vibepollo/loginwindow-runtime";
+    constexpr std::string_view loginwindow_handoff_lock_path = "/Library/Application Support/Vibepollo/loginwindow.lock";
+
+    bool is_loginscreen_launch_agent() {
+      const char *service = std::getenv("XPC_SERVICE_NAME");
+      return service != nullptr && std::string_view {service} == loginscreen_label;
+    }
+
+    bool is_smappservice_launch_agent() {
+      const char *service = std::getenv("XPC_SERVICE_NAME");
+      return service != nullptr && std::string_view {service} == PROJECT_FQDN;
+    }
+
+    bool is_non_owner_loginscreen_user() {
+      if (!is_loginscreen_launch_agent() || geteuid() == 0) {
+        return false;
+      }
+      const char *owner_cfg_env = std::getenv("VIBEPOLLO_OWNER_CONFIG_DIR");
+      if (owner_cfg_env == nullptr || owner_cfg_env[0] == '\0') {
+        return false;
+      }
+      const uid_t self_uid = geteuid();
+      fs::path probe {owner_cfg_env};
+      while (!probe.empty() && probe != probe.root_path()) {
+        struct stat st {};
+        if (::stat(probe.c_str(), &st) == 0) {
+          if (st.st_uid == 0) {
+            // Reached /Users or / without finding a user-owned directory.
+            return false;
+          }
+          return st.st_uid != self_uid;
+        }
+        if (errno == EACCES) {
+          // Another user's 0750 home directory rejected traversal; the owner always has access.
+          return true;
+        }
+        probe = probe.parent_path();
+      }
+      return false;
+    }
+
+    bool tcp_loopback_listener_active(std::uint16_t port) {
+      if (port == 0) {
+        return false;
+      }
+      const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (sock < 0) {
+        return false;
+      }
+      (void) ::fcntl(sock, F_SETFD, FD_CLOEXEC);
+      const int flags = ::fcntl(sock, F_GETFL, 0);
+      if (flags >= 0) {
+        (void) ::fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+      }
+
+      sockaddr_in addr {};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(port);
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+      bool active = false;
+      const int rc = ::connect(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
+      if (rc == 0) {
+        active = true;
+      } else if (errno == EINPROGRESS) {
+        pollfd pfd {};
+        pfd.fd = sock;
+        pfd.events = POLLOUT;
+        if (::poll(&pfd, 1, 25) > 0) {
+          int so_error = 0;
+          socklen_t len = sizeof(so_error);
+          if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 && so_error == 0) {
+            active = true;
+          }
+        }
+      }
+      ::close(sock);
+      return active;
+    }
 
     bool detect_loginwindow_session() {
       if (const char *forced = std::getenv("VIBEPOLLO_FORCE_LOGINWINDOW");
@@ -185,16 +266,7 @@ namespace platf {
           lw_env != nullptr && lw_env[0] == '1') {
         return true;
       }
-      bool is_prelogin = false;
-      if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
-        const auto login_done = static_cast<CFBooleanRef>(CFDictionaryGetValue(session, kCGSessionLoginDoneKey));
-        const auto username = static_cast<CFStringRef>(CFDictionaryGetValue(session, kCGSessionUserNameKey));
-        if (login_done == kCFBooleanFalse || username == nullptr) {
-          is_prelogin = true;
-        }
-        CFRelease(session);
-      }
-      return is_prelogin;
+      return false;
     }
 
     bool copy_file_mode_0600(const fs::path &src, const fs::path &dst) {
@@ -258,6 +330,72 @@ namespace platf {
       }
       return out;
     }
+
+    std::string build_loginscreen_agent_plist_xml(std::string_view owner_cfg_dir, std::string_view executable_path) {
+      return
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "  <key>Label</key>\n"
+        "  <string>" + xml_escape(loginscreen_label) + "</string>\n"
+        "  <key>AssociatedBundleIdentifiers</key>\n"
+        "  <string>" + xml_escape(PROJECT_FQDN) + "</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array>\n"
+        "    <string>" + xml_escape(executable_path) + "</string>\n"
+        "  </array>\n"
+        "  <key>EnvironmentVariables</key>\n"
+        "  <dict>\n"
+        "    <key>VIBEPOLLO_LOGINWINDOW</key>\n"
+        "    <string>1</string>\n"
+        "    <key>VIBEPOLLO_OWNER_CONFIG_DIR</key>\n"
+        "    <string>" + xml_escape(owner_cfg_dir) + "</string>\n"
+        "  </dict>\n"
+        "  <key>LimitLoadToSessionType</key>\n"
+        "  <array>\n"
+        "    <string>LoginWindow</string>\n"
+        "    <string>Aqua</string>\n"
+        "  </array>\n"
+        "  <key>RunAtLoad</key>\n"
+        "  <true/>\n"
+        "  <key>KeepAlive</key>\n"
+        "  <dict>\n"
+        "    <key>SuccessfulExit</key>\n"
+        "    <false/>\n"
+        "  </dict>\n"
+        "  <key>ProcessType</key>\n"
+        "  <string>Interactive</string>\n"
+        "  <key>ThrottleInterval</key>\n"
+        "  <integer>2</integer>\n"
+        "</dict>\n"
+        "</plist>\n";
+    }
+
+    bool write_root_plist_atomic(const fs::path &dst, std::string_view plist_xml) {
+      const fs::path tmp = dst.string() + ".tmp";
+      ::unlink(tmp.c_str());
+      const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+      if (fd < 0) {
+        return false;
+      }
+      const ssize_t n = ::write(fd, plist_xml.data(), plist_xml.size());
+      ::fchmod(fd, 0644);
+      ::fchown(fd, 0, 0);
+      ::fsync(fd);
+      ::close(fd);
+      if (n != static_cast<ssize_t>(plist_xml.size())) {
+        ::unlink(tmp.c_str());
+        return false;
+      }
+      std::error_code ec;
+      fs::rename(tmp, dst, ec);
+      if (ec) {
+        ::unlink(tmp.c_str());
+        return false;
+      }
+      return true;
+    }
   }  // namespace
 
   bool is_loginwindow_session() {
@@ -266,10 +404,19 @@ namespace platf {
   }
 
   bool should_exit_for_inactive_gui_session() {
-    if (is_loginwindow_session() || geteuid() == 0 || !is_login_agent()) {
+    if (is_loginwindow_session() || geteuid() == 0) {
       return false;
     }
-    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    // Ensure child apps spawned in Aqua never inherit the LaunchAgent marker env var.
+    ::unsetenv("VIBEPOLLO_LOGINWINDOW");
+
+    if (is_non_owner_loginscreen_user()) {
+      return true;
+    }
+    if (!is_login_agent()) {
+      return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 8000ms;
     while (true) {
       if (CFDictionaryRef session = CGSessionCopyCurrentDictionary()) {
         const auto login_done = static_cast<CFBooleanRef>(CFDictionaryGetValue(session, kCGSessionLoginDoneKey));
@@ -302,6 +449,8 @@ namespace platf {
     ::chmod(runtime_cfg.c_str(), 0700);
     ::chmod((runtime_cfg / "credentials").c_str(), 0700);
 
+    std::string preserved_desktop_name = "Desktop";
+    std::string preserved_desktop_image = "desktop.png";
     std::string preserved_desktop_uuid;
     const char *owner_cfg_env = std::getenv("VIBEPOLLO_OWNER_CONFIG_DIR");
     if (owner_cfg_env != nullptr && owner_cfg_env[0] != '\0') {
@@ -324,25 +473,51 @@ namespace platf {
         }
       }
 
-      // Preserve the owner's Desktop app UUID so clients tapping their cached Desktop tile on the
-      // LoginWindow screen resolve the exact same appuuid/appid without requiring an applist refresh.
+      // Preserve the owner's Desktop app metadata + UUID so clients caching the Desktop tile on
+      // LoginWindow keep the exact same versioned appid and appuuid after logging in.
       const fs::path src_apps = src_cfg / "apps.json";
       if (fs::is_regular_file(src_apps, ec) && !ec) {
         try {
-          boost::property_tree::ptree apps_tree;
-          boost::property_tree::read_json(src_apps.string(), apps_tree);
-          if (const auto apps_child = apps_tree.get_child_optional("apps")) {
-            for (const auto &[_, node] : *apps_child) {
-              if (node.get<std::string>("name", "") == "Desktop") {
-                const std::string candidate = node.get<std::string>("uuid", "");
-                const bool safe_uuid = !candidate.empty() && candidate.size() <= 64 &&
-                                       std::all_of(candidate.begin(), candidate.end(), [](unsigned char ch) {
-                                         return std::isxdigit(ch) != 0 || ch == '-';
-                                       });
-                if (safe_uuid) {
-                  preserved_desktop_uuid = candidate;
-                }
+          std::ifstream in(src_apps, std::ios::binary);
+          const auto parsed = nlohmann::json::parse(in, nullptr, true, true);
+          if (parsed.is_object() && parsed.contains("apps") && parsed["apps"].is_array()) {
+            const nlohmann::json *best = nullptr;
+            for (const auto &node : parsed["apps"]) {
+              if (!node.is_object()) {
+                continue;
+              }
+              const std::string name = node.value("name", "");
+              if (name == "Desktop") {
+                best = &node;
                 break;
+              }
+              if (!best) {
+                const std::string cmd = node.value("cmd", "");
+                const bool has_detached = node.contains("detached") && node["detached"].is_array() && !node["detached"].empty();
+                const std::string uuid = node.value("uuid", "");
+                if (cmd.empty() && !has_detached &&
+                    uuid != "9a1c5a25-58fe-40e0-b9aa-7d3f00000005" &&
+                    uuid != "9a1c5a25-58fe-40e0-b9aa-7d3f00000006") {
+                  best = &node;
+                }
+              }
+            }
+            if (best) {
+              const std::string name = best->value("name", "");
+              const std::string image = best->value("image-path", "");
+              const std::string candidate = best->value("uuid", "");
+              const bool safe_uuid = !candidate.empty() && candidate.size() <= 64 &&
+                                     std::all_of(candidate.begin(), candidate.end(), [](unsigned char ch) {
+                                       return std::isxdigit(ch) != 0 || ch == '-';
+                                     });
+              if (!name.empty()) {
+                preserved_desktop_name = name;
+              }
+              if (!image.empty()) {
+                preserved_desktop_image = image;
+              }
+              if (safe_uuid) {
+                preserved_desktop_uuid = candidate;
               }
             }
           }
@@ -351,19 +526,28 @@ namespace platf {
       }
     }
 
-    // Lock pre-login apps.json strictly to Desktop only so no shell commands can be launched as root
-    // before authenticating through macOS SecurityAgent.
+    // Lock pre-login apps.json strictly to Desktop only (at schema version 2 so migrate() never
+    // rewrites or re-UUIDs it) so no shell commands can be launched as root before authenticating.
     {
       const fs::path apps_path = runtime_cfg / "apps.json";
-      std::string desktop_only_apps = "{\n  \"env\": {},\n  \"apps\": [\n    {\n      \"name\": \"Desktop\",\n      \"image-path\": \"desktop.png\"";
+      nlohmann::json desktop_entry {
+        {"name", preserved_desktop_name},
+        {"image-path", preserved_desktop_image},
+        {"allow-client-commands", false}
+      };
       if (!preserved_desktop_uuid.empty()) {
-        desktop_only_apps += ",\n      \"uuid\": \"" + preserved_desktop_uuid + "\"";
+        desktop_entry["uuid"] = preserved_desktop_uuid;
       }
-      desktop_only_apps += "\n    }\n  ]\n}\n";
+      const nlohmann::json desktop_only_apps {
+        {"version", 2},
+        {"env", nlohmann::json::object()},
+        {"apps", nlohmann::json::array({std::move(desktop_entry)})}
+      };
+      const std::string serialized = desktop_only_apps.dump(2) + "\n";
       ::unlink(apps_path.c_str());
       const int fd = ::open(apps_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
       if (fd >= 0) {
-        (void) ::write(fd, desktop_only_apps.data(), desktop_only_apps.size());
+        (void) ::write(fd, serialized.data(), serialized.size());
         ::fchmod(fd, 0600);
         ::close(fd);
       }
@@ -371,17 +555,339 @@ namespace platf {
 
     ::setenv("HOME", runtime_home.c_str(), 1);
     ::unsetenv("XDG_CONFIG_HOME");
+
+    // Hold a world-readable exclusive lock across the LoginWindow process lifetime so the incoming
+    // Aqua user agent can detect the exact moment `std::_Exit(0)` releases resources.
+    static int s_loginwindow_lock_fd = -1;
+    if (s_loginwindow_lock_fd < 0) {
+      s_loginwindow_lock_fd = ::open(std::string {loginwindow_handoff_lock_path}.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+      if (s_loginwindow_lock_fd >= 0) {
+        ::fchmod(s_loginwindow_lock_fd, 0644);
+        (void) ::flock(s_loginwindow_lock_fd, LOCK_EX | LOCK_NB);
+      }
+    }
+
+    // Self-upgrade legacy LoginWindow-only plists on boot so `launchd` immediately starts the
+    // unified Aqua agent on the very first login without requiring manual re-registration.
+    if (geteuid() == 0 && owner_cfg_env != nullptr && owner_cfg_env[0] != '\0') {
+      const fs::path plist_file {loginscreen_plist_path};
+      if (fs::is_regular_file(plist_file, ec) && !ec) {
+        std::ifstream plist_in(plist_file, std::ios::binary);
+        const std::string existing((std::istreambuf_iterator<char>(plist_in)), std::istreambuf_iterator<char>());
+        if (existing.find("<string>Aqua</string>") == std::string::npos ||
+            existing.find("<key>AssociatedBundleIdentifiers</key>") == std::string::npos) {
+          char executable[2048];
+          uint32_t exec_size = sizeof(executable);
+          if (_NSGetExecutablePath(executable, &exec_size) == 0) {
+            const fs::path canon_exec = fs::weakly_canonical(fs::path {executable}, ec);
+            const std::string exe = (!ec && !canon_exec.empty()) ? canon_exec.string() : std::string {executable};
+            (void) write_root_plist_atomic(plist_file, build_loginscreen_agent_plist_xml(owner_cfg_env, exe));
+          }
+        }
+      }
+    }
+  }
+
+  void wait_for_loginwindow_handoff(std::uint16_t base_port, std::chrono::milliseconds timeout) {
+    if (is_loginwindow_session()) {
+      return;
+    }
+    const std::array<std::uint16_t, 4> ports {
+      static_cast<std::uint16_t>(base_port >= 5 ? base_port - 5 : 0),
+      base_port,
+      static_cast<std::uint16_t>(base_port + 1),
+      static_cast<std::uint16_t>(base_port + 21)
+    };
+
+    const auto prelogin_still_holding = [&]() {
+      const int fd = ::open(std::string {loginwindow_handoff_lock_path}.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        const bool locked = (::flock(fd, LOCK_SH | LOCK_NB) != 0);
+        if (!locked) {
+          (void) ::flock(fd, LOCK_UN);
+        }
+        ::close(fd);
+        if (locked) {
+          return true;
+        }
+      }
+      for (const std::uint16_t port : ports) {
+        if (tcp_loopback_listener_active(port)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (!prelogin_still_holding()) {
+      return;
+    }
+
+    BOOST_LOG(info) << "Waiting for pre-login LoginWindow session to finish releasing ports..."sv;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(50ms);
+      if (!prelogin_still_holding()) {
+        break;
+      }
+    }
+  }
+
+  void abort_open_loginwindow_tcp_clients() {
+    if (!is_loginwindow_session()) {
+      return;
+    }
+    const long open_max = std::min<long>(::sysconf(_SC_OPEN_MAX), 1024);
+    for (int fd = 3; fd < open_max; ++fd) {
+      int sock_type = 0;
+      socklen_t type_len = sizeof(sock_type);
+      if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &sock_type, &type_len) != 0 || sock_type != SOCK_STREAM) {
+        continue;
+      }
+      sockaddr_storage peer {};
+      socklen_t peer_len = sizeof(peer);
+      if (::getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peer_len) != 0) {
+        continue;
+      }
+      linger lg {1, 0};
+      (void) ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+      (void) ::close(fd);
+    }
+  }
+
+  void spawn_loginwindow_aqua_handoff() {
+    if (!is_loginwindow_session() || geteuid() != 0) {
+      return;
+    }
+    const char *owner_cfg_env = std::getenv("VIBEPOLLO_OWNER_CONFIG_DIR");
+    if (owner_cfg_env == nullptr || owner_cfg_env[0] == '\0') {
+      return;
+    }
+    const fs::path owner_cfg {owner_cfg_env};
+    struct stat st {};
+    if (::stat(owner_cfg.c_str(), &st) != 0 &&
+        (owner_cfg.parent_path().empty() || ::stat(owner_cfg.parent_path().c_str(), &st) != 0)) {
+      return;
+    }
+    if (st.st_uid == 0) {
+      return;
+    }
+
+    char executable[2048];
+    uint32_t exec_size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &exec_size) != 0) {
+      return;
+    }
+    std::error_code ec;
+    const fs::path canon_exec = fs::weakly_canonical(fs::path {executable}, ec);
+    const std::string exe = (!ec && !canon_exec.empty()) ? canon_exec.string() : std::string {executable};
+
+    constexpr std::string_view handoff_label = PROJECT_FQDN ".aqua-handoff";
+    const fs::path handoff_plist = fs::path {loginwindow_runtime_root} / "aqua-handoff.plist";
+    const std::string uid_str = std::to_string(st.st_uid);
+    const std::string pid_str = std::to_string(::getpid());
+
+    const std::string plist_xml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+      "<plist version=\"1.0\">\n"
+      "<dict>\n"
+      "  <key>Label</key>\n"
+      "  <string>" + xml_escape(handoff_label) + "</string>\n"
+      "  <key>ProgramArguments</key>\n"
+      "  <array>\n"
+      "    <string>" + xml_escape(exe) + "</string>\n"
+      "    <string>" + xml_escape(aqua_handoff_arg) + "</string>\n"
+      "    <string>" + xml_escape(uid_str) + "</string>\n"
+      "    <string>" + xml_escape(owner_cfg.string()) + "</string>\n"
+      "    <string>" + xml_escape(pid_str) + "</string>\n"
+      "  </array>\n"
+      "  <key>RunAtLoad</key>\n"
+      "  <true/>\n"
+      "  <key>LaunchOnlyOnce</key>\n"
+      "  <true/>\n"
+      "</dict>\n"
+      "</plist>\n";
+
+    fs::create_directories(handoff_plist.parent_path(), ec);
+    if (!write_root_plist_atomic(handoff_plist, plist_xml)) {
+      return;
+    }
+    ::chmod(handoff_plist.c_str(), 0600);
+    (void) run({"/bin/launchctl", "bootout", "system/" + std::string {handoff_label}});
+    (void) run({"/bin/launchctl", "bootstrap", "system", handoff_plist.string()});
+  }
+
+  int run_aqua_handoff_helper(int argc, char *argv[]) {
+    if (argc < 5 || std::string_view {argv[1]} != aqua_handoff_arg || geteuid() != 0) {
+      return 2;
+    }
+    std::signal(SIGTERM, [](int) { _exit(0); });
+    std::signal(SIGINT, [](int) { _exit(0); });
+
+    const fs::path handoff_plist = fs::path {loginwindow_runtime_root} / "aqua-handoff.plist";
+    std::error_code ec;
+    fs::remove(handoff_plist, ec);
+
+    const long parsed_uid = std::strtol(argv[2], nullptr, 10);
+    const std::string owner_cfg_dir = argv[3];
+    const long parsed_pid = std::strtol(argv[4], nullptr, 10);
+    if (parsed_uid <= 0) {
+      return 2;
+    }
+    const uid_t owner_uid = static_cast<uid_t>(parsed_uid);
+    const pid_t prev_pid = static_cast<pid_t>(parsed_pid);
+
+    auto lock_held_at = [](const fs::path &lock_file) {
+      const int fd = ::open(lock_file.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
+        return false;
+      }
+      const bool held = (::flock(fd, LOCK_EX | LOCK_NB) != 0);
+      ::close(fd);
+      return held;
+    };
+
+    auto spawn_quiet = [](const std::vector<std::string> &args) -> pid_t {
+      std::vector<char *> c_argv;
+      c_argv.reserve(args.size() + 1);
+      for (const auto &a : args) {
+        c_argv.push_back(const_cast<char *>(a.c_str()));
+      }
+      c_argv.push_back(nullptr);
+
+      posix_spawn_file_actions_t actions;
+      posix_spawn_file_actions_init(&actions);
+      posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+      posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+      posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+      pid_t pid = -1;
+      const int rc = ::posix_spawn(&pid, c_argv[0], &actions, nullptr, c_argv.data(), *_NSGetEnviron());
+      posix_spawn_file_actions_destroy(&actions);
+      return (rc == 0) ? pid : -1;
+    };
+
+    auto run_quiet = [&spawn_quiet](const std::vector<std::string> &args) {
+      const pid_t pid = spawn_quiet(args);
+      if (pid < 0) {
+        return -1;
+      }
+      int status = 0;
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+      return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    };
+
+    // 1. Wait briefly for the LoginWindow Vibepollo process to exit.
+    if (prev_pid > 1) {
+      const auto pid_deadline = std::chrono::steady_clock::now() + 3s;
+      while (std::chrono::steady_clock::now() < pid_deadline) {
+        if (::kill(prev_pid, 0) != 0 && errno == ESRCH) {
+          break;
+        }
+        std::this_thread::sleep_for(15ms);
+      }
+    }
+
+    const std::string uid_str = std::to_string(owner_uid);
+    const std::string gui_domain = "gui/" + uid_str;
+    const std::string loginscreen_service = gui_domain + "/" + std::string {loginscreen_label};
+    const fs::path owner_lock = fs::path {owner_cfg_dir} / "vibepollo.lock";
+
+    // 2. Wait for the owner's Aqua LaunchAgent (or GUI domain) to appear (no-op on shutdown/reboot).
+    bool gui_ready = false;
+    bool service_ready = false;
+    std::chrono::steady_clock::time_point gui_first_seen {};
+    const auto gui_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < gui_deadline) {
+      if (lock_held_at(owner_lock)) {
+        return 0;
+      }
+      if (run_quiet({"/bin/launchctl", "print", loginscreen_service}) == 0) {
+        gui_ready = true;
+        service_ready = true;
+        break;
+      }
+      if (!gui_ready && run_quiet({"/bin/launchctl", "print", gui_domain}) == 0) {
+        gui_ready = true;
+        gui_first_seen = std::chrono::steady_clock::now();
+      } else if (gui_ready && (std::chrono::steady_clock::now() - gui_first_seen) >= 400ms) {
+        break;
+      }
+      std::this_thread::sleep_for(25ms);
+    }
+    if (!gui_ready) {
+      return 0;
+    }
+
+    // Resolve `.app` bundle path for LaunchServices fallback (`open -gj`).
+    std::string bundle_path;
+    char executable[2048];
+    uint32_t exec_size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &exec_size) == 0) {
+      const fs::path canon_exec = fs::weakly_canonical(fs::path {executable}, ec);
+      const fs::path exe = (!ec && !canon_exec.empty()) ? canon_exec : fs::path {executable};
+      const fs::path bundle_dir = exe.parent_path().parent_path().parent_path();
+      if (bundle_dir.extension() == ".app" && fs::is_directory(bundle_dir, ec)) {
+        bundle_path = bundle_dir.string();
+      }
+    }
+
+    // 3. Fire `open -g -j` immediately (asynchronously) so LaunchServices spawns Vibepollo via
+    //    `launch job demand` even while `gui/<uid>` is in `on-demand-only mode` (which defers
+    //    `launchctl kickstart` until TAL finishes), and keep `kickstart` as a backup retry.
+    pid_t open_pid = -1;
+    auto reap_open = [&open_pid]() {
+      if (open_pid > 0) {
+        int status = 0;
+        if (::waitpid(open_pid, &status, WNOHANG) == open_pid) {
+          open_pid = -1;
+        }
+      }
+    };
+
+    const auto wake_start = std::chrono::steady_clock::now();
+    const auto wake_deadline = wake_start + 10s;
+    auto next_kickstart = wake_start + 1500ms;
+    bool open_launched = false;
+
+    while (std::chrono::steady_clock::now() < wake_deadline) {
+      reap_open();
+      if (lock_held_at(owner_lock)) {
+        break;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (!open_launched && !bundle_path.empty()) {
+        open_pid = spawn_quiet({"/bin/launchctl", "asuser", uid_str, "/usr/bin/open", "-g", "-j", bundle_path});
+        open_launched = true;
+      }
+      if (service_ready && now >= next_kickstart) {
+        (void) run_quiet({"/bin/launchctl", "kickstart", loginscreen_service});
+        next_kickstart = now + 1000ms;
+      }
+      std::this_thread::sleep_for(25ms);
+    }
+
+    // Avoid leaving an unawaited `open` child if we finished early (launchd reaps orphans on exit,
+    // and we don't want launchd to signal `open` mid-IPC while `open_pid` is still active unless
+    // Vibepollo is already running and holding `owner_lock`).
+    if (open_pid > 0 && !lock_held_at(owner_lock)) {
+      const auto drain_deadline = std::chrono::steady_clock::now() + 2s;
+      while (open_pid > 0 && std::chrono::steady_clock::now() < drain_deadline) {
+        reap_open();
+        if (lock_held_at(owner_lock)) {
+          break;
+        }
+        std::this_thread::sleep_for(50ms);
+      }
+    }
+    return 0;
   }
 
   bool is_login_agent() {
     // launchd names the job it started in XPC_SERVICE_NAME. Restarting from the menu bar
     // re-executes in place, so it survives that too.
-    const char *service = getenv("XPC_SERVICE_NAME");
-    if (service == nullptr) {
-      return false;
-    }
-    const std::string_view sv {service};
-    return sv == PROJECT_FQDN || sv == loginscreen_label;
+    return is_smappservice_launch_agent() || is_loginscreen_launch_agent();
   }
 
   bool loginscreen_agent_enabled() {
@@ -391,7 +897,8 @@ namespace platf {
 
   bool opens_at_login() {
     if (@available(macOS 13.0, *)) {
-      return login_agent().status == SMAppServiceStatusEnabled;
+      return [SMAppService mainAppService].status == SMAppServiceStatusEnabled ||
+             login_agent().status == SMAppServiceStatusEnabled;
     }
     return false;
   }
@@ -403,6 +910,7 @@ namespace platf {
         return 1;
       }
       ::unlink(std::string {loginscreen_plist_path}.c_str());
+      ::unlink(std::string {loginwindow_handoff_lock_path}.c_str());
       std::error_code ec;
       fs::remove_all(fs::path {loginwindow_runtime_root}, ec);
       return 0;
@@ -422,65 +930,8 @@ namespace platf {
       return 2;
     }
 
-    const std::string plist_xml =
-      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-      "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-      "<plist version=\"1.0\">\n"
-      "<dict>\n"
-      "  <key>Label</key>\n"
-      "  <string>" + xml_escape(loginscreen_label) + "</string>\n"
-      "  <key>ProgramArguments</key>\n"
-      "  <array>\n"
-      "    <string>" + xml_escape(executable_path) + "</string>\n"
-      "  </array>\n"
-      "  <key>EnvironmentVariables</key>\n"
-      "  <dict>\n"
-      "    <key>VIBEPOLLO_LOGINWINDOW</key>\n"
-      "    <string>1</string>\n"
-      "    <key>VIBEPOLLO_OWNER_CONFIG_DIR</key>\n"
-      "    <string>" + xml_escape(owner_cfg_dir) + "</string>\n"
-      "  </dict>\n"
-      "  <key>LimitLoadToSessionType</key>\n"
-      "  <array>\n"
-      "    <string>LoginWindow</string>\n"
-      "  </array>\n"
-      "  <key>RunAtLoad</key>\n"
-      "  <true/>\n"
-      "  <key>KeepAlive</key>\n"
-      "  <dict>\n"
-      "    <key>SuccessfulExit</key>\n"
-      "    <false/>\n"
-      "  </dict>\n"
-      "  <key>ProcessType</key>\n"
-      "  <string>Interactive</string>\n"
-      "  <key>ThrottleInterval</key>\n"
-      "  <integer>2</integer>\n"
-      "</dict>\n"
-      "</plist>\n";
-
-    const fs::path dst {loginscreen_plist_path};
-    const fs::path tmp = dst.string() + ".tmp";
-    ::unlink(tmp.c_str());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
-    if (fd < 0) {
-      return 1;
-    }
-    const ssize_t n = ::write(fd, plist_xml.data(), plist_xml.size());
-    ::fchmod(fd, 0644);
-    ::fchown(fd, 0, 0);
-    ::fsync(fd);
-    ::close(fd);
-    if (n != static_cast<ssize_t>(plist_xml.size())) {
-      ::unlink(tmp.c_str());
-      return 1;
-    }
-    std::error_code ec;
-    fs::rename(tmp, dst, ec);
-    if (ec) {
-      ::unlink(tmp.c_str());
-      return 1;
-    }
-    return 0;
+    const std::string plist_xml = build_loginscreen_agent_plist_xml(owner_cfg_dir, executable_path);
+    return write_root_plist_atomic(fs::path {loginscreen_plist_path}, plist_xml) ? 0 : 1;
   }
 
   bool set_loginscreen_agent_enabled(bool enabled) {
@@ -566,27 +1017,568 @@ namespace platf {
     return loginscreen_agent_enabled();
   }
 
+  namespace {
+    std::atomic<bool> g_native_settings_window_visible {false};
+    std::mutex g_restart_override_mutex;
+    std::string g_restart_executable_override;
+
+    fs::path reopen_route_marker_path() {
+      return appdata() / ".reopen_ui_route";
+    }
+
+    int run_with_stdin(const std::vector<std::string> &args, std::string_view stdin_payload, const std::vector<std::string> &extra_env = {}) {
+      int in_pipe[2] = {-1, -1};
+      if (::pipe(in_pipe) != 0) {
+        return -1;
+      }
+      posix_spawn_file_actions_t actions;
+      posix_spawn_file_actions_init(&actions);
+      posix_spawn_file_actions_adddup2(&actions, in_pipe[0], STDIN_FILENO);
+      posix_spawn_file_actions_addclose(&actions, in_pipe[0]);
+      posix_spawn_file_actions_addclose(&actions, in_pipe[1]);
+
+      std::vector<char *> argv;
+      argv.reserve(args.size() + 1);
+      for (const auto &arg : args) {
+        argv.push_back(const_cast<char *>(arg.c_str()));
+      }
+      argv.push_back(nullptr);
+
+      std::vector<std::string> merged_env;
+      for (char **ep = *_NSGetEnviron(); ep != nullptr && *ep != nullptr; ++ep) {
+        merged_env.emplace_back(*ep);
+      }
+      for (const auto &kv : extra_env) {
+        merged_env.push_back(kv);
+      }
+      std::vector<char *> envp;
+      envp.reserve(merged_env.size() + 1);
+      for (auto &e : merged_env) {
+        envp.push_back(e.data());
+      }
+      envp.push_back(nullptr);
+
+      pid_t pid = -1;
+      const int spawn_rc = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), envp.data());
+      posix_spawn_file_actions_destroy(&actions);
+      ::close(in_pipe[0]);
+
+      if (spawn_rc != 0) {
+        ::close(in_pipe[1]);
+        return -1;
+      }
+
+      if (!stdin_payload.empty()) {
+        (void) ::write(in_pipe[1], stdin_payload.data(), stdin_payload.size());
+      }
+      ::close(in_pipe[1]);
+
+      int status = 0;
+      while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+      return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+
+    bool resolve_running_app_bundle(fs::path &out_bundle, std::string &out_reason) {
+      char executable[2048];
+      uint32_t exec_size = sizeof(executable);
+      if (_NSGetExecutablePath(executable, &exec_size) != 0) {
+        out_reason = "not_app_bundle";
+        return false;
+      }
+      std::error_code ec;
+      const fs::path canon_exec = fs::weakly_canonical(fs::path {executable}, ec);
+      const fs::path exe = (!ec && !canon_exec.empty()) ? canon_exec : fs::path {executable};
+      const fs::path macos_dir = exe.parent_path();
+      const fs::path contents_dir = macos_dir.parent_path();
+      const fs::path bundle_dir = contents_dir.parent_path();
+      if (macos_dir.filename() != "MacOS" ||
+          contents_dir.filename() != "Contents" ||
+          bundle_dir.extension() != ".app" ||
+          !fs::is_directory(bundle_dir, ec)) {
+        out_reason = "not_app_bundle";
+        return false;
+      }
+
+      const std::string bundle_str = bundle_dir.string();
+      if (bundle_str.starts_with("/Volumes/")) {
+        out_reason = "read_only_bundle";
+        out_bundle = bundle_dir;
+        return false;
+      }
+
+      struct statvfs vfs {};
+      if (::statvfs(bundle_str.c_str(), &vfs) == 0 && (vfs.f_flag & ST_RDONLY) != 0) {
+        out_reason = "read_only_bundle";
+        out_bundle = bundle_dir;
+        return false;
+      }
+
+      out_bundle = bundle_dir;
+      out_reason.clear();
+      return true;
+    }
+
+    bool extract_bundle_signing_identity(const fs::path &bundle_path, std::string &out_bundle_id, std::string &out_team_id) {
+      out_bundle_id.clear();
+      out_team_id.clear();
+
+      NSURL *bundle_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:bundle_path.c_str()]];
+      if (bundle_url == nil) {
+        return false;
+      }
+
+      SecStaticCodeRef static_code = nullptr;
+      if (SecStaticCodeCreateWithPath((__bridge CFURLRef) bundle_url, kSecCSDefaultFlags, &static_code) != errSecSuccess || !static_code) {
+        return false;
+      }
+
+      CFDictionaryRef signing_info = nullptr;
+      const OSStatus copy_status = SecCodeCopySigningInformation(static_code, kSecCSSigningInformation, &signing_info);
+      CFRelease(static_code);
+      if (copy_status != errSecSuccess || !signing_info) {
+        return false;
+      }
+
+      if (const auto id_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoIdentifier));
+          id_ref && CFGetTypeID(id_ref) == CFStringGetTypeID()) {
+        const NSString *ns_id = (__bridge NSString *) id_ref;
+        if (ns_id.UTF8String) {
+          out_bundle_id = ns_id.UTF8String;
+        }
+      }
+      if (const auto team_ref = static_cast<CFStringRef>(CFDictionaryGetValue(signing_info, kSecCodeInfoTeamIdentifier));
+          team_ref && CFGetTypeID(team_ref) == CFStringGetTypeID()) {
+        const NSString *ns_team = (__bridge NSString *) team_ref;
+        if (ns_team.UTF8String) {
+          out_team_id = ns_team.UTF8String;
+        }
+      }
+      CFRelease(signing_info);
+      return !out_bundle_id.empty();
+    }
+
+    bool verify_candidate_bundle(const fs::path &candidate_app, const std::string &expected_team_id, std::string &out_detail) {
+      std::error_code ec;
+      const fs::path candidate_exe = candidate_app / "Contents" / "MacOS" / PROJECT_NAME;
+      if (!fs::is_directory(candidate_app, ec) || !fs::is_regular_file(candidate_exe, ec)) {
+        out_detail = "Missing executable inside mounted app bundle.";
+        return false;
+      }
+
+      if (run({"/usr/bin/codesign", "--verify", "--deep", "--strict", candidate_app.string()}) != 0) {
+        out_detail = "Code signature verification failed for update bundle.";
+        return false;
+      }
+
+      std::string candidate_id;
+      std::string candidate_team;
+      if (!extract_bundle_signing_identity(candidate_app, candidate_id, candidate_team)) {
+        out_detail = "Unable to inspect code signing identity of update bundle.";
+        return false;
+      }
+
+      if (candidate_id != PROJECT_FQDN) {
+        out_detail = "Bundle identifier mismatch (" + candidate_id + ").";
+        return false;
+      }
+
+      if (!expected_team_id.empty() && candidate_team != expected_team_id) {
+        out_detail = "Developer Team ID mismatch (" + (candidate_team.empty() ? std::string("unsigned/ad-hoc") : candidate_team) + ").";
+        return false;
+      }
+
+      return true;
+    }
+
+    bool atomic_replace_app_bundle(const fs::path &source_app, const fs::path &target_app, std::string &out_detail) {
+      std::error_code ec;
+      const fs::path parent = target_app.parent_path();
+      if (parent.empty() || !fs::is_directory(parent, ec)) {
+        out_detail = "Target parent directory does not exist.";
+        return false;
+      }
+
+      struct stat orig_st {};
+      const bool had_orig_stat = (::stat(target_app.c_str(), &orig_st) == 0);
+
+      const fs::path staging = parent / (".Vibepollo.app.staging-" + std::to_string(::getpid()));
+      fs::remove_all(staging, ec);
+      auto cleanup_staging = util::fail_guard([&]() {
+        std::error_code rm_ec;
+        fs::remove_all(staging, rm_ec);
+      });
+
+      if (run({"/usr/bin/ditto", source_app.string(), staging.string()}) != 0) {
+        out_detail = "Failed to stage updated application bundle via ditto.";
+        return false;
+      }
+
+      (void) run({"/usr/bin/xattr", "-rd", "com.apple.quarantine", staging.string()});
+
+      if (::geteuid() == 0 && had_orig_stat) {
+        const std::string owner_spec = std::to_string(orig_st.st_uid) + ":" + std::to_string(orig_st.st_gid);
+        (void) run({"/usr/sbin/chown", "-R", owner_spec, staging.string()});
+      }
+
+      if (run({"/usr/bin/codesign", "--verify", "--deep", "--strict", staging.string()}) != 0) {
+        out_detail = "Staged application bundle failed strict code signature verification.";
+        return false;
+      }
+
+      if (fs::exists(target_app, ec) && ::renamex_np(staging.c_str(), target_app.c_str(), RENAME_SWAP) == 0) {
+        // `staging` now points to the previous bundle; cleanup_staging removes it cleanly.
+        return true;
+      }
+
+      const fs::path backup = parent / (".Vibepollo.app.backup-" + std::to_string(::getpid()));
+      fs::remove_all(backup, ec);
+      if (fs::exists(target_app, ec)) {
+        fs::rename(target_app, backup, ec);
+        if (ec) {
+          out_detail = "Unable to move previous application bundle aside: " + ec.message();
+          return false;
+        }
+      }
+
+      fs::rename(staging, target_app, ec);
+      if (ec) {
+        std::error_code restore_ec;
+        if (fs::exists(backup, restore_ec)) {
+          fs::rename(backup, target_app, restore_ec);
+        }
+        out_detail = "Unable to move staged application bundle into place: " + ec.message();
+        return false;
+      }
+
+      cleanup_staging.disable();
+      fs::remove_all(backup, ec);
+      return true;
+    }
+  }  // namespace
+
+  extern "C" void vibepollo_set_macos_native_ui_visible(bool visible) {
+    g_native_settings_window_visible.store(visible, std::memory_order_relaxed);
+  }
+
+  bool is_native_settings_window_visible() {
+    return g_native_settings_window_visible.load(std::memory_order_relaxed);
+  }
+
+  void set_pending_reopen_ui_route(std::string_view route) {
+    if (is_loginwindow_session()) {
+      return;
+    }
+    std::error_code ec;
+    fs::create_directories(appdata(), ec);
+    const fs::path marker = reopen_route_marker_path();
+    ::unlink(marker.c_str());
+    if (route.empty()) {
+      return;
+    }
+    const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+      (void) ::write(fd, route.data(), route.size());
+      ::fchmod(fd, 0600);
+      ::close(fd);
+    }
+  }
+
+  std::string consume_pending_reopen_ui_route() {
+    const fs::path marker = reopen_route_marker_path();
+    std::error_code ec;
+    if (!fs::is_regular_file(marker, ec) || ec) {
+      return {};
+    }
+    std::ifstream in(marker, std::ios::binary);
+    std::string route;
+    if (in) {
+      std::getline(in, route);
+    }
+    ::unlink(marker.c_str());
+    while (!route.empty() && (route.back() == '\r' || route.back() == '\n' || route.back() == ' ')) {
+      route.pop_back();
+    }
+    return route;
+  }
+
+  bool can_self_update_macos_bundle(std::string *out_bundle_path, std::string *out_reason) {
+    fs::path bundle;
+    std::string reason;
+    const bool ok = resolve_running_app_bundle(bundle, reason);
+    if (out_bundle_path) {
+      *out_bundle_path = bundle.string();
+    }
+    if (out_reason) {
+      *out_reason = reason;
+    }
+    return ok;
+  }
+
+  int run_macos_update_helper(int argc, char *argv[]) {
+    if (argc < 4 || std::string_view {argv[1]} != install_update_arg) {
+      return 2;
+    }
+    if (::geteuid() != 0) {
+      std::fprintf(stderr, "Vibepollo: installing an application update requires administrator privileges.\n");
+      return 1;
+    }
+
+    const fs::path src_app {argv[2]};
+    const fs::path dst_app {argv[3]};
+    std::error_code ec;
+    if (!src_app.is_absolute() || !dst_app.is_absolute() ||
+        src_app.extension() != ".app" || dst_app.extension() != ".app" ||
+        !fs::is_directory(src_app, ec) || !fs::is_directory(dst_app, ec)) {
+      std::fprintf(stderr, "Vibepollo: invalid update helper bundle paths.\n");
+      return 2;
+    }
+
+    std::string current_id;
+    std::string current_team;
+    (void) extract_bundle_signing_identity(dst_app, current_id, current_team);
+
+    std::string detail;
+    if (!verify_candidate_bundle(src_app, current_team, detail)) {
+      std::fprintf(stderr, "Vibepollo: update verification failed: %s\n", detail.c_str());
+      return 1;
+    }
+
+    if (!atomic_replace_app_bundle(src_app, dst_app, detail)) {
+      std::fprintf(stderr, "Vibepollo: update replacement failed: %s\n", detail.c_str());
+      return 1;
+    }
+
+    std::fputs("VIBEPOLLO_UPDATE_OK\n", stdout);
+    std::fflush(stdout);
+    return 0;
+  }
+
+  bool install_macos_update_dmg(const std::string &dmg_path, std::string &out_error_code, std::string &out_error_detail) {
+    out_error_code.clear();
+    out_error_detail.clear();
+
+    if (is_loginwindow_session()) {
+      out_error_code = "install_failed";
+      out_error_detail = "Updates cannot be installed from the pre-login session.";
+      return false;
+    }
+
+    fs::path target_app;
+    std::string bundle_reason;
+    if (!resolve_running_app_bundle(target_app, bundle_reason)) {
+      out_error_code = bundle_reason.empty() ? "not_app_bundle" : bundle_reason;
+      out_error_detail = "Vibepollo must be running from a writable .app bundle (such as /Applications/Vibepollo.app).";
+      return false;
+    }
+
+    std::error_code ec;
+    if (!fs::is_regular_file(dmg_path, ec) || ec) {
+      out_error_code = "download_failed";
+      out_error_detail = "Downloaded disk image is missing.";
+      return false;
+    }
+
+    std::string running_bundle_id;
+    std::string running_team_id;
+    (void) extract_bundle_signing_identity(target_app, running_bundle_id, running_team_id);
+
+    char mnt_template[] = "/tmp/vibepollo-upd-mnt-XXXXXX";
+    char *mnt_raw = ::mkdtemp(mnt_template);
+    if (!mnt_raw) {
+      out_error_code = "install_failed";
+      out_error_detail = "Unable to allocate temporary mount directory.";
+      return false;
+    }
+    const fs::path mnt_dir {mnt_raw};
+    bool mounted = false;
+    auto unmount_guard = util::fail_guard([&]() {
+      if (mounted) {
+        (void) run({"/usr/bin/hdiutil", "detach", mnt_dir.string(), "-force", "-quiet"});
+      }
+      std::error_code rm_ec;
+      fs::remove(mnt_dir, rm_ec);
+    });
+
+    const int attach_rc = run_with_stdin(
+      {"/usr/bin/hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mnt_dir.string(), dmg_path},
+      "y\n",
+      {"PAGER=cat"}
+    );
+    if (attach_rc != 0) {
+      out_error_code = "install_failed";
+      out_error_detail = "Failed to mount update disk image.";
+      return false;
+    }
+    mounted = true;
+
+    fs::path mounted_app = mnt_dir / (std::string(PROJECT_NAME) + ".app");
+    if (!fs::is_directory(mounted_app, ec)) {
+      for (const auto &entry : fs::directory_iterator(mnt_dir, ec)) {
+        if (!ec && entry.is_directory() && entry.path().extension() == ".app") {
+          mounted_app = entry.path();
+          break;
+        }
+      }
+    }
+
+    if (!verify_candidate_bundle(mounted_app, running_team_id, out_error_detail)) {
+      out_error_code = "signature_invalid";
+      return false;
+    }
+
+    const bool writable_direct =
+      (::access(target_app.parent_path().c_str(), W_OK) == 0 && ::access(target_app.c_str(), W_OK) == 0);
+
+    if (writable_direct) {
+      if (!atomic_replace_app_bundle(mounted_app, target_app, out_error_detail)) {
+        out_error_code = "install_failed";
+        return false;
+      }
+    } else {
+      char executable[2048];
+      uint32_t exec_size = sizeof(executable);
+      if (_NSGetExecutablePath(executable, &exec_size) != 0) {
+        out_error_code = "install_failed";
+        out_error_detail = "Unable to locate helper executable.";
+        return false;
+      }
+      const fs::path canon_exec = fs::weakly_canonical(fs::path {executable}, ec);
+      const std::string exe = (!ec && !canon_exec.empty()) ? canon_exec.string() : std::string {executable};
+
+      using AuthRef = struct AuthorizationOpaqueRef *;
+      struct AuthItem {
+        const char *name;
+        std::size_t valueLength;
+        void *value;
+        std::uint32_t flags;
+      };
+      struct AuthRights {
+        std::uint32_t count;
+        AuthItem *items;
+      };
+      using CreateFn = OSStatus (*)(const AuthRights *, const AuthRights *, std::uint32_t, AuthRef *);
+      using FreeFn = OSStatus (*)(AuthRef, std::uint32_t);
+      using ExecFn = OSStatus (*)(AuthRef, const char *, std::uint32_t, char *const *, FILE **);
+
+      void *sec = ::dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_LOCAL);
+      if (!sec) {
+        out_error_code = "install_failed";
+        out_error_detail = "Unable to load Security.framework for administrator authorization.";
+        return false;
+      }
+      const auto auth_create = reinterpret_cast<CreateFn>(::dlsym(sec, "AuthorizationCreate"));
+      const auto auth_free = reinterpret_cast<FreeFn>(::dlsym(sec, "AuthorizationFree"));
+      const auto auth_exec = reinterpret_cast<ExecFn>(::dlsym(sec, "AuthorizationExecuteWithPrivileges"));
+      if (!auth_create || !auth_free || !auth_exec) {
+        ::dlclose(sec);
+        out_error_code = "install_failed";
+        out_error_detail = "Administrator authorization APIs unavailable.";
+        return false;
+      }
+
+      AuthItem right {"system.privilege.admin", 0, nullptr, 0};
+      AuthRights rights {1, &right};
+      constexpr std::uint32_t kAuthFlags = (1u << 0) | (1u << 1) | (1u << 4);
+      AuthRef auth = nullptr;
+      const OSStatus auth_rc = auth_create(&rights, nullptr, kAuthFlags, &auth);
+      if (auth_rc != errSecSuccess || !auth) {
+        ::dlclose(sec);
+        if (auth_rc == errAuthorizationCanceled) {
+          out_error_code = "auth_cancelled";
+          return false;
+        }
+        out_error_code = "install_failed";
+        out_error_detail = "Administrator authorization was denied.";
+        return false;
+      }
+
+      std::string arg_install {install_update_arg};
+      std::string src_str = mounted_app.string();
+      std::string dst_str = target_app.string();
+      std::vector<char *> helper_args {
+        const_cast<char *>(arg_install.c_str()),
+        const_cast<char *>(src_str.c_str()),
+        const_cast<char *>(dst_str.c_str()),
+        nullptr
+      };
+
+      FILE *pipe_fp = nullptr;
+      const OSStatus exec_status = auth_exec(auth, exe.c_str(), 0, helper_args.data(), &pipe_fp);
+      bool helper_ok = false;
+      if (pipe_fp) {
+        char buf[256];
+        while (std::fgets(buf, sizeof(buf), pipe_fp) != nullptr) {
+          if (std::string_view {buf}.find("VIBEPOLLO_UPDATE_OK") != std::string_view::npos) {
+            helper_ok = true;
+          }
+        }
+        std::fclose(pipe_fp);
+      }
+      auth_free(auth, 0);
+      ::dlclose(sec);
+
+      if (exec_status == errAuthorizationCanceled) {
+        out_error_code = "auth_cancelled";
+        return false;
+      }
+      if (exec_status != errSecSuccess || !helper_ok) {
+        out_error_code = "install_failed";
+        out_error_detail = "Privileged bundle update failed.";
+        return false;
+      }
+    }
+
+    (void) run({
+      "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+      "-f",
+      target_app.string()
+    });
+
+    {
+      std::lock_guard lock {g_restart_override_mutex};
+      g_restart_executable_override = (target_app / "Contents" / "MacOS" / PROJECT_NAME).string();
+    }
+
+    return true;
+  }
+
   bool set_opens_at_login(bool enabled) {
     if (@available(macOS 13.0, *)) {
-      SMAppService *agent = login_agent();
+      SMAppService *main_app = [SMAppService mainAppService];
+      SMAppService *legacy_agent = login_agent();
       NSError *error = nil;
       if (enabled) {
-        // launchd starts the agent right away, and it takes over from this copy.
-        if (![agent registerAndReturnError:&error]) {
+        // Register the main application as a Login Item (`SMAppService.mainAppService`) so
+        // `loginwindow` / LaunchServices launches Vibepollo immediately (~0.5-3s) after sign-in,
+        // avoiding `launchd`'s 60-second `on-demand-only` delay applied to LaunchAgents.
+        if (main_app.status != SMAppServiceStatusEnabled && ![main_app registerAndReturnError:&error]) {
           BOOST_LOG(warning) << "Couldn't turn on Open at Login: "sv << error.localizedDescription.UTF8String;
         }
 
         // If the user turned Vibepollo off in System Settings, only they can turn it back on.
-        if (agent.status == SMAppServiceStatusRequiresApproval) {
-          BOOST_LOG(info) << "Opening Login Items so the user can allow Vibepollo in the background"sv;
+        if (main_app.status == SMAppServiceStatusRequiresApproval) {
+          BOOST_LOG(info) << "Opening Login Items so the user can allow Vibepollo at login"sv;
           [SMAppService openSystemSettingsLoginItems];
+        }
+
+        // Remove the legacy LaunchAgent once `mainAppService` is active so launchd doesn't spawn
+        // a redundant second background job 60s after login.
+        if (main_app.status == SMAppServiceStatusEnabled &&
+            legacy_agent.status == SMAppServiceStatusEnabled &&
+            !is_smappservice_launch_agent()) {
+          [legacy_agent unregisterAndReturnError:nil];
         }
         return opens_at_login();
       }
 
-      bool replace = is_login_agent();
-      if (agent.status == SMAppServiceStatusEnabled && ![agent unregisterAndReturnError:&error]) {
+      if (main_app.status == SMAppServiceStatusEnabled && ![main_app unregisterAndReturnError:&error]) {
         BOOST_LOG(warning) << "Couldn't turn off Open at Login: "sv << error.localizedDescription.UTF8String;
+        return false;
+      }
+
+      const bool replace = is_smappservice_launch_agent();
+      if (legacy_agent.status == SMAppServiceStatusEnabled && ![legacy_agent unregisterAndReturnError:&error]) {
+        BOOST_LOG(warning) << "Couldn't unregister legacy login agent: "sv << error.localizedDescription.UTF8String;
         return false;
       }
       if (replace) {
@@ -604,49 +1596,75 @@ namespace platf {
       return appdata() / "vibepollo.lock";
     }
 
-    // Whether another process holds the instance lock, as the login agent does once it runs.
-    bool instance_lock_held_elsewhere() {
+    // Whether another process holds the instance lock.
+    bool instance_lock_held_elsewhere(bool *out_held_by_agent = nullptr) {
+      if (out_held_by_agent != nullptr) {
+        *out_held_by_agent = false;
+      }
       int fd = open(instance_lock_path().c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
         return false;
       }
       const bool held = flock(fd, LOCK_EX | LOCK_NB) != 0;
+      if (held && out_held_by_agent != nullptr) {
+        char buf[32] = {};
+        if (pread(fd, buf, sizeof(buf) - 1, 0) > 0) {
+          *out_held_by_agent = std::string_view {buf}.find("agent") != std::string_view::npos;
+        }
+      }
       close(fd);
       return held;
     }
 
-    // Starts the agent unless it's already running, and waits for it to take over.
-    bool start_login_agent(const std::string &service) {
-      if (run({"/bin/launchctl", "kickstart", service}) != 0) {
-        return false;
+    // Migrate existing installs from the legacy SMAppService LaunchAgent (which macOS delays by
+    // 60s in `on-demand-only mode` after login) to `SMAppService.mainAppService` so `loginwindow`
+    // launches Vibepollo immediately after sign-in just like Parsec.
+    void migrate_legacy_login_agent_if_needed() {
+      if (is_loginwindow_session()) {
+        return;
       }
-      // kickstart succeeds even when launchd then fails to spawn the agent.
-      const auto deadline = std::chrono::steady_clock::now() + 5s;
-      while (!instance_lock_held_elsewhere()) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-          return false;
+      if (@available(macOS 13.0, *)) {
+        SMAppService *legacy_agent = login_agent();
+        SMAppService *main_app = [SMAppService mainAppService];
+        if (legacy_agent.status == SMAppServiceStatusEnabled) {
+          if (main_app.status != SMAppServiceStatusEnabled) {
+            NSError *reg_err = nil;
+            if ([main_app registerAndReturnError:&reg_err]) {
+              BOOST_LOG(info) << "Migrated Open at Login to SMAppService.mainAppService for immediate post-login startup"sv;
+            } else if (reg_err != nil) {
+              BOOST_LOG(warning) << "Could not migrate Open at Login to mainAppService: "sv << reg_err.localizedDescription.UTF8String;
+            }
+          }
+          if (main_app.status == SMAppServiceStatusEnabled && !is_smappservice_launch_agent()) {
+            [legacy_agent unregisterAndReturnError:nil];
+          }
         }
-        std::this_thread::sleep_for(100ms);
       }
-      return true;
     }
   }  // namespace
 
   bool defer_to_login_agent() {
-    if (is_loginwindow_session() || is_login_agent() || !opens_at_login()) {
+    if (is_loginwindow_session()) {
       return false;
     }
 
-    auto service = "gui/"s + std::to_string(getuid()) + "/" + std::string {PROJECT_FQDN};
-    if (!start_login_agent(service)) {
-      // launchd only starts the agent for the build that registered it, so an update can leave it
-      // unable to. Turning Open at Login off and on again registers it for this build.
-      BOOST_LOG(warning) << "Couldn't start "sv << service << ", so running without it"sv;
-      BOOST_LOG(warning) << "If Vibepollo was just updated, turn Open at Login off and on again"sv;
-      return false;
+    migrate_legacy_login_agent_if_needed();
+
+    if (is_smappservice_launch_agent() && loginscreen_agent_enabled()) {
+      BOOST_LOG(info) << "System LaunchAgent manages Aqua and LoginWindow; legacy SMAppService agent exiting cleanly"sv;
+      return true;
     }
-    BOOST_LOG(info) << "Open at Login is on, so leaving it to "sv << service << " to run Vibepollo"sv;
-    return true;
+
+    const bool lock_held = instance_lock_held_elsewhere();
+    if (lock_held) {
+      // Never kill an already-running Vibepollo instance (e.g. the main app launched at login
+      // by `SMAppService.mainAppService` when `/Library/LaunchAgents/...loginscreen` wakes up 60s
+      // later out of `on-demand-only mode`). Exit 0 cleanly (`SuccessfulExit = false`).
+      BOOST_LOG(info) << "Another Vibepollo instance is already running; exiting cleanly"sv;
+      return true;
+    }
+
+    return false;
   }
 
   bool acquire_instance_lock(std::chrono::milliseconds timeout) {
@@ -663,13 +1681,6 @@ namespace platf {
     }
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-      // The login agent takes over from other copies, like the one that just turned Open at Login on.
-      char pid[16] = {};
-      if (is_login_agent() && pread(fd, pid, sizeof(pid) - 1, 0) > 0 && std::atoi(pid) > 0) {
-        BOOST_LOG(info) << "Asking the copy of Vibepollo with PID "sv << pid << " to quit"sv;
-        kill(std::atoi(pid), SIGTERM);
-      }
-
       BOOST_LOG(info) << "Waiting for another copy of Vibepollo to quit"sv;
       auto deadline = std::chrono::steady_clock::now() + timeout;
       while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
@@ -681,8 +1692,8 @@ namespace platf {
       }
     }
 
-    auto pid = std::to_string(getpid());
-    if (ftruncate(fd, 0) != 0 || pwrite(fd, pid.data(), pid.size(), 0) < 0) {
+    auto record = std::to_string(getpid()) + (is_login_agent() ? " agent\n" : " app\n");
+    if (ftruncate(fd, 0) != 0 || pwrite(fd, record.data(), record.size(), 0) < 0) {
       BOOST_LOG(warning) << "Couldn't record this process in "sv << path;
     }
     return true;
@@ -885,9 +1896,17 @@ namespace platf {
   }
 
   fs::path appdata() {
-    const char *homedir;
-    if ((homedir = getenv("HOME")) == nullptr) {
-      homedir = getpwuid(geteuid())->pw_dir;
+    if (is_loginwindow_session()) {
+      const fs::path runtime_home {loginwindow_runtime_root};
+      return services::home_config_root(std::optional<fs::path> {runtime_home}, runtime_home);
+    }
+    const char *homedir = getenv("HOME");
+    if (homedir == nullptr || homedir[0] == '\0') {
+      if (const auto *pw = getpwuid(geteuid()); pw != nullptr && pw->pw_dir != nullptr) {
+        homedir = pw->pw_dir;
+      } else {
+        homedir = "/tmp";
+      }
     }
 
     return services::home_config_root(std::optional<fs::path> {fs::path {homedir}}, fs::path {homedir});
@@ -1128,11 +2147,21 @@ namespace platf {
   }
 
   void restart_on_exit() {
+    std::string override_exe;
+    {
+      std::lock_guard lock {g_restart_override_mutex};
+      override_exe = g_restart_executable_override;
+    }
+
     char executable[2048];
-    uint32_t size = sizeof(executable);
-    if (_NSGetExecutablePath(executable, &size) < 0) {
-      BOOST_LOG(fatal) << "NSGetExecutablePath() failed: "sv << errno;
-      return;
+    if (!override_exe.empty() && override_exe.size() < sizeof(executable)) {
+      std::memcpy(executable, override_exe.c_str(), override_exe.size() + 1);
+    } else {
+      uint32_t size = sizeof(executable);
+      if (_NSGetExecutablePath(executable, &size) < 0) {
+        BOOST_LOG(fatal) << "NSGetExecutablePath() failed: "sv << errno;
+        return;
+      }
     }
 
     // ASIO doesn't use O_CLOEXEC, so we have to close all fds ourselves

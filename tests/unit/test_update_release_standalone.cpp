@@ -261,5 +261,29 @@ int main() {
   auto wrong_core = compatible;
   wrong_core["nightly_metadata"]["version"] = "2.0.2-daily.d20261011.3+aaaaaaaaaaaa";
   assert(select(json::array({wrong_core}), "2.0.0", true).is_null());
+
+  // SHA-256 digest extraction from GitHub asset digest, release body, and SHA256SUMS
+  const std::string valid_hash = "1fe6190c4c8d78c11800c2ef8eb0fc949fed2b0901c941e355ad8df3193409b0";
+  const std::string upper_hash = "1FE6190C4C8D78C11800C2EF8EB0FC949FED2B0901C941E355AD8DF3193409B0";
+  assert(release_selection::normalize_sha256_hex("sha256:" + upper_hash) == valid_hash);
+  assert(release_selection::normalize_sha256_hex(valid_hash) == valid_hash);
+  assert(release_selection::normalize_sha256_hex("sha256:short").empty());
+  assert(release_selection::normalize_sha256_hex(std::string(64, 'z')).empty());
+
+  json asset_with_digest = {{"name", "Vibepollo-macOS-arm64.dmg"}, {"digest", "sha256:" + upper_hash}};
+  assert(release_selection::extract_asset_sha256(asset_with_digest) == valid_hash);
+
+  json asset_without_digest = {{"name", "Vibepollo-macOS-arm64.dmg"}};
+  const std::string release_body_sha =
+    "## What's New\n\n### SHA-256\n\n```\n" + valid_hash + "  Vibepollo-macOS-arm64.dmg\n```\n";
+  assert(release_selection::extract_asset_sha256(asset_without_digest, release_body_sha) == valid_hash);
+
+  const std::string sums_content =
+    std::string(64, 'a') + " *Vibepollo-macOS-x86_64.dmg\n" +
+    upper_hash + "  artifacts/Vibepollo-macOS-arm64.dmg\n";
+  assert(release_selection::parse_sha256_for_filename(sums_content, "Vibepollo-macOS-arm64.dmg") == valid_hash);
+  assert(release_selection::parse_sha256_for_filename(sums_content, "Vibepollo-macOS-x86_64.dmg") == std::string(64, 'a'));
+  assert(release_selection::parse_sha256_for_filename(sums_content, "VibepolloSetup.exe").empty());
+
   std::cout << "release selection regression checks passed\n";
 }

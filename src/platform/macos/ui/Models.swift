@@ -51,6 +51,8 @@ struct DashboardSnapshot: Codable, Equatable {
   var screenCaptureAllowed: Bool
   var accessibilityAllowed: Bool
   var deferredReloadPending: Bool
+  var updateAvailable: Bool
+  var availableUpdateVersion: String
 
   static let empty = DashboardSnapshot(
     version: "",
@@ -64,7 +66,67 @@ struct DashboardSnapshot: Codable, Equatable {
     hostStats: .empty,
     screenCaptureAllowed: true,
     accessibilityAllowed: true,
-    deferredReloadPending: false
+    deferredReloadPending: false,
+    updateAvailable: false,
+    availableUpdateVersion: ""
+  )
+}
+
+struct SoftwareUpdateSnapshot: Codable, Equatable {
+  var phase: String
+  var currentVersion: String
+  var currentChannel: String
+  var currentCommit: String
+  var availableVersion: String
+  var availableName: String
+  var availableUrl: String
+  var availableBody: String
+  var availablePublishedAt: String
+  var isPrerelease: Bool
+  var assetName: String
+  var assetSize: Int64
+  var downloadedBytes: Int64
+  var totalBytes: Int64
+  var lastCheckedUnix: Int64
+  var scheduledOnIdle: Bool
+  var checkInProgress: Bool
+  var canSelfUpdate: Bool
+  var bundlePath: String
+  var bundleReason: String
+  var errorCode: String
+  var errorDetail: String
+
+  var isBusy: Bool {
+    checkInProgress || ["checking", "downloading", "verifying", "installing", "restarting"].contains(phase)
+  }
+
+  var hasAvailableUpdate: Bool {
+    !availableVersion.isEmpty && ["available", "downloading", "verifying", "downloaded", "installing", "restarting"].contains(phase)
+  }
+
+  static let empty = SoftwareUpdateSnapshot(
+    phase: "idle",
+    currentVersion: "",
+    currentChannel: "stable",
+    currentCommit: "",
+    availableVersion: "",
+    availableName: "",
+    availableUrl: "",
+    availableBody: "",
+    availablePublishedAt: "",
+    isPrerelease: false,
+    assetName: "",
+    assetSize: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    lastCheckedUnix: 0,
+    scheduledOnIdle: false,
+    checkInProgress: false,
+    canSelfUpdate: true,
+    bundlePath: "",
+    bundleReason: "",
+    errorCode: "",
+    errorDetail: ""
   )
 }
 
@@ -286,6 +348,8 @@ struct HostSettingsState: Equatable {
   var lidCloseEndsStreams: Bool = true
   var updateCheckInterval: Int = 86400
   var notifyPreReleases: Bool = true
+  var autoDownloadUpdates: Bool = true
+  var autoInstallUpdates: Bool = true
   var hideTrayControls: Bool = false
   var envvarCompatibilityMode: Bool = false
   var legacyOrdering: Bool = false

@@ -76,9 +76,23 @@ struct SidebarIconBadge: View {
   }
 }
 
+struct SettingsNotificationBadge: View {
+  let count: Int
+
+  var body: some View {
+    Text("\(count)")
+      .font(.system(size: 11, weight: .semibold))
+      .foregroundStyle(.white)
+      .padding(.horizontal, count > 9 ? 5.5 : 0)
+      .frame(minWidth: 18, minHeight: 18)
+      .background(Circle().fill(Color.red))
+  }
+}
+
 private struct SidebarCategoryRow: View {
   let section: SidebarSection
   let title: String
+  var badgeCount: Int = 0
 
   var body: some View {
     HStack(spacing: 9) {
@@ -86,7 +100,10 @@ private struct SidebarCategoryRow: View {
       Text(title)
         .font(.system(size: 13))
         .lineLimit(1)
-      Spacer(minLength: 0)
+      Spacer(minLength: 4)
+      if badgeCount > 0 {
+        SettingsNotificationBadge(count: badgeCount)
+      }
     }
     .padding(.vertical, 1.5)
   }
@@ -199,7 +216,8 @@ struct VibepolloRootView: View {
             ForEach(visibleSettings) { sec in
               SidebarCategoryRow(
                 section: sec,
-                title: l10n.sectionTitle(sec)
+                title: l10n.sectionTitle(sec),
+                badgeCount: (sec == .general && store.dashboard.updateAvailable) ? 1 : 0
               )
               .tag(sec)
             }
@@ -247,6 +265,8 @@ struct VibepolloRootView: View {
           case .apps:
             AppsPane(store: store)
           }
+        case .softwareUpdate:
+          SoftwareUpdateSubView(store: store)
         case .hostAutomation:
           HostAutomationSubView(store: store)
         case .deviceDetail(let uuid):
@@ -320,6 +340,29 @@ private struct GeneralSettingsPane: View {
             .buttonStyle(.plain)
           }
         }
+      }
+
+      Section {
+        Button {
+          store.navigate(to: .softwareUpdate)
+        } label: {
+          HStack(spacing: 10) {
+            SidebarIconBadge(symbol: "gearshape.fill", tint: .gray, size: 22, symbolSize: 12)
+            SettingsRowLabel(
+              title: l10n.pick("소프트웨어 업데이트", "Software Update"),
+              subtitle: softwareUpdateRowSubtitle
+            )
+            Spacer()
+            if store.dashboard.updateAvailable {
+              SettingsNotificationBadge(count: 1)
+            }
+            Image(systemName: "chevron.right")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundStyle(.tertiary)
+          }
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
       }
 
       Section {
@@ -444,19 +487,13 @@ private struct GeneralSettingsPane: View {
           }
         } label: {
           SettingsRowLabel(
-            title: l10n.pick("업데이트 정책 및 파일 경로", "Update Policy & File Paths"),
-            subtitle: l10n.pick("자동 업데이트 주기, 메뉴 막대 옵션, 상태 및 인증서 파일 경로를 설정합니다.", "Configure update check interval, menu bar controls, and certificate/state file paths.")
+            title: l10n.pick("메뉴 막대 및 파일 경로", "Menu Bar & File Paths"),
+            subtitle: l10n.pick("메뉴 막대 제어 옵션, 환경 변수 호환 모드, 상태 및 인증서 파일 경로를 설정합니다.", "Configure menu bar controls, environment compatibility, and certificate/state file paths.")
           )
         }
       }
 
       Section(l10n.pick("서비스", "Service")) {
-        LabeledContent(l10n.pick("소프트웨어 업데이트", "Software Update")) {
-          Button(l10n.pick("업데이트 확인", "Check for Updates")) {
-            VibepolloHostBridge.shared().checkForUpdates()
-          }
-        }
-
         LabeledContent {
           Button(l10n.pick("재시작", "Restart")) {
             VibepolloHostBridge.shared().restartHost()
@@ -465,8 +502,8 @@ private struct GeneralSettingsPane: View {
           SettingsRowLabel(
             title: l10n.pick("Vibepollo 재시작", "Restart Vibepollo"),
             subtitle: l10n.pick(
-              "현재 버전 \(store.dashboard.version.isEmpty ? VibepolloHostBridge.shared().appVersion() : store.dashboard.version)",
-              "Version \(store.dashboard.version.isEmpty ? VibepolloHostBridge.shared().appVersion() : store.dashboard.version)"
+              "현재 버전 \(currentDisplayVersion)",
+              "Version \(currentDisplayVersion)"
             )
           )
         }
@@ -487,6 +524,20 @@ private struct GeneralSettingsPane: View {
     .sheet(isPresented: $showAdvancedSheet) {
       GeneralAdvancedSheet(store: store)
     }
+  }
+
+  private var currentDisplayVersion: String {
+    store.dashboard.version.isEmpty ? VibepolloHostBridge.shared().appVersion() : store.dashboard.version
+  }
+
+  private var softwareUpdateRowSubtitle: String {
+    if store.dashboard.updateAvailable && !store.dashboard.availableUpdateVersion.isEmpty {
+      return l10n.pick(
+        "Vibepollo \(store.dashboard.availableUpdateVersion) 업데이트 사용 가능",
+        "Vibepollo \(store.dashboard.availableUpdateVersion) Update Available"
+      )
+    }
+    return "Vibepollo \(currentDisplayVersion)"
   }
 
   private func commitHostNameIfNeeded() {

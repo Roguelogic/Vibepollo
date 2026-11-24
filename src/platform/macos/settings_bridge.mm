@@ -274,6 +274,18 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   out["accessibilityAllowed"] = is_accessibility_allowed();
   out["deferredReloadPending"] = config::has_deferred_reload();
 
+  const auto upd = update::get_status_snapshot();
+  const bool upd_available =
+    !upd.available_release.version.empty() &&
+    (upd.phase == update::phase_e::available ||
+     upd.phase == update::phase_e::downloading ||
+     upd.phase == update::phase_e::verifying ||
+     upd.phase == update::phase_e::downloaded ||
+     upd.phase == update::phase_e::installing ||
+     upd.phase == update::phase_e::restarting);
+  out["updateAvailable"] = upd_available;
+  out["availableUpdateVersion"] = upd_available ? upd.available_release.version : "";
+
   return to_nsstring(out.dump());
 }
 
@@ -618,6 +630,8 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   out["lidCloseEndsStreams"] = config::sunshine.lid_close_ends_streams;
   out["updateCheckInterval"] = config::sunshine.update_check_interval_seconds;
   out["notifyPreReleases"] = config::sunshine.notify_pre_releases;
+  out["autoDownloadUpdates"] = config::sunshine.auto_download_updates;
+  out["autoInstallUpdates"] = config::sunshine.auto_install_updates;
   out["hideTrayControls"] = config::sunshine.hide_tray_controls;
   out["envvarCompatibilityMode"] = config::sunshine.envvar_compatibility_mode;
   out["legacyOrdering"] = config::sunshine.legacy_ordering;
@@ -838,6 +852,14 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
     system_tray::refresh_macos_tray_checks();
 
+    if (changed_keys.count("notify_pre_releases")) {
+      update::on_policy_changed(true);
+    } else if (changed_keys.count("update_check_interval") ||
+               changed_keys.count("auto_download_updates") ||
+               changed_keys.count("auto_install_updates")) {
+      update::on_policy_changed(false);
+    }
+
     return @{
       @"status": @YES,
       @"appliedNow": @(applied_now),
@@ -1011,8 +1033,89 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   }
 }
 
+- (NSString *)fetchSoftwareUpdateStatusJSON {
+  const auto snap = update::get_status_snapshot();
+  auto phase_str = [](update::phase_e p) -> const char * {
+    switch (p) {
+      case update::phase_e::checking:
+        return "checking";
+      case update::phase_e::up_to_date:
+        return "up_to_date";
+      case update::phase_e::available:
+        return "available";
+      case update::phase_e::downloading:
+        return "downloading";
+      case update::phase_e::verifying:
+        return "verifying";
+      case update::phase_e::downloaded:
+        return "downloaded";
+      case update::phase_e::installing:
+        return "installing";
+      case update::phase_e::restarting:
+        return "restarting";
+      case update::phase_e::error:
+        return "error";
+      case update::phase_e::idle:
+      default:
+        return "idle";
+    }
+  };
+
+  std::string bundle_path;
+  std::string bundle_reason;
+  const bool can_self_update = platf::can_self_update_macos_bundle(&bundle_path, &bundle_reason);
+
+  nlohmann::json out;
+  out["phase"] = phase_str(snap.phase);
+  out["currentVersion"] = snap.current_version;
+  out["currentChannel"] = snap.current_channel;
+  out["currentCommit"] = snap.current_commit;
+  out["availableVersion"] = snap.available_release.version;
+  out["availableName"] = snap.available_release.name;
+  out["availableUrl"] = snap.available_release.url;
+  out["availableBody"] = snap.available_release.body;
+  out["availablePublishedAt"] = snap.available_release.published_at;
+  out["isPrerelease"] = snap.available_release.is_prerelease;
+  out["assetName"] = snap.target_asset.name;
+  out["assetSize"] = snap.target_asset.size;
+  out["downloadedBytes"] = snap.downloaded_bytes;
+  out["totalBytes"] = snap.total_bytes;
+  out["lastCheckedUnix"] = snap.last_checked_unix;
+  out["scheduledOnIdle"] = snap.scheduled_on_idle;
+  out["checkInProgress"] = snap.check_in_progress;
+  out["canSelfUpdate"] = can_self_update;
+  out["bundlePath"] = bundle_path;
+  out["bundleReason"] = bundle_reason;
+  out["errorCode"] = snap.error_code;
+  out["errorDetail"] = snap.error_detail;
+  return to_nsstring(out.dump());
+}
+
 - (void)checkForUpdates {
   update::trigger_check(true);
+}
+
+- (void)startSoftwareUpdateNow {
+  update::start_install_now(true);
+}
+
+- (void)downloadSoftwareUpdateOnly {
+  update::start_download(false);
+}
+
+- (void)cancelSoftwareUpdateDownload {
+  update::cancel_download();
+}
+
+- (void)setSoftwareUpdateScheduledOnIdle:(BOOL)scheduled {
+  update::schedule_install_on_idle(scheduled == YES);
+}
+
+- (void)openExternalURL:(NSString *)urlString {
+  const std::string raw = urlString.UTF8String ?: "";
+  if (raw.starts_with("https://")) {
+    platf::open_url(raw);
+  }
 }
 
 - (void)restartHost {

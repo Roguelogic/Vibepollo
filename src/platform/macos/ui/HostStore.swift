@@ -12,6 +12,7 @@ final class HostStore: ObservableObject {
   @Published var searchQuery: String = ""
   @Published var showPinSheet: Bool = false
   @Published var dashboard: DashboardSnapshot = .empty
+  @Published var softwareUpdate: SoftwareUpdateSnapshot = .empty
   @Published var clients: [PairedClientItem] = []
   @Published var apps: [StreamAppItem] = []
   @Published var sessionHistory: [SessionHistoryItem] = []
@@ -22,6 +23,7 @@ final class HostStore: ObservableObject {
   @Published var steamInstalled: Bool = false
 
   private var pollTimer: Timer?
+  private var fastUpdateTimer: Timer?
   private var bannerDismissTask: Task<Void, Never>?
   private var settingsLoadedOnce = false
 
@@ -40,6 +42,8 @@ final class HostStore: ObservableObject {
     switch currentRoute {
     case .section(let sec):
       return l10n.sectionTitle(sec)
+    case .softwareUpdate:
+      return l10n.pick("소프트웨어 업데이트", "Software Update")
     case .hostAutomation:
       return l10n.pick("호스트 자동화 및 명령어", "Host Automation & Commands")
     case .deviceDetail(let uuid):
@@ -61,6 +65,7 @@ final class HostStore: ObservableObject {
     }
     forwardStack.removeAll()
     currentRoute = route
+    syncFastUpdatePolling()
   }
 
   func selectSidebar(_ section: SidebarSection) {
@@ -71,17 +76,20 @@ final class HostStore: ObservableObject {
     guard let prev = backStack.popLast() else { return }
     forwardStack.append(currentRoute)
     currentRoute = prev
+    syncFastUpdatePolling()
   }
 
   func goForward() {
     guard let next = forwardStack.popLast() else { return }
     backStack.append(currentRoute)
     currentRoute = next
+    syncFastUpdatePolling()
   }
 
   func popToSectionRoot(_ section: SidebarSection) {
     forwardStack.removeAll()
     currentRoute = .section(section)
+    syncFastUpdatePolling()
   }
 
   func startWindowSession(initialRoute: String?) {
@@ -94,6 +102,7 @@ final class HostStore: ObservableObject {
       settingsLoadedOnce = true
     }
     handleRoute(initialRoute)
+    syncFastUpdatePolling()
 
     pollTimer?.invalidate()
     pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -106,6 +115,8 @@ final class HostStore: ObservableObject {
   func stopWindowSession() {
     pollTimer?.invalidate()
     pollTimer = nil
+    fastUpdateTimer?.invalidate()
+    fastUpdateTimer = nil
     bannerDismissTask?.cancel()
     bannerDismissTask = nil
     statusBanner = nil
@@ -115,20 +126,23 @@ final class HostStore: ObservableObject {
     guard let route = route?.trimmingCharacters(in: .whitespacesAndNewlines), !route.isEmpty else {
       return
     }
-    if route.contains("pin") || route.contains("pair") {
+    let lower = route.lowercased()
+    if lower.contains("pin") || lower.contains("pair") {
       navigate(to: .section(.devices))
       showPinSheet = true
-    } else if route.contains("device") || route.contains("client") {
+    } else if lower.contains("update") {
+      navigate(to: .softwareUpdate)
+    } else if lower.contains("device") || lower.contains("client") {
       navigate(to: .section(.devices))
-    } else if route.contains("app") || route.contains("library") || route.contains("steam") {
+    } else if lower.contains("app") || lower.contains("library") || lower.contains("steam") {
       navigate(to: .section(.apps))
-    } else if route.contains("display") {
+    } else if lower.contains("display") {
       navigate(to: .section(.display))
-    } else if route.contains("log") {
+    } else if lower.contains("log") {
       navigate(to: .logs)
-    } else if route.contains("network") {
+    } else if lower.contains("network") {
       navigate(to: .section(.networkSystem))
-    } else if route.contains("setting") || route.contains("config") {
+    } else if lower.contains("setting") || lower.contains("config") {
       navigate(to: .section(.general))
     }
   }
@@ -153,7 +167,61 @@ final class HostStore: ObservableObject {
         }
       }
     }
+    refreshSoftwareUpdate()
     loadClients()
+  }
+
+  func refreshSoftwareUpdate() {
+    let raw = VibepolloHostBridge.shared().fetchSoftwareUpdateStatusJSON()
+    if let data = raw.data(using: .utf8),
+       let decoded = try? JSONDecoder().decode(SoftwareUpdateSnapshot.self, from: data) {
+      self.softwareUpdate = decoded
+      if decoded.hasAvailableUpdate != dashboard.updateAvailable ||
+         (decoded.hasAvailableUpdate && decoded.availableVersion != dashboard.availableUpdateVersion) {
+        dashboard.updateAvailable = decoded.hasAvailableUpdate
+        dashboard.availableUpdateVersion = decoded.hasAvailableUpdate ? decoded.availableVersion : ""
+      }
+    }
+    syncFastUpdatePolling()
+  }
+
+  private func syncFastUpdatePolling() {
+    let needsFastPoll = (currentRoute == .softwareUpdate) || softwareUpdate.isBusy
+    if needsFastPoll {
+      guard fastUpdateTimer == nil else { return }
+      fastUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.refreshSoftwareUpdate()
+        }
+      }
+    } else {
+      fastUpdateTimer?.invalidate()
+      fastUpdateTimer = nil
+    }
+  }
+
+  func checkForUpdatesNow() {
+    VibepolloHostBridge.shared().checkForUpdates()
+    refreshSoftwareUpdate()
+  }
+
+  func installUpdateNow() {
+    VibepolloHostBridge.shared().startSoftwareUpdateNow()
+    refreshSoftwareUpdate()
+  }
+
+  func cancelUpdateDownload() {
+    VibepolloHostBridge.shared().cancelSoftwareUpdateDownload()
+    refreshSoftwareUpdate()
+  }
+
+  func setUpdateScheduledOnIdle(_ scheduled: Bool) {
+    VibepolloHostBridge.shared().setSoftwareUpdateScheduledOnIdle(scheduled)
+    refreshSoftwareUpdate()
+  }
+
+  func openExternalURL(_ urlString: String) {
+    VibepolloHostBridge.shared().openExternalURL(urlString)
   }
 
   func loadClients() {
@@ -384,6 +452,8 @@ final class HostStore: ObservableObject {
     next.lidCloseEndsStreams = b("lidCloseEndsStreams", true)
     next.updateCheckInterval = i("updateCheckInterval", 86400)
     next.notifyPreReleases = b("notifyPreReleases", true)
+    next.autoDownloadUpdates = b("autoDownloadUpdates", true)
+    next.autoInstallUpdates = b("autoInstallUpdates", true)
     next.hideTrayControls = b("hideTrayControls", false)
     next.envvarCompatibilityMode = b("envvarCompatibilityMode", false)
     next.legacyOrdering = b("legacyOrdering", false)
@@ -589,5 +659,69 @@ final class HostStore: ObservableObject {
 
   func reloadLogs() {
     logsText = VibepolloHostBridge.shared().fetchLogsTail(400)
+  }
+
+  func setAutomaticCheckEnabled(_ enabled: Bool) {
+    if enabled {
+      let interval = settings.updateCheckInterval > 0 ? settings.updateCheckInterval : 86400
+      settings.updateCheckInterval = interval
+      patchSettings(["update_check_interval": interval])
+    } else {
+      settings.updateCheckInterval = 0
+      settings.autoDownloadUpdates = false
+      settings.autoInstallUpdates = false
+      patchSettings([
+        "update_check_interval": 0,
+        "auto_download_updates": false,
+        "auto_install_updates": false,
+      ])
+    }
+    refreshSoftwareUpdate()
+  }
+
+  func setAutomaticDownloadEnabled(_ enabled: Bool) {
+    if enabled {
+      var patch: [String: Any] = ["auto_download_updates": true]
+      if settings.updateCheckInterval <= 0 {
+        settings.updateCheckInterval = 86400
+        patch["update_check_interval"] = 86400
+      }
+      settings.autoDownloadUpdates = true
+      patchSettings(patch)
+    } else {
+      settings.autoDownloadUpdates = false
+      settings.autoInstallUpdates = false
+      patchSettings([
+        "auto_download_updates": false,
+        "auto_install_updates": false,
+      ])
+    }
+    refreshSoftwareUpdate()
+  }
+
+  func setAutomaticInstallEnabled(_ enabled: Bool) {
+    if enabled {
+      var patch: [String: Any] = [
+        "auto_download_updates": true,
+        "auto_install_updates": true,
+      ]
+      if settings.updateCheckInterval <= 0 {
+        settings.updateCheckInterval = 86400
+        patch["update_check_interval"] = 86400
+      }
+      settings.autoDownloadUpdates = true
+      settings.autoInstallUpdates = true
+      patchSettings(patch)
+    } else {
+      settings.autoInstallUpdates = false
+      patchSettings(["auto_install_updates": false])
+    }
+    refreshSoftwareUpdate()
+  }
+
+  func setBetaUpdatesEnabled(_ enabled: Bool) {
+    settings.notifyPreReleases = enabled
+    patchSettings(["notify_pre_releases": enabled])
+    refreshSoftwareUpdate()
   }
 }

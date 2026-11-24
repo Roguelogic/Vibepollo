@@ -57,7 +57,15 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)deleteSessionHistoryWithUUID:(NSString *)uuid;
 - (BOOL)isSteamAvailable;
 - (BOOL)syncSteamCatalogNow;
+
+// Software Update (macOS System Settings > General > Software Update)
+- (NSString *)fetchSoftwareUpdateStatusJSON;
 - (void)checkForUpdates;
+- (void)startSoftwareUpdateNow;
+- (void)downloadSoftwareUpdateOnly;
+- (void)cancelSoftwareUpdateDownload;
+- (void)setSoftwareUpdateScheduledOnIdle:(BOOL)scheduled;
+- (void)openExternalURL:(NSString *)urlString;
 - (void)restartHost;
 
 @end
@@ -71,6 +79,7 @@ extern "C" {
 
 void vibepollo_register_macos_native_ui(void);
 void vibepollo_open_macos_native_ui(const char * _Nullable route);
+void vibepollo_set_macos_native_ui_visible(_Bool visible);
 
 #ifdef __cplusplus
 }

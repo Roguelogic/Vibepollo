@@ -1962,6 +1962,8 @@ namespace config {
     bool_f(vars, "enable_discovery", sunshine.enable_discovery);
     bool_f(vars, "envvar_compatibility_mode", sunshine.envvar_compatibility_mode);
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
+    bool_f(vars, "auto_download_updates", sunshine.auto_download_updates);
+    bool_f(vars, "auto_install_updates", sunshine.auto_install_updates);
     bool_f(vars, "legacy_ordering", sunshine.legacy_ordering);
     bool_f(vars, "forward_rumble", input.forward_rumble);
 
@@ -2576,6 +2578,8 @@ namespace config {
           key == "origin_web_ui_allowed" ||
           key == "update_check_interval" ||
           key == "notify_pre_releases" ||
+          key == "auto_download_updates" ||
+          key == "auto_install_updates" ||
           key == "session_history_ttl_days" ||
           key == "session_history_db_size_limit_mb" ||
           key == "hardware_metrics" ||

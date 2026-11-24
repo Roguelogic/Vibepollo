@@ -296,6 +296,12 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && (argv[1] == platf::install_loginscreen_agent_arg || argv[1] == platf::remove_loginscreen_agent_arg)) {
     return platf::run_loginscreen_agent_helper(argc, argv);
   }
+  if (argc > 1 && argv[1] == platf::aqua_handoff_arg) {
+    return platf::run_aqua_handoff_helper(argc, argv);
+  }
+  if (argc > 1 && argv[1] == platf::install_update_arg) {
+    return platf::run_macos_update_helper(argc, argv);
+  }
 #endif
 #ifdef __linux__
   #ifdef SUNSHINE_BUILD_STEAMOS
@@ -414,6 +420,8 @@ int main(int argc, char *argv[]) {
     config::sunshine.system_tray = false;
     config::sunshine.session_history_enabled = false;
     config::sunshine.update_check_interval_seconds = 0;
+    config::sunshine.auto_download_updates = false;
+    config::sunshine.auto_install_updates = false;
   }
 #endif
 
@@ -510,6 +518,7 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(fatal) << "Another copy of "sv << PROJECT_NAME << " is already running"sv;
     return 1;
   }
+  platf::wait_for_loginwindow_handoff(config::sunshine.port);
 #endif
 
   // Display configuration is managed by the external Windows helper; no in-process init.
@@ -755,20 +764,20 @@ int main(int argc, char *argv[]) {
     system_tray::end_tray();
   });
 #endif
-  // Schedule periodic update checks if configured
-  if (config::sunshine.update_check_interval_seconds > 0) {
-    // Trigger an immediate update check on startup so users don't wait
-    // a full interval before the first detection occurs.
-    update::trigger_check(true);
+  // Schedule periodic update & idle-install checks
+  if (!platf::is_loginwindow_session()) {
+    if (config::sunshine.update_check_interval_seconds > 0) {
+      // Trigger an immediate update check on startup so users don't wait
+      // a full interval before the first detection occurs.
+      update::trigger_check(true);
+    }
 
     auto schedule_periodic = std::make_shared<std::function<void()>>();
     *schedule_periodic = [schedule_periodic]() {
       update::periodic();
-      if (config::sunshine.update_check_interval_seconds > 0) {
-        task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(config::sunshine.update_check_interval_seconds));
-      }
+      task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(30));
     };
-    task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(config::sunshine.update_check_interval_seconds));
+    task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(30));
   }
 #endif
 
@@ -793,8 +802,18 @@ int main(int argc, char *argv[]) {
   if (s_macos_sigterm) {
     dispatch_source_set_event_handler(s_macos_sigterm, ^{
       if (platf::is_loginwindow_session()) {
-        // Release ports and virtual display immediately when macOS transitions LoginWindow -> Aqua
-        // after password entry so the incoming desktop agent binds without port contention.
+        // Notify any connected pre-login client of graceful stream termination before exiting so
+        // Moonlight/VoidLink closes cleanly without an error dialog, then exit immediately so the
+        // incoming Aqua desktop agent binds without port or virtual-display contention.
+        const auto sessions = rtsp_stream::get_sessions_snapshot();
+        if (!sessions.empty()) {
+          for (const auto &session : sessions) {
+            stream::session::graceful_stop(*session);
+          }
+          std::this_thread::sleep_for(120ms);
+        }
+        platf::abort_open_loginwindow_tcp_clients();
+        platf::spawn_loginwindow_aqua_handoff();
         std::_Exit(0);
       }
       shutdown_signal_requested.store(true, std::memory_order_relaxed);
@@ -1255,6 +1274,14 @@ int main(int argc, char *argv[]) {
   // the virtual display's display configuration both depend on them.
   platf::macos_virtual_display::recover_disabled_displays();
   platf::macos_virtual_display::watch_display_changes();
+  if (!platf::is_loginwindow_session()) {
+    const std::string reopen_route = platf::consume_pending_reopen_ui_route();
+    if (!reopen_route.empty()) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        launch_ui(reopen_route);
+      });
+    }
+  }
   platf::run_main_event_loop([&shutdown_event]() {
     return shutdown_event->peek();
   });

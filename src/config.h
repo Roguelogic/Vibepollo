@@ -465,6 +465,8 @@ namespace config {
     bool realtime_stats_enabled {true};  ///< Sample live host stats (CPU/GPU/RAM/VRAM) for the web UI
     int realtime_stats_poll_interval_ms {2000};  ///< Host stats sampler interval in milliseconds
     bool lid_close_ends_streams {true};  ///< macOS: end streams when a MacBook's lid closes, even if the Mac stays awake.
+    bool auto_download_updates {true};  ///< Automatically download available updates in the background.
+    bool auto_install_updates {true};  ///< Automatically install downloaded updates and restart when idle.
   };
 
   extern video_t video;

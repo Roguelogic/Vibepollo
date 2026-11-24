@@ -122,6 +122,7 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
 
     HostStore.shared.startWindowSession(initialRoute: route)
     lastObservedRoute = HostStore.shared.currentRoute
+    vibepollo_set_macos_native_ui_visible(true)
     window?.makeKeyAndOrderFront(nil)
     syncWindowChrome()
     NSApp.activate(ignoringOtherApps: true)
@@ -243,6 +244,7 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    vibepollo_set_macos_native_ui_visible(false)
     window?.makeFirstResponder(focusSink)
     HostStore.shared.stopWindowSession()
 

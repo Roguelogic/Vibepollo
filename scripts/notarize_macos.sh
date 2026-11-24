@@ -102,12 +102,12 @@ if [[ "$INSTALL_LOCAL" == "1" ]]; then
   echo "==> Updating /Applications/Vibepollo.app..."
   rsync -a --delete "$APP_BUNDLE/" /Applications/Vibepollo.app/
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Vibepollo.app || true
-  launchctl bootout "gui/$(id -u)/io.github.Nonary.vibepollo.loginscreen" 2>/dev/null || true
-  if ! launchctl kickstart -k "gui/$(id -u)/io.github.Nonary.vibepollo" 2>/dev/null; then
-    pkill -TERM -f "/Applications/Vibepollo.app/Contents/MacOS/Vibepollo" 2>/dev/null || true
-    sleep 1
-    open -g /Applications/Vibepollo.app
-  fi
+  pkill -TERM -f "/Applications/Vibepollo.app/Contents/MacOS/Vibepollo" 2>/dev/null || true
+  for _ in $(seq 1 25); do
+    pgrep -f "/Applications/Vibepollo.app/Contents/MacOS/Vibepollo" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  open -g /Applications/Vibepollo.app
 fi
 
 echo "==> Done! Notarized DMG ready at: $OUT_DMG"

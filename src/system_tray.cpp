@@ -623,6 +623,7 @@ namespace system_tray {
 
   static void tray_check_update_cb(struct tray_menu *) {
     BOOST_LOG(info) << "Manual update check requested from tray"sv;
+    launch_ui("/software-update"s);
     update::trigger_check(true);
   }
 
@@ -662,7 +663,7 @@ namespace system_tray {
           m->text = ko ? "실행 중인 앱 강제 종료" : TRAY_MSG_NO_APP_RUNNING;
         }
       } else if (m->cb == tray_check_update_cb) {
-        m->text = ko ? "업데이트 확인" : "Check for Update";
+        m->text = ko ? "업데이트 확인…" : "Check for Updates…";
       } else if (m->submenu == scroll_inertia_submenu) {
         m->text = ko ? "스크롤 관성" : "Scroll Inertia";
       } else if (m->submenu == pencil_mode_submenu) {
