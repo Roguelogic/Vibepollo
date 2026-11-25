@@ -51,6 +51,7 @@ if(SUNSHINE_ENABLE_TRAY)
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/Localization.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/Models.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/HostStore.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/MenuBarPopover.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/SettingsWindowController.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeSettingsViews.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeAdvancedSheets.swift")

@@ -216,20 +216,6 @@ struct VibepolloRootView: View {
   var body: some View {
     NavigationSplitView(columnVisibility: .constant(.all)) {
       List(selection: selectionBinding) {
-        let visibleMonitor = SidebarSection.monitorGroup.filter(matchesSearch)
-        if !visibleMonitor.isEmpty {
-          Section {
-            ForEach(visibleMonitor) { sec in
-              SidebarCategoryRow(
-                section: sec,
-                title: l10n.sectionTitle(sec),
-                showLiveDot: !store.dashboard.sessions.isEmpty
-              )
-              .tag(sec)
-            }
-          }
-        }
-
         let visibleSettings = SidebarSection.settingsGroup.filter(matchesSearch)
         if !visibleSettings.isEmpty {
           Section {
@@ -270,8 +256,6 @@ struct VibepolloRootView: View {
         switch store.currentRoute {
         case .section(let section):
           switch section {
-          case .monitor:
-            MonitorPane(store: store)
           case .general:
             GeneralSettingsPane(store: store)
           case .display:
@@ -296,7 +280,7 @@ struct VibepolloRootView: View {
         case .logs:
           LogViewerSubView(store: store)
         case .telemetry:
-          MonitorPane(store: store)
+          SessionHistorySubView(store: store)
         }
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1124,10 +1108,10 @@ private struct NetworkSystemPane: View {
         }
 
         SettingsDrillInRow(
-          title: l10n.pick("모니터 및 세션 기록", "Monitor & Session History"),
-          subtitle: l10n.pick("실시간 CPU · GPU · 메모리 · 네트워크, 활성 스트림 지연 및 과거 세션 기록을 확인합니다.", "Inspect real-time CPU, GPU, memory, network, active stream latency, and past session history.")
+          title: l10n.pick("세션 기록 및 통계", "Session History & Stats"),
+          subtitle: l10n.pick("과거 스트리밍 기록과 통계 샘플링·보관 기간을 관리합니다. 실시간 모니터는 상단 메뉴 막대 아이콘을 클릭해 확인할 수 있습니다.", "Manage past session history and retention. Click the menu bar icon anytime for the live Liquid Glass monitor.")
         ) {
-          store.navigate(to: .section(.monitor))
+          store.navigate(to: .telemetry)
         }
       }
 
@@ -2590,140 +2574,7 @@ private struct LogViewerSubView: View {
   }
 }
 
-// MARK: - Monitor & Hardware Encoder Spec Components
-
-/// Lightweight SwiftUI Shape sparkline (avoids Canvas GPU layer allocations on periodic ticks).
-private struct SparklineLineShape: Shape {
-  let values: [Double]
-  let maxValue: Double
-
-  func path(in rect: CGRect) -> Path {
-    var path = Path()
-    guard !values.isEmpty, rect.width > 1, rect.height > 1 else { return path }
-    let ceiling = max(maxValue, 0.001)
-    let insetY: CGFloat = 2
-    let usableH = max(1, rect.height - insetY * 2)
-    if values.count == 1 {
-      let norm = CGFloat(min(max(values[0] / ceiling, 0), 1))
-      let y = rect.height - insetY - norm * usableH
-      path.move(to: CGPoint(x: 0, y: y))
-      path.addLine(to: CGPoint(x: rect.width, y: y))
-      return path
-    }
-    let stepX = rect.width / CGFloat(values.count - 1)
-    for (idx, raw) in values.enumerated() {
-      let norm = CGFloat(min(max(raw / ceiling, 0), 1))
-      let pt = CGPoint(x: CGFloat(idx) * stepX, y: rect.height - insetY - norm * usableH)
-      if idx == 0 {
-        path.move(to: pt)
-      } else {
-        path.addLine(to: pt)
-      }
-    }
-    return path
-  }
-}
-
-private struct SparklineAreaShape: Shape {
-  let values: [Double]
-  let maxValue: Double
-
-  func path(in rect: CGRect) -> Path {
-    var path = SparklineLineShape(values: values, maxValue: maxValue).path(in: rect)
-    guard !values.isEmpty, rect.width > 1, rect.height > 1 else { return path }
-    path.addLine(to: CGPoint(x: rect.width, y: rect.height))
-    path.addLine(to: CGPoint(x: 0, y: rect.height))
-    path.closeSubpath()
-    return path
-  }
-}
-
-private struct ResourceSparklineCard: View {
-  let title: String
-  let symbol: String
-  let primaryValue: String
-  let detailLeft: String
-  let detailRight: String
-  let progress: Double?
-  let history: [Double]
-  let maxValue: Double
-  let tint: Color
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 7) {
-      HStack(alignment: .firstTextBaseline, spacing: 6) {
-        Image(systemName: symbol)
-          .font(.system(size: 11, weight: .semibold))
-          .foregroundStyle(tint)
-        Text(title)
-          .font(.system(size: 12, weight: .medium))
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-        Spacer(minLength: 4)
-        Text(primaryValue)
-          .font(.system(size: 14.5, weight: .semibold, design: .rounded))
-          .monospacedDigit()
-          .lineLimit(1)
-      }
-
-      ZStack {
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
-          .fill(Color.primary.opacity(0.035))
-        if !history.isEmpty {
-          SparklineAreaShape(values: history, maxValue: maxValue)
-            .fill(
-              LinearGradient(
-                colors: [tint.opacity(0.24), tint.opacity(0.02)],
-                startPoint: .top,
-                endPoint: .bottom
-              )
-            )
-          SparklineLineShape(values: history, maxValue: maxValue)
-            .stroke(tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-        }
-      }
-      .frame(height: 36)
-      .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-      if let progress {
-        GeometryReader { geo in
-          let clamped = CGFloat(min(max(progress, 0), 1))
-          ZStack(alignment: .leading) {
-            Capsule().fill(Color.primary.opacity(0.08))
-            Capsule()
-              .fill(tint)
-              .frame(width: max(clamped > 0 ? 4 : 0, geo.size.width * clamped))
-          }
-        }
-        .frame(height: 4)
-      }
-
-      HStack(spacing: 6) {
-        Text(detailLeft)
-          .font(.system(size: 10.5))
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-          .truncationMode(.tail)
-        Spacer(minLength: 4)
-        if !detailRight.isEmpty {
-          Text(detailRight)
-            .font(.system(size: 10.5).monospacedDigit())
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-        }
-      }
-    }
-    .padding(10)
-    .background(
-      RoundedRectangle(cornerRadius: 8, style: .continuous)
-        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 8, style: .continuous)
-        .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.75)
-    )
-  }
-}
+// MARK: - Hardware Encoder Spec & Session History Components
 
 private struct SpecChip: View {
   let text: String
@@ -2917,406 +2768,13 @@ private struct HardwareEncoderSpecsSection: View {
   }
 }
 
-private struct PipelineLatencyBarView: View {
-  let captureMs: Double
-  let encodeMs: Double
-  let sendMs: Double
-  let targetFps: Int
-  let pixelThroughputMpx: Double?
-  let l10n: L10n
-
-  var body: some View {
-    let totalMs = max(0.01, captureMs + encodeMs + sendMs)
-    let budgetMs = targetFps > 0 ? (1000.0 / Double(targetFps)) : 16.67
-    let capFrac = CGFloat(max(0, captureMs) / totalMs)
-    let encFrac = CGFloat(max(0, encodeMs) / totalMs)
-    let sndFrac = CGFloat(max(0, sendMs) / totalMs)
-
-    VStack(alignment: .leading, spacing: 6) {
-      HStack(alignment: .firstTextBaseline) {
-        Text(l10n.pick("호스트 파이프라인 지연 (P95)", "Host Pipeline Latency (P95)"))
-          .font(.system(size: 12, weight: .medium))
-        Spacer()
-        Text(String(format: "%.2f ms", totalMs))
-          .font(.system(size: 12.5, weight: .semibold).monospacedDigit())
-        Text(String(format: "· %@ %.2f ms", l10n.pick("프레임 예산", "Budget"), budgetMs))
-          .font(.system(size: 11).monospacedDigit())
-          .foregroundStyle(.secondary)
-      }
-
-      GeometryReader { geo in
-        let w = geo.size.width
-        HStack(spacing: 1.5) {
-          Rectangle()
-            .fill(Color.blue)
-            .frame(width: max(captureMs > 0 ? 3 : 0, w * capFrac))
-          Rectangle()
-            .fill(Color.purple)
-            .frame(width: max(encodeMs > 0 ? 4 : 0, w * encFrac))
-          Rectangle()
-            .fill(Color.green)
-            .frame(width: max(sendMs > 0 ? 3 : 0, w * sndFrac))
-        }
-        .clipShape(Capsule(style: .continuous))
-      }
-      .frame(height: 7)
-
-      HStack(spacing: 12) {
-        legendDot(color: .blue, label: l10n.pick("캡처→제출", "Capture"), value: captureMs)
-        legendDot(color: .purple, label: l10n.pick("인코딩", "Encode"), value: encodeMs)
-        legendDot(color: .green, label: l10n.pick("완료→전송", "Send"), value: sendMs)
-        Spacer(minLength: 4)
-        if let mpx = pixelThroughputMpx, mpx > 0 {
-          Text(String(format: "%.0f Mpx/s", mpx))
-            .font(.system(size: 10.5).monospacedDigit())
-            .foregroundStyle(.secondary)
-        }
-      }
-    }
-    .padding(.vertical, 3)
-  }
-
-  private func legendDot(color: Color, label: String, value: Double) -> some View {
-    HStack(spacing: 4) {
-      Circle().fill(color).frame(width: 6, height: 6)
-      Text("\(label) \(String(format: "%.2f", value))ms")
-        .font(.system(size: 10.5).monospacedDigit())
-        .foregroundStyle(.secondary)
-    }
-  }
-}
-
-private struct StreamKpiCell: View {
-  let label: String
-  let primary: String
-  let secondary: String
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(label)
-        .font(.system(size: 10.5))
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-      Text(primary)
-        .font(.system(size: 13.5, weight: .semibold, design: .rounded))
-        .monospacedDigit()
-        .lineLimit(1)
-      if !secondary.isEmpty {
-        Text(secondary)
-          .font(.system(size: 10.5).monospacedDigit())
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-      }
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 8)
-    .padding(.vertical, 6)
-    .background(
-      RoundedRectangle(cornerRadius: 7, style: .continuous)
-        .fill(Color.primary.opacity(0.035))
-    )
-  }
-}
-
-private struct MonitorPane: View {
+private struct SessionHistorySubView: View {
   @ObservedObject var store: HostStore
   @ViewState private var showTelemetrySettings = false
   private var l10n: L10n { store.l10n }
 
-  private var hs: HostStatsSnapshot { store.dashboard.hostStats }
-
-  private var cpuPrimaryText: String {
-    hs.cpuPercent >= 0 ? String(format: "%.1f%%", hs.cpuPercent) : "—"
-  }
-
-  private var cpuLeftDetail: String {
-    var base = hs.cpuModel.isEmpty ? "CPU" : hs.cpuModel
-    if let p = hs.cpuPerfCores, let e = hs.cpuEffCores, p > 0, e > 0 {
-      base += " · \(p)P+\(e)E"
-    } else if let c = hs.cpuLogicalCores, c > 0 {
-      base += l10n.pick(" · \(c)코어", " · \(c)-core")
-    }
-    return base
-  }
-
-  private var cpuRightDetail: String {
-    if let u = hs.cpuUserPercent, let s = hs.cpuSystemPercent, u >= 0, s >= 0 {
-      return l10n.pick(
-        String(format: "사용자 %.0f%% · 시스템 %.0f%%", u, s),
-        String(format: "Usr %.0f%% · Sys %.0f%%", u, s)
-      )
-    }
-    return ""
-  }
-
-  private var gpuPrimaryText: String {
-    hs.gpuPercent >= 0 ? String(format: "%.0f%%", hs.gpuPercent) : "—"
-  }
-
-  private var gpuLeftDetail: String {
-    var base = hs.gpuModel.isEmpty ? "Apple GPU" : hs.gpuModel
-    if let cores = hs.gpuCoreCount, cores > 0 {
-      base += l10n.pick(" · \(cores)코어", " · \(cores)-core")
-    }
-    return base
-  }
-
-  private var gpuRightDetail: String {
-    var parts: [String] = []
-    if let r = hs.gpuRendererPercent, r >= 0 {
-      parts.append(l10n.pick(String(format: "렌더 %.0f%%", r), String(format: "Render %.0f%%", r)))
-    }
-    if let mb = hs.gpuMemInUseMB, mb > 0 {
-      parts.append(mb >= 1024 ? String(format: "%.1f GB", mb / 1024.0) : String(format: "%.0f MB", mb))
-    } else if let t = hs.gpuTilerPercent, t >= 0 {
-      parts.append(l10n.pick(String(format: "타일러 %.0f%%", t), String(format: "Tiler %.0f%%", t)))
-    }
-    return parts.joined(separator: " · ")
-  }
-
-  private var ramPercent: Double? {
-    guard hs.ramUsedGB > 0, hs.ramTotalGB > 0 else { return nil }
-    return min(max(hs.ramUsedGB / hs.ramTotalGB, 0), 1)
-  }
-
-  private var ramTint: Color {
-    guard let pct = ramPercent else { return .green }
-    if pct >= 0.90 { return .red }
-    if pct >= 0.80 { return .orange }
-    return .green
-  }
-
-  private var ramPrimaryText: String {
-    guard hs.ramUsedGB > 0, hs.ramTotalGB > 0 else { return "—" }
-    return String(format: "%.1f / %.0f GB", hs.ramUsedGB, hs.ramTotalGB)
-  }
-
-  private var ramLeftDetail: String {
-    if let pct = ramPercent {
-      return l10n.pick(String(format: "%.0f%% 사용 중", pct * 100.0), String(format: "%.0f%% used", pct * 100.0))
-    }
-    return l10n.pick("통합 메모리", "Unified Memory")
-  }
-
-  private var ramRightDetail: String {
-    if let fp = hs.processFootprintMB, fp > 0 {
-      return String(format: "Vibepollo %.0f MB", fp)
-    }
-    return ""
-  }
-
-  private var netPrimaryText: String {
-    if let tx = hs.netTxMbps, tx >= 0 {
-      return String(format: "↑ %.1f Mbps", tx)
-    }
-    return "—"
-  }
-
-  private var netLeftDetail: String {
-    let iface = hs.netInterface ?? ""
-    if iface.isEmpty {
-      return l10n.pick("기본 네트워크", "Default Interface")
-    }
-    if let link = hs.netLinkSpeedMbps, link > 0 {
-      let speedStr = link >= 1000 ? String(format: "%.0f Gbps", Double(link) / 1000.0) : "\(link) Mbps"
-      return "\(iface) · \(speedStr)"
-    }
-    return iface
-  }
-
-  private var netRightDetail: String {
-    if let rx = hs.netRxMbps, rx >= 0 {
-      return String(format: "↓ %.1f Mbps", rx)
-    }
-    return ""
-  }
-
-  private var netSparkMax: Double {
-    let peak = store.netTxHistory.max() ?? 0
-    return max(10.0, peak * 1.2)
-  }
-
-  private var netProgress: Double? {
-    guard let tx = hs.netTxMbps, tx >= 0 else { return 0 }
-    return min(max(tx / netSparkMax, 0), 1)
-  }
-
   var body: some View {
     Form {
-      Section(l10n.pick("시스템 리소스", "System Resources")) {
-        LazyVGrid(
-          columns: [
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10),
-          ],
-          spacing: 10
-        ) {
-          ResourceSparklineCard(
-            title: "CPU",
-            symbol: "cpu",
-            primaryValue: cpuPrimaryText,
-            detailLeft: cpuLeftDetail,
-            detailRight: cpuRightDetail,
-            progress: hs.cpuPercent >= 0 ? hs.cpuPercent / 100.0 : nil,
-            history: store.cpuHistory,
-            maxValue: 100.0,
-            tint: .blue
-          )
-
-          ResourceSparklineCard(
-            title: "GPU",
-            symbol: "sparkles.rectangle.stack",
-            primaryValue: gpuPrimaryText,
-            detailLeft: gpuLeftDetail,
-            detailRight: gpuRightDetail,
-            progress: hs.gpuPercent >= 0 ? hs.gpuPercent / 100.0 : nil,
-            history: store.gpuHistory,
-            maxValue: 100.0,
-            tint: .purple
-          )
-
-          ResourceSparklineCard(
-            title: l10n.pick("통합 메모리", "Memory"),
-            symbol: "memorychip",
-            primaryValue: ramPrimaryText,
-            detailLeft: ramLeftDetail,
-            detailRight: ramRightDetail,
-            progress: ramPercent,
-            history: store.ramHistory,
-            maxValue: 100.0,
-            tint: ramTint
-          )
-
-          ResourceSparklineCard(
-            title: l10n.pick("네트워크", "Network"),
-            symbol: "network",
-            primaryValue: netPrimaryText,
-            detailLeft: netLeftDetail,
-            detailRight: netRightDetail,
-            progress: netProgress,
-            history: store.netTxHistory,
-            maxValue: netSparkMax,
-            tint: .teal
-          )
-        }
-        .padding(.vertical, 4)
-      }
-
-      if store.dashboard.sessions.isEmpty {
-        Section(l10n.pick("활성 스트림", "Active Stream")) {
-          VStack(alignment: .leading, spacing: 3) {
-            Text(l10n.pick("현재 진행 중인 스트리밍 세션이 없습니다.", "No active streaming sessions."))
-              .font(.system(size: 13))
-            Text(l10n.pick("클라이언트가 연결되면 실시간 FPS, 비트레이트, 3단계 지연 및 인코더 파이프라인이 표시됩니다.", "Live FPS, bitrate, 3-stage host latency, and encoder pipeline details appear here while streaming."))
-              .font(.system(size: 11.5))
-              .foregroundStyle(.secondary)
-          }
-          .padding(.vertical, 2)
-        }
-      } else {
-        ForEach(store.dashboard.sessions) { s in
-          Section {
-            HStack(spacing: 8) {
-              Circle()
-                .fill(Color.green)
-                .frame(width: 8, height: 8)
-              Text(s.deviceName)
-                .font(.system(size: 13.5, weight: .semibold))
-              SpecChip(
-                text: s.directUsb ? "USB Direct" : l10n.pick("네트워크", "Network"),
-                tint: s.directUsb ? .blue : .teal,
-                emphasized: true
-              )
-              if let liveFps = s.actualFps, liveFps > 0, liveFps < 20, (s.repeatedFrames ?? 0) > 0 {
-                SpecChip(text: l10n.pick("VFR 절전", "VFR Idle"), tint: .secondary)
-              }
-              Spacer()
-              Text(formatUptime(s.uptimeSeconds))
-                .font(.system(size: 11.5).monospacedDigit())
-                .foregroundStyle(.secondary)
-            }
-
-            LazyVGrid(
-              columns: [
-                GridItem(.flexible(), spacing: 8),
-                GridItem(.flexible(), spacing: 8),
-                GridItem(.flexible(), spacing: 8),
-                GridItem(.flexible(), spacing: 8),
-              ],
-              spacing: 8
-            ) {
-              StreamKpiCell(
-                label: l10n.pick("실제 FPS", "Live FPS"),
-                primary: (s.actualFps ?? 0) > 0
-                  ? String(format: "%.1f fps", s.actualFps ?? 0)
-                  : "\(s.fps) Hz",
-                secondary: l10n.pick("목표 \(s.fps)Hz", "Target \(s.fps)Hz")
-              )
-
-              StreamKpiCell(
-                label: l10n.pick("실효 비트레이트", "Live Bitrate"),
-                primary: (s.actualBitrateKbps ?? 0) > 0
-                  ? String(format: "%.1f Mbps", (s.actualBitrateKbps ?? 0) / 1000.0)
-                  : String(format: "%.1f Mbps", Double(s.bitrateKbps) / 1000.0),
-                secondary: String(format: "%@ %.0fM", l10n.pick("상한", "Cap"), Double(s.bitrateKbps) / 1000.0)
-              )
-
-              StreamKpiCell(
-                label: l10n.pick("인코딩 지연", "Encode Latency"),
-                primary: (s.encodeP95Ms ?? s.encodeLatencyMs) > 0
-                  ? String(format: "%.1f ms", s.encodeP95Ms ?? s.encodeLatencyMs)
-                  : "—",
-                secondary: s.encodeLatencyMs > 0
-                  ? String(format: "%@ %.1fms", l10n.pick("최근", "Last"), s.encodeLatencyMs)
-                  : ""
-              )
-
-              StreamKpiCell(
-                label: l10n.pick("안정성", "Stability"),
-                primary: s.jitterMs != nil
-                  ? String(format: "%.1f ms %@", s.jitterMs ?? 0, l10n.pick("지터", "jit"))
-                  : l10n.pick("정상", "Stable"),
-                secondary: l10n.pick(
-                  "손실 \(max(0, s.losses)) · IDR \(s.idrRequests ?? 0)",
-                  "Loss \(max(0, s.losses)) · IDR \(s.idrRequests ?? 0)"
-                )
-              )
-            }
-            .padding(.vertical, 2)
-
-            if let capture = s.captureToSubmitP95Ms, let encode = s.encodeP95Ms, let send = s.completeToSendP95Ms {
-              let effectiveFps = (s.actualFps ?? 0) > 0 ? (s.actualFps ?? 0) : Double(s.fps)
-              let liveMpx = (Double(s.width) * Double(s.height) * effectiveFps) / 1_000_000.0
-              PipelineLatencyBarView(
-                captureMs: capture,
-                encodeMs: encode,
-                sendMs: send,
-                targetFps: s.fps,
-                pixelThroughputMpx: liveMpx,
-                l10n: l10n
-              )
-            }
-
-            LabeledContent(l10n.pick("스트림 포맷", "Stream Format")) {
-              Text("\(String(format: "%d×%d @ %d Hz", s.width, s.height, s.fps)) · \(s.codec) · \(s.bitDepth)-bit · \(s.yuv444 ? "4:4:4" : "4:2:0")\(s.hdr ? " · HDR" : "")")
-                .font(.system(size: 12).monospacedDigit())
-                .foregroundStyle(.secondary)
-            }
-
-            if let pipe = store.dashboard.encoderSpec?.activePipeline, pipe.active {
-              ActivePipelineTagStrip(pipeline: pipe, l10n: l10n)
-                .padding(.vertical, 2)
-            }
-          } header: {
-            Text(l10n.pick("활성 스트림", "Active Stream"))
-          }
-        }
-      }
-
-      if let spec = store.dashboard.encoderSpec {
-        HardwareEncoderSpecsSection(spec: spec, l10n: l10n)
-      }
-
       Section {
         LabeledContent {
           Button(l10n.pick("통계 설정...", "Telemetry Options...")) {
@@ -3325,7 +2783,7 @@ private struct MonitorPane: View {
         } label: {
           SettingsRowLabel(
             title: l10n.pick("통계 샘플링 및 세션 기록 보관", "Sampling & History Retention"),
-            subtitle: l10n.pick("실시간 하드웨어 지표 주기와 SQLite 세션 이력 보관 기간을 설정합니다.", "Configure hardware metrics sampling and SQLite session history retention.")
+            subtitle: l10n.pick("실시간 하드웨어 지표 주기와 SQLite 세션 이력 보관 기간을 설정합니다. 실시간 모니터는 상단 메뉴 막대 아이콘에서 바로 확인할 수 있습니다.", "Configure hardware metrics sampling and SQLite session history retention. Click the menu bar icon anytime for the live monitor.")
           )
         }
       }
@@ -3368,17 +2826,6 @@ private struct MonitorPane: View {
     }
   }
 
-  private func formatUptime(_ seconds: Double) -> String {
-    let total = max(0, Int(seconds))
-    let h = total / 3600
-    let m = (total % 3600) / 60
-    let sec = total % 60
-    if h > 0 {
-      return String(format: "%d:%02d:%02d", h, m, sec)
-    }
-    return String(format: "%02d:%02d", m, sec)
-  }
-
   private static let historyDateKoFormatter: DateFormatter = {
     let f = DateFormatter()
     f.locale = Locale(identifier: "ko_KR")
@@ -3402,7 +2849,7 @@ private struct MonitorPane: View {
       let f = l10n.isKo ? Self.historyDateKoFormatter : Self.historyDateEnFormatter
       return f.string(from: Date(timeIntervalSince1970: item.startTimeUnix))
     }()
-    let spec = "\(item.width)×\(item.height) \(item.targetFps)Hz · \(item.codec)\(item.hdr ? " HDR" : "") · \(mins)\(l10n.pick("분", "m"))"
+    let spec = "\(String(format: "%d×%d", item.width, item.height)) \(item.targetFps)Hz · \(item.codec)\(item.hdr ? " HDR" : "") · \(mins)\(l10n.pick("분", "m"))"
     return dateStr.isEmpty ? spec : "\(dateStr) · \(spec)"
   }
 }

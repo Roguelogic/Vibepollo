@@ -39,7 +39,7 @@ final class HostStore: ObservableObject {
   private var settingsLoadedOnce = false
 
   var isMonitorRoute: Bool {
-    currentRoute == .section(.monitor) || currentRoute == .telemetry
+    currentRoute == .telemetry
   }
 
   var l10n: L10n {
@@ -66,24 +66,23 @@ final class HostStore: ObservableObject {
     case .logs:
       return l10n.pick("시스템 로그", "System Logs")
     case .telemetry:
-      return l10n.pick("모니터", "Monitor")
+      return l10n.pick("세션 기록 및 통계", "Session History & Stats")
     }
   }
 
   private init() {}
 
   func navigate(to route: NavigationRoute) {
-    let normalized: NavigationRoute = (route == .telemetry) ? .section(.monitor) : route
-    guard normalized != currentRoute else { return }
+    guard route != currentRoute else { return }
     backStack.append(currentRoute)
     if backStack.count > 32 {
       backStack.removeFirst()
     }
     forwardStack.removeAll()
-    currentRoute = normalized
+    currentRoute = route
     if isMonitorRoute {
       refreshLiveState()
-    } else if normalized == .softwareUpdate {
+    } else if route == .softwareUpdate {
       refreshSoftwareUpdate()
     } else {
       syncFastUpdatePolling()
@@ -180,7 +179,7 @@ final class HostStore: ObservableObject {
       navigate(to: .section(.devices))
       showPinSheet = true
     } else if lower.contains("monitor") || lower.contains("telemetry") || lower.contains("stats") {
-      navigate(to: .section(.monitor))
+      navigate(to: .telemetry)
     } else if lower.contains("update") {
       navigate(to: .softwareUpdate)
     } else if lower.contains("device") || lower.contains("client") {

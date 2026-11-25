@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -50,6 +51,8 @@
 #include "src/video.h"
 
 extern "C" void vibepollo_macos_open_native_ui(const char *route);
+extern "C" void vibepollo_macos_toggle_menubar_popover(double x, double y, double width, double height);
+extern "C" void vibepollo_macos_close_menubar_popover(void);
 
 namespace {
 
@@ -272,6 +275,14 @@ namespace {
 
 extern "C" void vibepollo_open_macos_native_ui(const char *route) {
   vibepollo_macos_open_native_ui(route);
+}
+
+extern "C" void vibepollo_toggle_macos_menubar_popover(double x, double y, double width, double height) {
+  vibepollo_macos_toggle_menubar_popover(x, y, width, height);
+}
+
+extern "C" void vibepollo_close_macos_menubar_popover(void) {
+  vibepollo_macos_close_menubar_popover();
 }
 
 extern "C" void vibepollo_register_macos_native_ui(void) {
@@ -1321,6 +1332,10 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 - (void)restartHost {
   proc::proc.terminate();
   platf::restart();
+}
+
+- (void)quitHost {
+  std::raise(SIGINT);
 }
 
 @end

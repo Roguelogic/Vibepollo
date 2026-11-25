@@ -43,6 +43,7 @@ namespace {
   tray_log_callback log_callback = nullptr;
   std::atomic<bool> exit_requested = false;
   NSStatusItem *status_item = nil;
+  NSMenu *context_menu = nil;
 
   void tray_log_message(enum tray_log_level level, NSString *message) {
     if (log_callback != nullptr) {
@@ -71,6 +72,32 @@ namespace {
 @end
 
 @implementation VibepolloTrayTarget
+
+- (void)statusButtonClicked:(NSStatusBarButton *)sender {
+  NSEvent *event = NSApp.currentEvent;
+  const BOOL isSecondaryClick =
+    event != nil &&
+    (event.type == NSEventTypeRightMouseUp ||
+     event.type == NSEventTypeRightMouseDown ||
+     (event.modifierFlags & NSEventModifierFlagControl) != 0);
+
+  if (isSecondaryClick || platf::is_loginwindow_session()) {
+    vibepollo_close_macos_menubar_popover();
+    if (context_menu != nil && sender != nil) {
+      [context_menu popUpMenuPositioningItem:nil
+                                  atLocation:NSMakePoint(0, sender.bounds.size.height + 6)
+                                      inView:sender];
+    }
+    return;
+  }
+
+  NSRect anchor = NSZeroRect;
+  if (sender != nil && sender.window != nil) {
+    const NSRect inWindow = [sender convertRect:sender.bounds toView:nil];
+    anchor = [sender.window convertRectToScreen:inWindow];
+  }
+  vibepollo_toggle_macos_menubar_popover(anchor.origin.x, anchor.origin.y, anchor.size.width, anchor.size.height);
+}
 
 - (void)menuCallback:(NSMenuItem *)sender {
   auto *item = static_cast<struct tray_menu *>([sender.representedObject pointerValue]);
@@ -164,10 +191,18 @@ namespace {
         [window orderOut:nil];
       }
     }
-    status_item.menu = build_menu(state.menu);
+    context_menu = build_menu(state.menu);
+    status_item.menu = nil;
+    if (status_item.button != nil) {
+      status_item.button.target = target;
+      status_item.button.action = @selector(statusButtonClicked:);
+      [status_item.button sendActionOn:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown)];
+    }
   }
 
   void remove_status_item() {
+    vibepollo_close_macos_menubar_popover();
+    context_menu = nil;
     if (status_item != nil) {
       [[NSStatusBar systemStatusBar] removeStatusItem:status_item];
       status_item = nil;
