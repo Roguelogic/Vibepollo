@@ -59,7 +59,7 @@ final class MenuBarPopoverStore: ObservableObject {
   }
 
   func refresh() {
-    let raw = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON(includeHostStats: false)
+    let raw = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON()
     guard let data = raw.data(using: .utf8),
           let decoded = try? JSONDecoder().decode(DashboardSnapshot.self, from: data)
     else { return }

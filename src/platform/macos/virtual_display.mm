@@ -1,6 +1,6 @@
 /**
  * @file src/platform/macos/virtual_display.mm
- * @brief Per-client virtual display for macOS.
+ * @brief Core per-client virtual display lifecycle, scaling, layout, and reconfiguration watcher for macOS.
  *
  * macOS has no public API for virtual displays, so this uses the private CGVirtualDisplay classes
  * (as BetterDisplay, DeskPad, and Chromium's tests do), and the private CGSConfigureDisplayEnabled
@@ -10,47 +10,24 @@
  * Display configuration and display-mode queries only work in a process with an AppKit session,
  * which main() provides by running the AppKit event loop on the main thread.
  *
- * macOS does not turn a display back on when the process that turned it off dies, even with
- * app-only configuration scope (verified on macOS 27). The exclusive layout therefore keeps two
- * safeguards: a helper process that turns the displays back on if Vibepollo exits without doing
- * so, and a marker file of turned-off displays that the next launch restores.
- *
- * Displays can come back on during a session: reopening a MacBook's lid brings back its built-in
- * display, and a monitor plugged in turns on. While the exclusive layout is active, a display
- * reconfiguration callback notices these and, once the changes settle, turns them off again,
- * updating both safeguards first. Vibepollo's own displays are put back in the modes they were
- * made with if macOS changes them as displays come and go.
+ * Related modules:
+ *  - virtual_display_watchdog.mm: physical display power/mode safeguards, crash-restore helper, marker recovery.
+ *  - virtual_display_remote.mm: Remote Monitor per-client displays and composed topology.
  */
 // standard includes
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
-#include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 // platform includes
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <mach-o/dyld.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 // local includes
 #include "display_policy.h"
@@ -58,449 +35,38 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
-#include "src/remote_display_topology.h"
-#include "src/utility.h"
 #include "src/video.h"
-#include "virtual_display.h"
-
-extern char **environ;
-
-// Private CoreGraphics interfaces (macOS 11+), instantiated through NSClassFromString().
-@interface CGVirtualDisplayDescriptor: NSObject
-@property (retain, nonatomic) dispatch_queue_t queue;
-@property (retain, nonatomic) NSString *name;
-@property (nonatomic) unsigned int maxPixelsHigh;
-@property (nonatomic) unsigned int maxPixelsWide;
-@property (nonatomic) CGSize sizeInMillimeters;
-@property (nonatomic) unsigned int serialNum;
-@property (nonatomic) unsigned int productID;
-@property (nonatomic) unsigned int vendorID;
-@property (nonatomic) CGPoint redPrimary;
-@property (nonatomic) CGPoint greenPrimary;
-@property (nonatomic) CGPoint bluePrimary;
-@property (nonatomic) CGPoint whitePoint;
-@property (copy, nonatomic) void (^terminationHandler)(id, id);
-@end
-
-@interface CGVirtualDisplayMode: NSObject
-- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate;
-// Newer macOS only; check with instancesRespondToSelector: first.
-- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate transferFunction:(unsigned int)transferFunction;
-@end
-
-@interface CGVirtualDisplaySettings: NSObject
-@property (retain, nonatomic) NSArray *modes;
-@property (nonatomic) unsigned int hiDPI;
-@end
-
-@interface CGVirtualDisplay: NSObject
-@property (readonly, nonatomic) unsigned int displayID;
-- (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
-- (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
-@end
+#include "virtual_display_internal.h"
 
 using namespace std::literals;
 
 namespace platf::macos_virtual_display {
   namespace {
-    using configure_display_enabled_fn = CGError (*)(CGDisplayConfigRef, CGDirectDisplayID, bool);
-
-    // A stable identity lets macOS remember the virtual display's arrangement between sessions.
-    constexpr unsigned int vendor_id = 0x5650;  // "VP"
-    constexpr unsigned int product_id = 0x0001;
-    constexpr unsigned int serial_number = 0x0001;
-
     // If macOS persists a hostile/unusable state for a (vendor, product, serial) identity (for
     // example after system "Stop Extending"), remember the working offset so reconnects skip it.
     std::mutex identity_offsets_mutex;
     std::map<unsigned int, unsigned int> identity_offsets;
 
-    // A mode's transfer function, on macOS versions that take one. 1 makes the display HDR: macOS
-    // then gives it EDR headroom, as it does an HDR monitor. 0, the default, is SDR. The values are
-    // undocumented; these were found by testing on macOS 27.
-    constexpr unsigned int hdr_transfer_function = 1;
-
-    /**
-     * @brief Whether this macOS can make an HDR virtual display and capture it in HDR.
-     * @details Capturing HDR needs ScreenCaptureKit's HDR capture, from macOS 15.
-     */
-    bool can_make_hdr() {
-      if (@available(macOS 15.0, *)) {
-        return [NSClassFromString(@"CGVirtualDisplayMode") instancesRespondToSelector:@selector(initWithWidth:height:refreshRate:transferFunction:)];
-      }
-      return false;
-    }
-
-    configure_display_enabled_fn configure_display_enabled() {
-      static const auto fn = reinterpret_cast<configure_display_enabled_fn>(dlsym(RTLD_DEFAULT, "CGSConfigureDisplayEnabled"));
-      return fn;
-    }
-
-    // For the restore helper, which has no event loop of its own.
-    void pump_events(const std::chrono::milliseconds duration) {
-      NSDate *until = [NSDate dateWithTimeIntervalSinceNow:duration.count() / 1000.0];
-      while (until.timeIntervalSinceNow > 0) {
-        @autoreleasepool {
-          NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
-          if (event) {
-            [NSApp sendEvent:event];
-          }
-        }
-      }
-    }
-
-    bool wait_until(const std::function<bool()> &condition, const std::chrono::milliseconds timeout) {
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
-      while (!condition()) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-          return false;
-        }
-        std::this_thread::sleep_for(5ms);
-      }
-      return true;
-    }
-
-    std::vector<CGDirectDisplayID> display_list(CGError (*list)(uint32_t, CGDirectDisplayID *, uint32_t *)) {
-      std::vector<CGDirectDisplayID> ids(32);
-      uint32_t count = 0;
-      if (list(static_cast<uint32_t>(ids.size()), ids.data(), &count) != kCGErrorSuccess) {
-        return {};
-      }
-      ids.resize(count);
-      return ids;
-    }
-
-    bool is_active(const CGDirectDisplayID id) {
-      const auto active = display_list(CGGetActiveDisplayList);
-      return std::find(active.begin(), active.end(), id) != active.end();
-    }
-
-    // A display that no longer exists, such as another app's virtual display removed while it was
-    // turned off, reports this vendor. A display that's only turned off keeps its real one.
-    bool is_gone(const CGDirectDisplayID id) {
-      return CGDisplayVendorNumber(id) == 0xFFFFFFFF;
-    }
-
-    std::filesystem::path marker_path() {
-      return platf::appdata() / "macos_displays_turned_off";
-    }
-
-    /// Replaces the marker whole, so a failed write never leaves a partial list behind.
-    bool write_marker(const std::vector<CGDirectDisplayID> &ids) {
-      const auto path = marker_path();
-      auto temporary = path;
-      temporary += ".tmp";
-      {
-        std::ofstream file {temporary};
-        for (const auto id : ids) {
-          file << id << '\n';
-        }
-        file.flush();
-        if (!file) {
-          BOOST_LOG(warning) << "Virtual display: couldn't write "sv << temporary.string();
-          return false;
-        }
-      }
-      std::error_code ec;
-      std::filesystem::rename(temporary, path, ec);
-      if (ec) {
-        BOOST_LOG(warning) << "Virtual display: couldn't write "sv << path.string() << ": "sv << ec.message();
-        std::filesystem::remove(temporary, ec);
-        return false;
-      }
-      return true;
-    }
-
-    std::vector<CGDirectDisplayID> read_marker() {
-      std::vector<CGDirectDisplayID> ids;
-      std::ifstream file {marker_path()};
-      for (CGDirectDisplayID id; file >> id;) {
-        ids.push_back(id);
-      }
-      return ids;
-    }
-
-    void remove_marker() {
-      std::error_code ec;
-      std::filesystem::remove(marker_path(), ec);
-    }
-
-    // Session scope, so the change doesn't depend on this process staying alive.
-    bool set_displays_enabled(const std::vector<CGDirectDisplayID> &ids, const bool enabled) {
-      const auto configure = configure_display_enabled();
-      CGDisplayConfigRef config;
-      if (!configure || CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
-        return false;
-      }
-      for (const auto id : ids) {
-        configure(config, id, enabled);
-      }
-      return CGCompleteDisplayConfiguration(config, kCGConfigureForSession) == kCGErrorSuccess;
-    }
-
-    // One configuration per display: a single display that fails, like one that's since been
-    // removed, would otherwise fail them all and leave every screen off. Enabling a display that's
-    // already on fails too, so skip those. Every display is attempted; only a removed one may fail.
-    bool turn_on(const std::vector<CGDirectDisplayID> &ids) {
-      bool restored = true;
-      for (const auto id : ids) {
-        if (!is_active(id) && !set_displays_enabled({id}, true) && !is_gone(id)) {
-          restored = false;
-        }
-      }
-      return restored;
-    }
-
-    std::string format_ids(const std::vector<CGDirectDisplayID> &ids) {
-      std::string result;
-      for (const auto id : ids) {
-        result += (result.empty() ? ""s : ", "s) + std::to_string(id);
-      }
-      return result;
-    }
-
-    /**
-     * @brief Split off a closed MacBook's built-in display, which can't be turned on until the lid opens.
-     * @details Once turned off, it comes back on by itself when the lid opens (seen on macOS 27), but it
-     *          stays in the marker in case it doesn't. CGDisplayIsOnline() can't tell: macOS reports a
-     *          display that's only turned off as offline too.
-     */
-    std::pair<std::vector<CGDirectDisplayID>, std::vector<CGDirectDisplayID>> split_offline(const std::vector<CGDirectDisplayID> &ids) {
-      std::pair<std::vector<CGDirectDisplayID>, std::vector<CGDirectDisplayID>> result;
-      const bool lid_closed = platf::lid_closed();
-      for (const auto id : ids) {
-        (lid_closed && CGDisplayIsBuiltin(id) && !is_gone(id) ? result.second : result.first).push_back(id);
-      }
-      return result;
-    }
-
-    /// After turning displays back on: forget the marker, or keep just the offline ones in it.
-    void settle_marker(const std::vector<CGDirectDisplayID> &offline) {
-      if (offline.empty()) {
-        remove_marker();
-        return;
-      }
-      write_marker(offline);
-      BOOST_LOG(info) << "Virtual display: the lid is closed, so the built-in display "sv << format_ids(offline) << " comes back on when it opens"sv;
-    }
-
-    std::pair<std::size_t, std::size_t> current_pixels(const CGDirectDisplayID id) {
-      const CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id);
-      if (!mode) {
-        return {0, 0};
-      }
-      const std::pair<std::size_t, std::size_t> pixels {CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode)};
-      CGDisplayModeRelease(mode);
-      return pixels;
-    }
-
-    bool same_mode(const CGDisplayModeRef a, const CGDisplayModeRef b) {
-      return CGDisplayModeGetPixelWidth(a) == CGDisplayModeGetPixelWidth(b) && CGDisplayModeGetPixelHeight(a) == CGDisplayModeGetPixelHeight(b) &&
-             CGDisplayModeGetWidth(a) == CGDisplayModeGetWidth(b) && CGDisplayModeGetHeight(a) == CGDisplayModeGetHeight(b);
-    }
-
-    /**
-     * @brief The other displays' modes, from before a new display joins them.
-     * @details macOS keeps display settings per combination of displays, so a new display gives the
-     *          others their default modes and drops the user's scaling, such as More Space. So does
-     *          turning a display back on, or removing one. restore() puts back any that changed.
-     */
-    class saved_modes_t {
-    public:
-      saved_modes_t() {
-        for (const auto id : display_list(CGGetActiveDisplayList)) {
-          if (const CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id)) {
-            modes.emplace_back(id, mode);
-          }
-        }
-      }
-
-      saved_modes_t(const saved_modes_t &) = delete;
-      saved_modes_t &operator=(const saved_modes_t &) = delete;
-
-      /// Also remember a display that joined later, unless it's already remembered.
-      void add(const CGDirectDisplayID id) {
-        if (std::any_of(modes.begin(), modes.end(), [id](const auto &entry) {
-              return entry.first == id;
-            })) {
-          return;
-        }
-        if (const CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id)) {
-          modes.emplace_back(id, mode);
-        }
-      }
-
-      ~saved_modes_t() {
-        for (const auto &[_, mode] : modes) {
-          CGDisplayModeRelease(mode);
-        }
-      }
-
-      /// @param wait How long macOS may take to make the change, which it does just after the displays change.
-      void restore(const std::chrono::milliseconds wait) const {
-        wait_until([this]() {
-          return !changed().empty();
-        },
-                   wait);
-        const auto displays = changed();
-        CGDisplayConfigRef config;
-        if (displays.empty() || CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
-          return;
-        }
-        for (const auto &[id, mode] : displays) {
-          BOOST_LOG(info) << "Virtual display: putting back the mode macOS changed on display "sv << id;
-          CGConfigureDisplayWithDisplayMode(config, id, mode, nullptr);
-        }
-        CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
-      }
-
-    private:
-      std::vector<std::pair<CGDirectDisplayID, CGDisplayModeRef>> changed() const {
-        std::vector<std::pair<CGDirectDisplayID, CGDisplayModeRef>> result;
-        for (const auto &[id, mode] : modes) {
-          const CGDisplayModeRef current = CGDisplayCopyDisplayMode(id);
-          if (current && is_active(id) && !same_mode(current, mode)) {
-            result.emplace_back(id, mode);
-          }
-          if (current) {
-            CGDisplayModeRelease(current);
-          }
-        }
-        return result;
-      }
-
-      std::vector<std::pair<CGDirectDisplayID, CGDisplayModeRef>> modes;
-    };
-
-    /// The helper that turns displays back on if Vibepollo exits without doing so.
-    using watchdog_t = macos_display_policy::restore_helper_t;
-
-    struct virtual_display_t {
-      CGVirtualDisplay *display = nil;
-      CGDirectDisplayID id = kCGNullDirectDisplay;
-      bool hdr = false;
-      int width = 0;  ///< As requested.
-      int height = 0;
-      double refresh = 0;
-      ///< Target Retina mode when explicit scaling is configured, or default 2x fallback.
-      bool hidpi = false;
-      bool explicit_scale = false;
-      unsigned int max_pixels_wide = 0;
-      unsigned int max_pixels_high = 0;
-      std::size_t default_mode_width = 0;
-      std::size_t default_mode_height = 0;
-      std::size_t default_pixel_width = 0;
-      std::size_t default_pixel_height = 0;
-      std::size_t mode_width = 0;  ///< Logical width in points.
-      std::size_t mode_height = 0;
-      std::size_t pixel_width = 0;  ///< Active backing pixels, which get captured.
-      std::size_t pixel_height = 0;
-      bool exclusive = false;  ///< The exclusive layout is in effect: only Vibepollo's displays stay on.
-      std::vector<CGDirectDisplayID> turned_off;  ///< Physical displays to turn back on.
-      std::unique_ptr<saved_modes_t> turned_off_modes;  ///< Their modes from before.
-      watchdog_t watchdog;
-      /// Bounds how often displays that keep coming back on get turned off again. Opening the lid
-      /// can take two: one right away, and one once the changes settle.
-      macos_display_policy::attempt_budget_t enforce_budget {6, 60s};
-      bool gave_up_enforcing = false;
-
-      virtual_display_t() = default;
-      virtual_display_t(const virtual_display_t &) = delete;
-      virtual_display_t &operator=(const virtual_display_t &) = delete;
-      ~virtual_display_t();
-    };
-
     std::mutex state_mutex;
-    std::unique_ptr<virtual_display_t> current;
+    std::unique_ptr<detail::virtual_display_t> current;
     int current_users = 0;
     std::atomic<CGDirectDisplayID> current_id {kCGNullDirectDisplay};
     std::atomic<bool> current_hdr {false};
 
-    watchdog_t start_watchdog(const std::vector<CGDirectDisplayID> &ids) {
-      int fds[2];
-      if (pipe(fds) != 0) {
-        BOOST_LOG(warning) << "Virtual display: couldn't start the restore helper: "sv << std::strerror(errno);
-        return {};
-      }
-      fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-      fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-      // If the helper died first, writing "done" must fail rather than raise SIGPIPE here.
-      fcntl(fds[1], F_SETNOSIGPIPE, 1);
+    // Changes arrive in bursts (a reopened lid adds a display, then macOS rearranges and picks modes),
+    // so wait for them to stop before acting.
+    constexpr auto settle_delay = 750ms;
 
-      char executable[PATH_MAX];
-      uint32_t size = sizeof(executable);
-      if (_NSGetExecutablePath(executable, &size) != 0) {
-        close(fds[0]);
-        close(fds[1]);
-        BOOST_LOG(warning) << "Virtual display: couldn't start the restore helper: no executable path"sv;
-        return {};
-      }
+    std::atomic<std::uint64_t> change_generation {0};
+    std::atomic<std::uint64_t> settled_generation {0};
+    std::atomic<std::uint32_t> pending_flags {0};
+    std::atomic<std::uint64_t> scale_reinit_counter {0};
 
-      std::vector<std::string> args {executable, std::string {restore_watchdog_arg}};
-      for (const auto id : ids) {
-        args.push_back(std::to_string(id));
-      }
-      std::vector<char *> argv;
-      for (auto &arg : args) {
-        argv.push_back(arg.data());
-      }
-      argv.push_back(nullptr);
-
-      // Inherit only the pipe (as stdin): an inherited listening socket would keep Vibepollo's
-      // ports busy after a crash.
-      posix_spawnattr_t attributes;
-      posix_spawnattr_init(&attributes);
-      posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
-      posix_spawn_file_actions_t actions;
-      posix_spawn_file_actions_init(&actions);
-      posix_spawn_file_actions_adddup2(&actions, fds[0], STDIN_FILENO);
-
-      pid_t pid = -1;
-      const int result = posix_spawn(&pid, executable, &actions, &attributes, argv.data(), environ);
-      posix_spawn_file_actions_destroy(&actions);
-      posix_spawnattr_destroy(&attributes);
-      close(fds[0]);
-
-      if (result != 0) {
-        close(fds[1]);
-        BOOST_LOG(warning) << "Virtual display: couldn't start the restore helper: "sv << std::strerror(result);
-        return {};
-      }
-      return {pid, fds[1]};
-    }
-
-    void stop_watchdog(watchdog_t &watchdog, const bool displays_restored) {
-      if (watchdog.fd < 0) {
-        watchdog.pid = -1;
-        return;
-      }
-      if (displays_restored) {
-        constexpr char done = 'd';
-        (void) write(watchdog.fd, &done, 1);
-      }
-      // Without "done", the helper turns the displays back on itself.
-      close(watchdog.fd);
-      watchdog.fd = -1;
-      wait_until([&watchdog]() {
-        const pid_t r = waitpid(watchdog.pid, nullptr, WNOHANG);
-        return r > 0 || (r < 0 && errno != EINTR);
-      },
-                 3s);
-      watchdog.pid = -1;
-    }
-
-    /// The safeguards and display changes macos_display_policy::cover_and_turn_off() makes.
-    const macos_display_policy::safeguard_ops_t &safeguard_ops() {
-      static const macos_display_policy::safeguard_ops_t ops {
-        .write_marker = write_marker,
-        .remove_marker = remove_marker,
-        .start_helper = start_watchdog,
-        .stop_helper = stop_watchdog,
-        .turn_off = [](const std::vector<CGDirectDisplayID> &ids) {
-          return set_displays_enabled(ids, false);
-        },
-      };
-      return ops;
+    // Off the main thread: the callback arrives there, and the work below can wait seconds for
+    // displays, during which the event loop the display configuration depends on must keep running.
+    dispatch_queue_t reconcile_queue() {
+      static dispatch_queue_t queue = dispatch_queue_create("dev.vibepollo.display-changes", DISPATCH_QUEUE_SERIAL);
+      return queue;
     }
 
     /**
@@ -509,18 +75,26 @@ namespace platf::macos_virtual_display {
      *          Remote Monitor that's still coming online is never taken for a physical display.
      */
     bool is_own_display(const CGDirectDisplayID id) {
-      return CGDisplayVendorNumber(id) == vendor_id && CGDisplayModelNumber(id) == product_id;
+      return CGDisplayVendorNumber(id) == detail::vendor_id && CGDisplayModelNumber(id) == detail::product_id;
     }
 
-    /// The displays the exclusive layout keeps on, and whether a Remote Monitor is still being made.
-    std::pair<std::vector<CGDirectDisplayID>, bool> exclusive_keep_on(const CGDirectDisplayID stream_display, const std::vector<CGDirectDisplayID> &candidates);
+    std::pair<std::vector<CGDirectDisplayID>, bool> exclusive_keep_on(const CGDirectDisplayID stream_display, const std::vector<CGDirectDisplayID> &candidates) {
+      std::vector<CGDirectDisplayID> keep_on {stream_display};
+      for (const auto id : candidates) {
+        if (is_own_display(id)) {
+          keep_on.push_back(id);
+        }
+      }
+      const bool pending = detail::append_remote_keep_on(keep_on);
+      return {std::move(keep_on), pending};
+    }
 
-    bool turn_off_other_displays(virtual_display_t &display) {
-      if (!configure_display_enabled()) {
+    bool turn_off_other_displays(detail::virtual_display_t &display) {
+      if (!detail::has_configure_display_enabled()) {
         return false;
       }
 
-      const auto online = display_list(CGGetOnlineDisplayList);
+      const auto online = detail::display_list(CGGetOnlineDisplayList);
       const auto [keep_on, pending] = exclusive_keep_on(display.id, online);
       auto others = macos_display_policy::plan_exclusive_layout(online, keep_on, {}, pending).turn_off;
       if (others.empty()) {
@@ -531,44 +105,19 @@ namespace platf::macos_virtual_display {
       }
 
       // Safeguards first: macOS won't turn these back on if Vibepollo dies.
-      display.turned_off_modes = std::make_unique<saved_modes_t>();
-      if (macos_display_policy::cover_and_turn_off(safeguard_ops(), display.watchdog, {}, others, others) != macos_display_policy::cover_result_e::turned_off) {
+      display.turned_off_modes = std::make_unique<detail::saved_modes_t>();
+      if (macos_display_policy::cover_and_turn_off(detail::safeguard_ops(), display.watchdog, {}, others, others) != macos_display_policy::cover_result_e::turned_off) {
         return false;
       }
       display.exclusive = true;
       display.turned_off = std::move(others);
       // Let the desktop settle before capture starts: a capture set up while displays are still
       // going away can get no frames at all.
-      wait_until([&display]() {
-        return CGDisplayIsMain(display.id) && std::none_of(display.turned_off.begin(), display.turned_off.end(), is_active);
+      detail::wait_until([&display]() {
+        return CGDisplayIsMain(display.id) && std::none_of(display.turned_off.begin(), display.turned_off.end(), detail::is_active);
       },
-                 5s);
+                         5s);
       return true;
-    }
-
-    void ensure_not_mirrored(const CGDirectDisplayID id) {
-      if (id == kCGNullDirectDisplay) {
-        return;
-      }
-      // CGDisplayIsInMirrorSet returns 1 for mirrored, 0 for not mirrored, and -1 for unknown IDs.
-      // Compare explicitly against 1 so an unregistered ID is never treated as mirrored.
-      if (CGDisplayIsInMirrorSet(id) != 1) {
-        return;
-      }
-      CGDisplayConfigRef config = nullptr;
-      if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
-        return;
-      }
-      CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay);
-      for (const auto other : display_list(CGGetActiveDisplayList)) {
-        if (other != id && CGDisplayMirrorsDisplay(other) == id) {
-          CGConfigureDisplayMirrorOfDisplay(config, other, kCGNullDirectDisplay);
-        }
-      }
-      // Session scope (not permanent): permanent mirror reconfiguration of a private CGVirtualDisplay
-      // fails with kCGErrorIllegalArgument, whereas session scope reliably dissolves the mirror set.
-      const CGError err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
-      BOOST_LOG(info) << "Virtual display: display "sv << id << " was in a mirror set; detached to extend (result "sv << err << ')';
     }
 
     void log_if_unit_number_clashes(const CGDirectDisplayID id) {
@@ -579,7 +128,7 @@ namespace platf::macos_virtual_display {
       if (unit == UINT32_MAX) {
         return;
       }
-      for (const auto other : display_list(CGGetOnlineDisplayList)) {
+      for (const auto other : detail::display_list(CGGetOnlineDisplayList)) {
         if (other != id && CGDisplayUnitNumber(other) == unit) {
           BOOST_LOG(warning) << "Virtual display: display "sv << id << " shares CGDisplayUnitNumber "sv << unit
                              << " with online display "sv << other << "; capture source verification will reattach if macOS cross-binds them"sv;
@@ -590,7 +139,7 @@ namespace platf::macos_virtual_display {
 
     void make_main(const CGDirectDisplayID id) {
       // The display at (0, 0) is the main one; keep the others to its right in their current order.
-      const auto others = display_list(CGGetActiveDisplayList);
+      const auto others = detail::display_list(CGGetActiveDisplayList);
       double min_x = 0;
       for (const auto other : others) {
         if (other != id) {
@@ -613,7 +162,7 @@ namespace platf::macos_virtual_display {
       CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
     }
 
-    void apply_layout(virtual_display_t &display) {
+    void apply_layout(detail::virtual_display_t &display) {
       using layout_e = config::video_t::virtual_display_layout_e;
       const auto layout = config::video.virtual_display_layout;
 
@@ -642,7 +191,7 @@ namespace platf::macos_virtual_display {
         const double hz = CGDisplayModeGetRefreshRate(mode);
         return hz > 0.0 && std::abs(hz - target_refresh) < 0.5;
       };
-      wait_until([&]() {
+      detail::wait_until([&]() {
         const CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, (__bridge CFDictionaryRef) options);
         if (!modes) {
           return false;
@@ -683,7 +232,7 @@ namespace platf::macos_virtual_display {
         CFRelease(modes);
         return chosen != nullptr;
       },
-                 3s);
+                         3s);
 
       if (!chosen) {
         BOOST_LOG(warning) << "Virtual display: no "sv << pixel_width << 'x' << pixel_height << " mode; using macOS's default"sv;
@@ -695,6 +244,288 @@ namespace platf::macos_virtual_display {
         CGCompleteDisplayConfiguration(config, kCGConfigurePermanently);
       }
       CGDisplayModeRelease(chosen);
+    }
+
+    void ensure_retina_mode(detail::virtual_display_t &display) {
+      if (!detail::is_active(display.id)) {
+        detail::sync_recorded_mode(display);
+        return;
+      }
+      if (!display.hidpi) {
+        if (display.explicit_scale && display.default_mode_width > 0 && display.default_pixel_width > 0) {
+          select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
+        }
+        detail::sync_recorded_mode(display);
+        return;
+      }
+      if (display.explicit_scale) {
+        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
+        detail::sync_recorded_mode(display);
+        return;
+      }
+      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
+      const double cur_hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0.0;
+      const bool refresh_ok = display.refresh <= 0.0 || cur_hz <= 0.0 || std::abs(cur_hz - display.refresh) < 0.5;
+      const bool already_retina = cur &&
+                                  CGDisplayModeGetWidth(cur) >= 800 &&
+                                  CGDisplayModeGetPixelWidth(cur) == CGDisplayModeGetWidth(cur) * 2 &&
+                                  CGDisplayModeGetPixelHeight(cur) == CGDisplayModeGetHeight(cur) * 2 &&
+                                  refresh_ok;
+      if (cur) {
+        CGDisplayModeRelease(cur);
+      }
+      if (!already_retina) {
+        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
+      }
+      detail::sync_recorded_mode(display);
+    }
+
+    bool apply_virtual_display_settings(
+      CGVirtualDisplay *display,
+      const int width,
+      const int height,
+      const unsigned int max_pixels_wide,
+      const unsigned int max_pixels_high,
+      const double refresh,
+      const bool make_hdr,
+      const detail::scale_geometry_t &geom
+    ) {
+      const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
+      const Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
+      if (!display || !settings_class || !mode_class) {
+        return false;
+      }
+
+      CGVirtualDisplaySettings *settings = [[settings_class alloc] init];
+      settings.hiDPI = geom.hidpi ? 1 : 0;
+      NSMutableArray *modes = [NSMutableArray array];
+      std::vector<std::pair<unsigned int, unsigned int>> added_dims;
+      const auto add_mode = [&](const unsigned int w, const unsigned int h) {
+        if (w == 0 || h == 0 || w > max_pixels_wide || h > max_pixels_high) {
+          return;
+        }
+        if (std::find(added_dims.begin(), added_dims.end(), std::pair {w, h}) != added_dims.end()) {
+          return;
+        }
+        added_dims.emplace_back(w, h);
+        CGVirtualDisplayMode *m = make_hdr ?
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh transferFunction:detail::hdr_transfer_function] :
+                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh];
+        if (m) {
+          [modes addObject:m];
+        }
+      };
+
+      const auto base_size = macos_display_policy::virtual_display_size(width, height, geom.hidpi);
+      if (geom.hidpi) {
+        add_mode(base_size.pixel_width, base_size.pixel_height);
+        add_mode(base_size.width, base_size.height);
+        add_mode(geom.pixel_width, geom.pixel_height);
+        add_mode(geom.mode_width, geom.mode_height);
+        constexpr double scale_factors[] = {1.25, 1.50, 1.75, 2.15, 2.25, 2.3888889, 2.50, 2.6875, 3.00};
+        for (const double factor : scale_factors) {
+          const unsigned int lw = detail::round_even(base_size.pixel_width / factor);
+          const unsigned int lh = detail::round_even(static_cast<double>(lw) * base_size.pixel_height / base_size.pixel_width);
+          if (lw >= 640 && lh >= 480 && lw * 2 <= max_pixels_wide && lh * 2 <= max_pixels_high) {
+            add_mode(lw * 2, lh * 2);
+            add_mode(lw, lh);
+          }
+        }
+      } else {
+        add_mode(geom.pixel_width, geom.pixel_height);
+      }
+
+      settings.modes = modes;
+      return [display applySettings:settings] == YES;
+    }
+
+    std::unique_ptr<detail::virtual_display_t> create(const video::config_t &config) {
+      const double refresh = config.framerateX100 > 0 ? config.framerateX100 / 100.0 : config.framerate;
+      const bool hdr = config.dynamicRange > 0 && !config.prefer_sdr_10bit && !config.force_sdr;
+      const bool exclusive_layout = (config::video.virtual_display_layout == config::video_t::virtual_display_layout_e::exclusive);
+      auto result = detail::make_display(@PROJECT_NAME, detail::serial_number, config.width, config.height, refresh, hdr, exclusive_layout);
+      if (!result) {
+        BOOST_LOG(warning) << "Virtual display: streaming the physical display instead"sv;
+        return nullptr;
+      }
+      result->width = config.width;
+      result->height = config.height;
+      result->refresh = refresh;
+      apply_layout(*result);
+      detail::ensure_not_mirrored(result->id);
+      // Turning off physical displays activates macOS's single-display profile, which may default
+      // back to 1x non-Retina; re-verify and enforce Retina HiDPI after layout settles.
+      ensure_retina_mode(*result);
+      if (!result->turned_off.empty()) {
+        BOOST_LOG(info) << "Virtual display: physical displays turned off (active mode: looks like "sv
+                        << result->mode_width << 'x' << result->mode_height << ", pixels "sv
+                        << result->pixel_width << 'x' << result->pixel_height << ')';
+      }
+      return result;
+    }
+
+    void release() {
+      std::lock_guard lock {state_mutex};
+      if (--current_users > 0) {
+        return;
+      }
+      current_id = kCGNullDirectDisplay;
+      current_hdr = false;
+      current.reset();
+    }
+
+    dispatch_queue_t hold_timer_queue() {
+      static dispatch_queue_t q = dispatch_queue_create("dev.vibepollo.virtual-display.hold", DISPATCH_QUEUE_SERIAL);
+      return q;
+    }
+
+    void cancel_timer_locked(__strong dispatch_source_t &timer) {
+      if (timer != nil) {
+        dispatch_source_cancel(timer);
+        timer = nil;
+      }
+    }
+
+    std::mutex pause_hold_mutex;
+    std::shared_ptr<void> pause_hold;
+    std::uint64_t pause_hold_generation = 0;
+    dispatch_source_t pause_hold_timer = nil;
+
+    // A paused game's display can only be reused by a stream that wants the same mode.
+    bool pause_hold_is_stale(const video::config_t &config) {
+      {
+        std::lock_guard lock {pause_hold_mutex};
+        if (!pause_hold) {
+          return false;
+        }
+      }
+      const double refresh = config.framerateX100 > 0 ? config.framerateX100 / 100.0 : config.framerate;
+      const bool hdr = config.dynamicRange > 0 && !config.prefer_sdr_10bit && !config.force_sdr;
+      std::lock_guard lock {state_mutex};
+      return current && current_users == 1 &&
+             (current->width != config.width || current->height != config.height || current->refresh != refresh || current->hdr != hdr);
+    }
+
+    std::mutex launch_hold_mutex;
+    std::shared_ptr<void> launch_hold;
+    std::uint64_t launch_hold_generation = 0;
+    dispatch_source_t launch_hold_timer = nil;
+
+    /**
+     * @brief Turn off displays that came back on while the exclusive layout is in effect.
+     * @details Call with state_mutex held. Safeguards are updated before anything is turned off.
+     */
+    void enforce_exclusive_layout(detail::virtual_display_t &display, const std::chrono::steady_clock::time_point noticed) {
+      const auto active = detail::display_list(CGGetActiveDisplayList);
+      const auto [keep_on, pending] = exclusive_keep_on(display.id, active);
+      const auto plan = macos_display_policy::plan_exclusive_layout(active, keep_on, display.turned_off, pending);
+      if (plan.turn_off.empty() || display.gave_up_enforcing) {
+        return;
+      }
+      if (!display.enforce_budget.try_spend(std::chrono::steady_clock::now())) {
+        display.gave_up_enforcing = true;
+        BOOST_LOG(error) << "Virtual display: display(s) "sv << detail::format_ids(plan.turn_off)
+                         << " keep turning back on, so they'll stay on for the rest of this session. Start a new stream to try the Exclusive layout again"sv;
+        return;
+      }
+
+      // Safeguards first, and only for displays they don't cover yet. Turning displays back off
+      // that are already covered needs a running helper too: one that couldn't start, or the
+      // helper's own failure, would leave nothing to turn them back on.
+      using macos_display_policy::cover_result_e;
+      auto covered = display.turned_off;
+      covered.insert(covered.end(), plan.newly_tracked.begin(), plan.newly_tracked.end());
+      auto result = cover_result_e::turned_off;
+      if (!plan.newly_tracked.empty() || !display.watchdog.running()) {
+        if (!display.turned_off_modes) {
+          display.turned_off_modes = std::make_unique<detail::saved_modes_t>();
+        }
+        for (const auto id : plan.newly_tracked) {
+          display.turned_off_modes->add(id);
+        }
+        result = macos_display_policy::cover_and_turn_off(detail::safeguard_ops(), display.watchdog, display.turned_off, covered, plan.turn_off);
+      } else if (!detail::set_displays_enabled(plan.turn_off, false)) {
+        result = cover_result_e::turn_off_failed;
+      }
+      if (result == cover_result_e::safeguards_failed) {
+        BOOST_LOG(warning) << "Virtual display: couldn't prepare to turn display(s) "sv << detail::format_ids(plan.turn_off) << " back on, so they stay on"sv;
+        return;
+      }
+      if (result != cover_result_e::turned_off) {
+        BOOST_LOG(warning) << "Virtual display: couldn't turn off display(s) "sv << detail::format_ids(plan.turn_off);
+        return;
+      }
+      display.turned_off = std::move(covered);
+      detail::wait_until([&display, &plan]() {
+        return CGDisplayIsMain(display.id) && std::none_of(plan.turn_off.begin(), plan.turn_off.end(), detail::is_active);
+      },
+                         3s);
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - noticed);
+      BOOST_LOG(info) << "Virtual display: display(s) "sv << detail::format_ids(plan.turn_off) << " came on during the session; turned them off for the Exclusive layout "sv
+                      << elapsed.count() << " ms after macOS reported it"sv;
+    }
+
+    /// Call with state_mutex held.
+    bool exclusive_in_effect() {
+      return current && current->exclusive && config::video.virtual_display_layout == config::video_t::virtual_display_layout_e::exclusive;
+    }
+
+    void reconcile_after_display_change(const std::uint32_t flags) {
+      // Only a display arriving or leaving makes macOS pick new modes; a mode change on its own may
+      // be the user's choice, so leave it alone.
+      const bool displays_changed = (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag | kCGDisplayEnabledFlag | kCGDisplayDisabledFlag)) != 0;
+      {
+        std::lock_guard lock {state_mutex};
+        if (exclusive_in_effect()) {
+          enforce_exclusive_layout(*current, std::chrono::steady_clock::now());
+        }
+        if (current) {
+          detail::ensure_not_mirrored(current->id);
+          if (displays_changed) {
+            detail::keep_created_mode(*current);
+          } else if (detail::is_active(current->id)) {
+            detail::sync_recorded_mode(*current);
+          }
+        }
+      }
+      detail::reconcile_remote_displays(displays_changed);
+    }
+
+    void display_reconfigured(CGDirectDisplayID, const CGDisplayChangeSummaryFlags flags, void *) {
+      if (flags & kCGDisplayBeginConfigurationFlag) {
+        return;
+      }
+      // A display coming on, as when the lid opens, shows on screen until it's turned off again, so
+      // don't wait for the changes to settle for that: macOS has already made it the main display.
+      // The settled pass below catches anything this misses while macOS is still rearranging.
+      if (flags & (kCGDisplayAddFlag | kCGDisplayEnabledFlag)) {
+        detail::request_exclusive_enforcement();
+      }
+      pending_flags.fetch_or(static_cast<std::uint32_t>(flags));
+      const auto generation = ++change_generation;
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::chrono::nanoseconds {settle_delay}.count()), reconcile_queue(), ^{
+        if (change_generation.load() != generation) {
+          return;  // a later change restarted the wait
+        }
+        reconcile_after_display_change(pending_flags.exchange(0));
+        // Changes made while reconciling start another wait; until it ends, nothing has settled.
+        if (change_generation.load() == generation) {
+          settled_generation = generation;
+        }
+      });
+    }
+  }  // namespace
+
+  namespace detail {
+    /**
+     * @brief Whether this macOS can make an HDR virtual display and capture it in HDR.
+     * @details Capturing HDR needs ScreenCaptureKit's HDR capture, from macOS 15.
+     */
+    bool can_make_hdr() {
+      if (@available(macOS 15.0, *)) {
+        return [NSClassFromString(@"CGVirtualDisplayMode") instancesRespondToSelector:@selector(initWithWidth:height:refreshRate:transferFunction:)];
+      }
+      return false;
     }
 
     unsigned int round_even(const double value) {
@@ -712,49 +543,6 @@ namespace platf::macos_virtual_display {
       display.pixel_height = CGDisplayModeGetPixelHeight(cur);
       CGDisplayModeRelease(cur);
     }
-
-    void ensure_retina_mode(virtual_display_t &display) {
-      if (!is_active(display.id)) {
-        sync_recorded_mode(display);
-        return;
-      }
-      if (!display.hidpi) {
-        if (display.explicit_scale && display.default_mode_width > 0 && display.default_pixel_width > 0) {
-          select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
-        }
-        sync_recorded_mode(display);
-        return;
-      }
-      if (display.explicit_scale) {
-        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
-        sync_recorded_mode(display);
-        return;
-      }
-      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
-      const double cur_hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0.0;
-      const bool refresh_ok = display.refresh <= 0.0 || cur_hz <= 0.0 || std::abs(cur_hz - display.refresh) < 0.5;
-      const bool already_retina = cur &&
-                                  CGDisplayModeGetWidth(cur) >= 800 &&
-                                  CGDisplayModeGetPixelWidth(cur) == CGDisplayModeGetWidth(cur) * 2 &&
-                                  CGDisplayModeGetPixelHeight(cur) == CGDisplayModeGetHeight(cur) * 2 &&
-                                  refresh_ok;
-      if (cur) {
-        CGDisplayModeRelease(cur);
-      }
-      if (!already_retina) {
-        select_mode(display.id, display.default_mode_width, display.default_mode_height, display.default_pixel_width, display.default_pixel_height, display.refresh);
-      }
-      sync_recorded_mode(display);
-    }
-
-    struct scale_geometry_t {
-      bool hidpi = false;
-      bool explicit_scale = false;
-      unsigned int mode_width = 0;
-      unsigned int mode_height = 0;
-      unsigned int pixel_width = 0;
-      unsigned int pixel_height = 0;
-    };
 
     scale_geometry_t compute_scale_geometry(
       const int width,
@@ -816,63 +604,53 @@ namespace platf::macos_virtual_display {
       return g;
     }
 
-    bool apply_virtual_display_settings(
-      CGVirtualDisplay *display,
-      const int width,
-      const int height,
-      const unsigned int max_pixels_wide,
-      const unsigned int max_pixels_high,
-      const double refresh,
-      const bool make_hdr,
-      const scale_geometry_t &geom
-    ) {
-      const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
-      const Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
-      if (!display || !settings_class || !mode_class) {
-        return false;
+    void ensure_not_mirrored(const CGDirectDisplayID id) {
+      if (id == kCGNullDirectDisplay) {
+        return;
       }
-
-      CGVirtualDisplaySettings *settings = [[settings_class alloc] init];
-      settings.hiDPI = geom.hidpi ? 1 : 0;
-      NSMutableArray *modes = [NSMutableArray array];
-      std::vector<std::pair<unsigned int, unsigned int>> added_dims;
-      const auto add_mode = [&](const unsigned int w, const unsigned int h) {
-        if (w == 0 || h == 0 || w > max_pixels_wide || h > max_pixels_high) {
-          return;
-        }
-        if (std::find(added_dims.begin(), added_dims.end(), std::pair {w, h}) != added_dims.end()) {
-          return;
-        }
-        added_dims.emplace_back(w, h);
-        CGVirtualDisplayMode *m = make_hdr ?
-                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh transferFunction:hdr_transfer_function] :
-                                    [[mode_class alloc] initWithWidth:w height:h refreshRate:refresh];
-        if (m) {
-          [modes addObject:m];
-        }
-      };
-
-      const auto base_size = macos_display_policy::virtual_display_size(width, height, geom.hidpi);
-      if (geom.hidpi) {
-        add_mode(base_size.pixel_width, base_size.pixel_height);
-        add_mode(base_size.width, base_size.height);
-        add_mode(geom.pixel_width, geom.pixel_height);
-        add_mode(geom.mode_width, geom.mode_height);
-        constexpr double scale_factors[] = {1.25, 1.50, 1.75, 2.15, 2.25, 2.3888889, 2.50, 2.6875, 3.00};
-        for (const double factor : scale_factors) {
-          const unsigned int lw = round_even(base_size.pixel_width / factor);
-          const unsigned int lh = round_even(static_cast<double>(lw) * base_size.pixel_height / base_size.pixel_width);
-          if (lw >= 640 && lh >= 480 && lw * 2 <= max_pixels_wide && lh * 2 <= max_pixels_high) {
-            add_mode(lw * 2, lh * 2);
-            add_mode(lw, lh);
-          }
-        }
-      } else {
-        add_mode(geom.pixel_width, geom.pixel_height);
+      // CGDisplayIsInMirrorSet returns 1 for mirrored, 0 for not mirrored, and -1 for unknown IDs.
+      // Compare explicitly against 1 so an unregistered ID is never treated as mirrored.
+      if (CGDisplayIsInMirrorSet(id) != 1) {
+        return;
       }
+      CGDisplayConfigRef config = nullptr;
+      if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
+        return;
+      }
+      CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay);
+      for (const auto other : display_list(CGGetActiveDisplayList)) {
+        if (other != id && CGDisplayMirrorsDisplay(other) == id) {
+          CGConfigureDisplayMirrorOfDisplay(config, other, kCGNullDirectDisplay);
+        }
+      }
+      // Session scope (not permanent): permanent mirror reconfiguration of a private CGVirtualDisplay
+      // fails with kCGErrorIllegalArgument, whereas session scope reliably dissolves the mirror set.
+      const CGError err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+      BOOST_LOG(info) << "Virtual display: display "sv << id << " was in a mirror set; detached to extend (result "sv << err << ')';
+    }
 
-      settings.modes = modes;
-      return [display applySettings:settings] == YES;
+    /// Put a display of Vibepollo's back in the mode it was made with, if macOS picked another.
+    void keep_created_mode(const virtual_display_t &display) {
+      if (display.pixel_width == 0 || !is_active(display.id)) {
+        return;
+      }
+      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
+      const double cur_hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0.0;
+      const bool refresh_ok = display.refresh <= 0.0 || cur_hz <= 0.0 || std::abs(cur_hz - display.refresh) < 0.5;
+      const bool matches = cur &&
+                           CGDisplayModeGetWidth(cur) == display.mode_width &&
+                           CGDisplayModeGetHeight(cur) == display.mode_height &&
+                           CGDisplayModeGetPixelWidth(cur) == display.pixel_width &&
+                           CGDisplayModeGetPixelHeight(cur) == display.pixel_height &&
+                           refresh_ok;
+      if (cur) {
+        CGDisplayModeRelease(cur);
+      }
+      if (matches) {
+        return;
+      }
+      BOOST_LOG(info) << "Virtual display: macOS changed display "sv << display.id << "'s mode; putting back "sv << display.mode_width << 'x' << display.mode_height << " ("sv << display.pixel_width << 'x' << display.pixel_height << ')';
+      select_mode(display.id, display.mode_width, display.mode_height, display.pixel_width, display.pixel_height, display.refresh);
     }
 
     /**
@@ -888,224 +666,199 @@ namespace platf::macos_virtual_display {
       const int height,
       const double refresh,
       const bool hdr,
-      const bool skip_other_modes_restore = false
+      const bool skip_other_modes_restore
     ) {
       @autoreleasepool {
-      const Class descriptor_class = NSClassFromString(@"CGVirtualDisplayDescriptor");
-      const Class display_class = NSClassFromString(@"CGVirtualDisplay");
-      const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
-      const Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
-      if (!descriptor_class || !display_class || !settings_class || !mode_class) {
-        BOOST_LOG(warning) << "Virtual display: not supported by this macOS"sv;
-        return nullptr;
-      }
-
-      const bool make_hdr = hdr && can_make_hdr();
-      if (hdr && !make_hdr) {
-        BOOST_LOG(info) << "Virtual display: this macOS can't make it HDR, so the stream is SDR"sv;
-      }
-
-      // During a dark wake no display comes online, virtual ones included.
-      platf::wake_displays();
-      const saved_modes_t other_modes;
-
-      const unsigned int base_w = std::max(2u, static_cast<unsigned int>(width) & ~1u);
-      const unsigned int base_h = std::max(2u, static_cast<unsigned int>(height) & ~1u);
-      const double headroom_factor = std::min({1.6, 7680.0 / base_w, 4320.0 / base_h});
-      const unsigned int max_pixel_width = std::max(base_w, round_even(base_w * std::max(1.0, headroom_factor)));
-      const unsigned int max_pixel_height = std::max(base_h, round_even(base_h * std::max(1.0, headroom_factor)));
-
-      const int configured_scale = config::video.dd.virtual_display_scale_percent;
-      const auto geom = compute_scale_geometry(width, height, max_pixel_width, max_pixel_height, configured_scale);
-      const auto phys_mm = macos_display_policy::virtual_display_physical_size_mm(width, height, geom.hidpi);
-      const auto bootstrap_size = macos_display_policy::virtual_display_bootstrap_size(width, height);
-
-      unsigned int base_offset = 0;
-      {
-        std::lock_guard lock {identity_offsets_mutex};
-        if (const auto it = identity_offsets.find(serial); it != identity_offsets.end()) {
-          base_offset = it->second;
+        const Class descriptor_class = NSClassFromString(@"CGVirtualDisplayDescriptor");
+        const Class display_class = NSClassFromString(@"CGVirtualDisplay");
+        const Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
+        const Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
+        if (!descriptor_class || !display_class || !settings_class || !mode_class) {
+          BOOST_LOG(warning) << "Virtual display: not supported by this macOS"sv;
+          return nullptr;
         }
-      }
 
-      struct create_attempt_t {
-        std::unique_ptr<virtual_display_t> display;
-        bool poisoned_identity = false;
-      };
-
-      const auto try_create_once = [&](const macos_display_policy::display_identity_t ident, const bool use_bootstrap, const std::chrono::milliseconds online_timeout) -> create_attempt_t {
-        create_attempt_t attempt;
-        CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
-        descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
-        descriptor.name = name;
-        descriptor.maxPixelsWide = max_pixel_width;
-        descriptor.maxPixelsHigh = max_pixel_height;
-        descriptor.sizeInMillimeters = CGSizeMake(phys_mm.width_mm, phys_mm.height_mm);
-        descriptor.vendorID = vendor_id;
-        descriptor.productID = ident.product_id;
-        descriptor.serialNum = ident.serial_number;
-        if (make_hdr) {
-          // A wide gamut, as on Apple's HDR displays: Display P3 primaries and a D65 white point.
-          descriptor.redPrimary = CGPointMake(0.680, 0.320);
-          descriptor.greenPrimary = CGPointMake(0.265, 0.690);
-          descriptor.bluePrimary = CGPointMake(0.150, 0.060);
-          descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
+        const bool make_hdr = hdr && can_make_hdr();
+        if (hdr && !make_hdr) {
+          BOOST_LOG(info) << "Virtual display: this macOS can't make it HDR, so the stream is SDR"sv;
         }
-        // VirtualDisplayClient invokes terminationHandler with scalar status arguments when
-        // WindowServer exits; __unsafe_unretained prevents ARC from calling objc_retain on them.
-        descriptor.terminationHandler = ^(__unsafe_unretained id, __unsafe_unretained id) {
-          BOOST_LOG(warning) << "Virtual display: macOS removed the virtual display"sv;
+
+        // During a dark wake no display comes online, virtual ones included.
+        platf::wake_displays();
+        const saved_modes_t other_modes;
+
+        const unsigned int base_w = std::max(2u, static_cast<unsigned int>(width) & ~1u);
+        const unsigned int base_h = std::max(2u, static_cast<unsigned int>(height) & ~1u);
+        const double headroom_factor = std::min({1.6, 7680.0 / base_w, 4320.0 / base_h});
+        const unsigned int max_pixel_width = std::max(base_w, round_even(base_w * std::max(1.0, headroom_factor)));
+        const unsigned int max_pixel_height = std::max(base_h, round_even(base_h * std::max(1.0, headroom_factor)));
+
+        const int configured_scale = config::video.dd.virtual_display_scale_percent;
+        const auto geom = compute_scale_geometry(width, height, max_pixel_width, max_pixel_height, configured_scale);
+        const auto phys_mm = macos_display_policy::virtual_display_physical_size_mm(width, height, geom.hidpi);
+        const auto bootstrap_size = macos_display_policy::virtual_display_bootstrap_size(width, height);
+
+        unsigned int base_offset = 0;
+        {
+          std::lock_guard lock {identity_offsets_mutex};
+          if (const auto it = identity_offsets.find(serial); it != identity_offsets.end()) {
+            base_offset = it->second;
+          }
+        }
+
+        struct create_attempt_t {
+          std::unique_ptr<virtual_display_t> display;
+          bool poisoned_identity = false;
         };
 
-        auto candidate = std::make_unique<virtual_display_t>();
-        candidate->display = [[display_class alloc] initWithDescriptor:descriptor];
-        if (!candidate->display) {
-          BOOST_LOG(error) << "Virtual display: macOS refused to create it (serial "sv << ident.serial_number << ')';
+        const auto try_create_once = [&](const macos_display_policy::display_identity_t ident, const bool use_bootstrap, const std::chrono::milliseconds online_timeout) -> create_attempt_t {
+          create_attempt_t attempt;
+          CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
+          descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
+          descriptor.name = name;
+          descriptor.maxPixelsWide = max_pixel_width;
+          descriptor.maxPixelsHigh = max_pixel_height;
+          descriptor.sizeInMillimeters = CGSizeMake(phys_mm.width_mm, phys_mm.height_mm);
+          descriptor.vendorID = vendor_id;
+          descriptor.productID = ident.product_id;
+          descriptor.serialNum = ident.serial_number;
+          if (make_hdr) {
+            // A wide gamut, as on Apple's HDR displays: Display P3 primaries and a D65 white point.
+            descriptor.redPrimary = CGPointMake(0.680, 0.320);
+            descriptor.greenPrimary = CGPointMake(0.265, 0.690);
+            descriptor.bluePrimary = CGPointMake(0.150, 0.060);
+            descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
+          }
+          // VirtualDisplayClient invokes terminationHandler with scalar status arguments when
+          // WindowServer exits; __unsafe_unretained prevents ARC from calling objc_retain on them.
+          descriptor.terminationHandler = ^(__unsafe_unretained id, __unsafe_unretained id) {
+            BOOST_LOG(warning) << "Virtual display: macOS removed the virtual display"sv;
+          };
+
+          auto candidate = std::make_unique<virtual_display_t>();
+          candidate->display = [[display_class alloc] initWithDescriptor:descriptor];
+          if (!candidate->display) {
+            BOOST_LOG(error) << "Virtual display: macOS refused to create it (serial "sv << ident.serial_number << ')';
+            return attempt;
+          }
+
+          if (use_bootstrap && bootstrap_size) {
+            const auto boot_geom = compute_scale_geometry(
+              bootstrap_size->width,
+              bootstrap_size->height,
+              max_pixel_width,
+              max_pixel_height,
+              configured_scale
+            );
+            if (!apply_virtual_display_settings(
+                  candidate->display,
+                  bootstrap_size->width,
+                  bootstrap_size->height,
+                  max_pixel_width,
+                  max_pixel_height,
+                  refresh,
+                  make_hdr,
+                  boot_geom
+                )) {
+              BOOST_LOG(warning) << "Virtual display: bootstrap mode "sv << bootstrap_size->width << 'x' << bootstrap_size->height << " rejected"sv;
+              return attempt;
+            }
+            candidate->id = candidate->display.displayID;
+            if (!wait_until([id = candidate->id]() {
+                  return is_active(id);
+                },
+                            online_timeout)) {
+              attempt.poisoned_identity = true;
+              return attempt;
+            }
+            if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
+              BOOST_LOG(error) << "Virtual display: macOS rejected promoted mode "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
+              return attempt;
+            }
+          } else {
+            if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
+              BOOST_LOG(error) << "Virtual display: macOS rejected "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
+              return attempt;
+            }
+            candidate->id = candidate->display.displayID;
+            if (!wait_until([id = candidate->id]() {
+                  return is_active(id);
+                },
+                            online_timeout)) {
+              attempt.poisoned_identity = true;
+              return attempt;
+            }
+          }
+
+          attempt.display = std::move(candidate);
           return attempt;
+        };
+
+        std::unique_ptr<virtual_display_t> result;
+        constexpr unsigned int max_identity_probes = 3;
+        for (unsigned int probe = 0; probe < max_identity_probes; ++probe) {
+          const unsigned int total_offset = base_offset + probe;
+          const auto ident = macos_display_policy::offset_display_identity(product_id, serial, total_offset);
+          const auto timeout = (probe + 1 == max_identity_probes) ? 5000ms : 3000ms;
+
+          auto attempt = try_create_once(ident, false, timeout);
+          if (!attempt.display && bootstrap_size) {
+            BOOST_LOG(warning) << "Virtual display: direct creation for "sv << width << 'x' << height
+                               << " failed; retrying via conservative bootstrap "sv
+                               << bootstrap_size->width << 'x' << bootstrap_size->height;
+            attempt = try_create_once(ident, true, 3000ms);
+          }
+          if (attempt.display) {
+            result = std::move(attempt.display);
+            if (probe > 0) {
+              std::lock_guard lock {identity_offsets_mutex};
+              identity_offsets[serial] = total_offset;
+              BOOST_LOG(warning) << "Virtual display: recovered from poisoned macOS display identity for serial "sv
+                                 << serial << " using offset +"sv << total_offset
+                                 << " (product "sv << ident.product_id << ", serial "sv << ident.serial_number << ')';
+            }
+            break;
+          }
+          if (!attempt.poisoned_identity) {
+            break;
+          }
+          BOOST_LOG(warning) << "Virtual display: identity (product "sv << ident.product_id
+                             << ", serial "sv << ident.serial_number
+                             << ") never came online; probing fresh identity"sv;
         }
 
-        if (use_bootstrap && bootstrap_size) {
-          const auto boot_geom = compute_scale_geometry(
-            bootstrap_size->width,
-            bootstrap_size->height,
-            max_pixel_width,
-            max_pixel_height,
-            configured_scale
-          );
-          if (!apply_virtual_display_settings(
-                candidate->display,
-                bootstrap_size->width,
-                bootstrap_size->height,
-                max_pixel_width,
-                max_pixel_height,
-                refresh,
-                make_hdr,
-                boot_geom
-              )) {
-            BOOST_LOG(warning) << "Virtual display: bootstrap mode "sv << bootstrap_size->width << 'x' << bootstrap_size->height << " rejected"sv;
-            return attempt;
-          }
-          candidate->id = candidate->display.displayID;
-          if (!wait_until([id = candidate->id]() {
-                return is_active(id);
-              },
-                          online_timeout)) {
-            attempt.poisoned_identity = true;
-            return attempt;
-          }
-          if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
-            BOOST_LOG(error) << "Virtual display: macOS rejected promoted mode "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
-            return attempt;
-          }
-        } else {
-          if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
-            BOOST_LOG(error) << "Virtual display: macOS rejected "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
-            return attempt;
-          }
-          candidate->id = candidate->display.displayID;
-          if (!wait_until([id = candidate->id]() {
-                return is_active(id);
-              },
-                          online_timeout)) {
-            attempt.poisoned_identity = true;
-            return attempt;
-          }
+        if (!result) {
+          BOOST_LOG(error) << "Virtual display: it never came online"sv;
+          return nullptr;
         }
 
-        attempt.display = std::move(candidate);
-        return attempt;
-      };
+        result->width = width;
+        result->height = height;
+        result->max_pixels_wide = max_pixel_width;
+        result->max_pixels_high = max_pixel_height;
+        result->refresh = refresh;
+        result->hdr = make_hdr;
+        result->hidpi = geom.hidpi;
+        result->explicit_scale = geom.explicit_scale;
+        result->default_mode_width = geom.mode_width;
+        result->default_mode_height = geom.mode_height;
+        result->default_pixel_width = geom.pixel_width;
+        result->default_pixel_height = geom.pixel_height;
 
-      std::unique_ptr<virtual_display_t> result;
-      constexpr unsigned int max_identity_probes = 3;
-      for (unsigned int probe = 0; probe < max_identity_probes; ++probe) {
-        const unsigned int total_offset = base_offset + probe;
-        const auto ident = macos_display_policy::offset_display_identity(product_id, serial, total_offset);
-        const auto timeout = (probe + 1 == max_identity_probes) ? 5000ms : 3000ms;
-
-        auto attempt = try_create_once(ident, false, timeout);
-        if (!attempt.display && bootstrap_size) {
-          BOOST_LOG(warning) << "Virtual display: direct creation for "sv << width << 'x' << height
-                             << " failed; retrying via conservative bootstrap "sv
-                             << bootstrap_size->width << 'x' << bootstrap_size->height;
-          attempt = try_create_once(ident, true, 3000ms);
+        ensure_not_mirrored(result->id);
+        log_if_unit_number_clashes(result->id);
+        ensure_retina_mode(*result);
+        // In exclusive layout, apply_layout() immediately turns off all other displays right after
+        // make_display() returns, so polling other_modes for 1000ms here only stalls connection startup.
+        if (!skip_other_modes_restore) {
+          other_modes.restore(150ms);
         }
-        if (attempt.display) {
-          result = std::move(attempt.display);
-          if (probe > 0) {
-            std::lock_guard lock {identity_offsets_mutex};
-            identity_offsets[serial] = total_offset;
-            BOOST_LOG(warning) << "Virtual display: recovered from poisoned macOS display identity for serial "sv
-                               << serial << " using offset +"sv << total_offset
-                               << " (product "sv << ident.product_id << ", serial "sv << ident.serial_number << ')';
-          }
-          break;
-        }
-        if (!attempt.poisoned_identity) {
-          break;
-        }
-        BOOST_LOG(warning) << "Virtual display: identity (product "sv << ident.product_id
-                           << ", serial "sv << ident.serial_number
-                           << ") never came online; probing fresh identity"sv;
+        BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << result->pixel_width << 'x' << result->pixel_height << '@' << refresh << "Hz"sv
+                        << (make_hdr ? " HDR"sv : ""sv)
+                        << (geom.hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
+                        << ", display id "sv << result->id;
+        return result;
       }
-
-      if (!result) {
-        BOOST_LOG(error) << "Virtual display: it never came online"sv;
-        return nullptr;
-      }
-
-      result->width = width;
-      result->height = height;
-      result->max_pixels_wide = max_pixel_width;
-      result->max_pixels_high = max_pixel_height;
-      result->refresh = refresh;
-      result->hdr = make_hdr;
-      result->hidpi = geom.hidpi;
-      result->explicit_scale = geom.explicit_scale;
-      result->default_mode_width = geom.mode_width;
-      result->default_mode_height = geom.mode_height;
-      result->default_pixel_width = geom.pixel_width;
-      result->default_pixel_height = geom.pixel_height;
-
-      ensure_not_mirrored(result->id);
-      log_if_unit_number_clashes(result->id);
-      ensure_retina_mode(*result);
-      // In exclusive layout, apply_layout() immediately turns off all other displays right after
-      // make_display() returns, so polling other_modes for 1000ms here only stalls connection startup.
-      if (!skip_other_modes_restore) {
-        other_modes.restore(150ms);
-      }
-      BOOST_LOG(info) << "Virtual display: "sv << name.UTF8String << ' ' << result->pixel_width << 'x' << result->pixel_height << '@' << refresh << "Hz"sv
-                      << (make_hdr ? " HDR"sv : ""sv)
-                      << (geom.hidpi ? " (Retina, looks like "s + std::to_string(result->mode_width) + 'x' + std::to_string(result->mode_height) + ')' : ""s)
-                      << ", display id "sv << result->id;
-      return result;
-      }
-    }
-
-    std::unique_ptr<virtual_display_t> create(const video::config_t &config) {
-      const double refresh = config.framerateX100 > 0 ? config.framerateX100 / 100.0 : config.framerate;
-      const bool hdr = config.dynamicRange > 0 && !config.prefer_sdr_10bit && !config.force_sdr;
-      const bool exclusive_layout = (config::video.virtual_display_layout == config::video_t::virtual_display_layout_e::exclusive);
-      auto result = make_display(@PROJECT_NAME, serial_number, config.width, config.height, refresh, hdr, exclusive_layout);
-      if (!result) {
-        BOOST_LOG(warning) << "Virtual display: streaming the physical display instead"sv;
-        return nullptr;
-      }
-      result->width = config.width;
-      result->height = config.height;
-      result->refresh = refresh;
-      apply_layout(*result);
-      ensure_not_mirrored(result->id);
-      // Turning off physical displays activates macOS's single-display profile, which may default
-      // back to 1x non-Retina; re-verify and enforce Retina HiDPI after layout settles.
-      ensure_retina_mode(*result);
-      if (!result->turned_off.empty()) {
-        BOOST_LOG(info) << "Virtual display: physical displays turned off (active mode: looks like "sv
-                        << result->mode_width << 'x' << result->mode_height << ", pixels "sv
-                        << result->pixel_width << 'x' << result->pixel_height << ')';
-      }
-      return result;
     }
 
     virtual_display_t::~virtual_display_t() {
@@ -1145,50 +898,86 @@ namespace platf::macos_virtual_display {
       other_modes.restore(100ms);
     }
 
-    void release() {
-      std::lock_guard lock {state_mutex};
-      if (--current_users > 0) {
-        return;
+    bool reapply_scale_to_display(virtual_display_t &vd, const int configured_scale) {
+      if (!vd.display || vd.id == kCGNullDirectDisplay || !is_active(vd.id) || vd.width <= 0 || vd.height <= 0) {
+        return false;
       }
-      current_id = kCGNullDirectDisplay;
-      current_hdr = false;
-      current.reset();
-    }
-  }  // namespace
-
-  namespace {
-    dispatch_queue_t hold_timer_queue() {
-      static dispatch_queue_t q = dispatch_queue_create("dev.vibepollo.virtual-display.hold", DISPATCH_QUEUE_SERIAL);
-      return q;
-    }
-
-    void cancel_timer_locked(__strong dispatch_source_t &timer) {
-      if (timer != nil) {
-        dispatch_source_cancel(timer);
-        timer = nil;
+      if (configured_scale == 0) {
+        sync_recorded_mode(vd);
+        return false;
       }
+
+      const unsigned int max_w = vd.max_pixels_wide > 0 ? vd.max_pixels_wide : static_cast<unsigned int>(vd.width);
+      const unsigned int max_h = vd.max_pixels_high > 0 ? vd.max_pixels_high : static_cast<unsigned int>(vd.height);
+      const auto geom = compute_scale_geometry(vd.width, vd.height, max_w, max_h, configured_scale);
+
+      sync_recorded_mode(vd);
+      if (vd.mode_width == geom.mode_width &&
+          vd.mode_height == geom.mode_height &&
+          vd.pixel_width == geom.pixel_width &&
+          vd.pixel_height == geom.pixel_height) {
+        vd.hidpi = geom.hidpi;
+        vd.explicit_scale = geom.explicit_scale;
+        vd.default_mode_width = geom.mode_width;
+        vd.default_mode_height = geom.mode_height;
+        vd.default_pixel_width = geom.pixel_width;
+        vd.default_pixel_height = geom.pixel_height;
+        return false;
+      }
+
+      const std::size_t prev_pixel_w = vd.pixel_width;
+      const std::size_t prev_pixel_h = vd.pixel_height;
+
+      // Record the intended target mode before reconfiguring so concurrent display callbacks keep it.
+      vd.hidpi = geom.hidpi;
+      vd.explicit_scale = geom.explicit_scale;
+      vd.default_mode_width = geom.mode_width;
+      vd.default_mode_height = geom.mode_height;
+      vd.default_pixel_width = geom.pixel_width;
+      vd.default_pixel_height = geom.pixel_height;
+      vd.mode_width = geom.mode_width;
+      vd.mode_height = geom.mode_height;
+      vd.pixel_width = geom.pixel_width;
+      vd.pixel_height = geom.pixel_height;
+
+      if (!apply_virtual_display_settings(vd.display, vd.width, vd.height, max_w, max_h, vd.refresh, vd.hdr, geom)) {
+        BOOST_LOG(warning) << "Virtual display: couldn't apply live scale "sv << configured_scale << '%' << " on display "sv << vd.id;
+        sync_recorded_mode(vd);
+        return false;
+      }
+
+      select_mode(vd.id, geom.mode_width, geom.mode_height, geom.pixel_width, geom.pixel_height, vd.refresh);
+      using layout_e = config::video_t::virtual_display_layout_e;
+      const auto layout = config::video.virtual_display_layout;
+      if (!vd.exclusive && (layout == layout_e::extended_primary || layout == layout_e::extended_primary_isolated)) {
+        make_main(vd.id);
+      }
+      sync_recorded_mode(vd);
+
+      pending_flags.store(0, std::memory_order_relaxed);
+      const auto gen = ++change_generation;
+      settled_generation.store(gen, std::memory_order_release);
+      BOOST_LOG(info) << "Virtual display: applied live scale ("sv << configured_scale << "%) on display "sv << vd.id
+                      << " -> looks like "sv << vd.mode_width << 'x' << vd.mode_height
+                      << " (pixels "sv << vd.pixel_width << 'x' << vd.pixel_height << ')';
+      return vd.pixel_width != prev_pixel_w || vd.pixel_height != prev_pixel_h;
     }
 
-    std::mutex pause_hold_mutex;
-    std::shared_ptr<void> pause_hold;
-    std::uint64_t pause_hold_generation = 0;
-    dispatch_source_t pause_hold_timer = nil;
-
-    // A paused game's display can only be reused by a stream that wants the same mode.
-    bool pause_hold_is_stale(const video::config_t &config) {
-      {
-        std::lock_guard lock {pause_hold_mutex};
-        if (!pause_hold) {
-          return false;
+    /// Enforce the exclusive layout again soon, as once a Remote Monitor it waited for is published.
+    void request_exclusive_enforcement() {
+      const auto noticed = std::chrono::steady_clock::now();
+      dispatch_async(reconcile_queue(), ^{
+        std::lock_guard lock {state_mutex};
+        if (exclusive_in_effect()) {
+          enforce_exclusive_layout(*current, noticed);
         }
-      }
-      const double refresh = config.framerateX100 > 0 ? config.framerateX100 / 100.0 : config.framerate;
-      const bool hdr = config.dynamicRange > 0 && !config.prefer_sdr_10bit && !config.force_sdr;
-      std::lock_guard lock {state_mutex};
-      return current && current_users == 1 &&
-             (current->width != config.width || current->height != config.height || current->refresh != refresh || current->hdr != hdr);
+      });
     }
-  }  // namespace
+
+    CGDirectDisplayID current_display_id() {
+      return current_id.load();
+    }
+  }  // namespace detail
 
   void end_pause_hold() {
     std::shared_ptr<void> held;  // released outside the lock: releasing can take seconds
@@ -1225,13 +1014,6 @@ namespace platf::macos_virtual_display {
       release();
     });
   }
-
-  namespace {
-    std::mutex launch_hold_mutex;
-    std::shared_ptr<void> launch_hold;
-    std::uint64_t launch_hold_generation = 0;
-    dispatch_source_t launch_hold_timer = nil;
-  }  // namespace
 
   void hold_for_launch(const video::config_t &config) {
     auto held = acquire(config);
@@ -1325,402 +1107,12 @@ namespace platf::macos_virtual_display {
     return id == kCGNullDirectDisplay ? std::nullopt : std::optional<std::uint32_t> {id};
   }
 
-  namespace {
-    struct remote_display_t {
-      std::unique_ptr<virtual_display_t> display;
-      remote_display_topology::mode_t mode;  ///< As requested.
-    };
-
-    void request_exclusive_enforcement();
-
-    std::mutex remote_mutex;  ///< Held while displays are created, which takes seconds.
-    std::map<std::string, remote_display_t> remote_displays;  ///< By client UUID.
-
-    // The displays' IDs, for lookups from input and capture that mustn't wait on remote_mutex.
-    std::mutex remote_ids_mutex;
-    std::vector<CGDirectDisplayID> remote_ids;
-    std::vector<CGDirectDisplayID> remote_hdr_ids;
-    std::atomic<bool> has_remote_displays_flag {false};
-    int remote_displays_pending = 0;  ///< Remote Monitor displays being made, not yet in remote_ids.
-
-    // Call with remote_mutex held.
-    void publish_remote_ids() {
-      std::vector<CGDirectDisplayID> ids;
-      std::vector<CGDirectDisplayID> hdr_ids;
-      for (const auto &[_, remote] : remote_displays) {
-        if (remote.display) {
-          ids.push_back(remote.display->id);
-          if (remote.display->hdr) {
-            hdr_ids.push_back(remote.display->id);
-          }
-        }
-      }
-      std::lock_guard lock {remote_ids_mutex};
-      has_remote_displays_flag.store(!ids.empty(), std::memory_order_release);
-      remote_ids = std::move(ids);
-      remote_hdr_ids = std::move(hdr_ids);
-    }
-
-    // A serial per client (FNV-1a of its UUID), so macOS remembers each Remote Monitor's settings.
-    unsigned int remote_serial(const std::string &client_uuid) {
-      std::uint32_t hash = 2166136261u;
-      for (const unsigned char c : client_uuid) {
-        hash = (hash ^ c) * 16777619u;
-      }
-      return hash == serial_number ? hash + 1 : hash;
-    }
-
-    int current_refresh_hz(const CGDirectDisplayID id) {
-      const CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id);
-      const double refresh = mode ? CGDisplayModeGetRefreshRate(mode) : 0;
-      if (mode) {
-        CGDisplayModeRelease(mode);
-      }
-      // Built-in and virtual displays can report 0.
-      return refresh > 0 ? static_cast<int>(std::lround(refresh)) : 60;
-    }
-
-    std::string display_label(const CGDirectDisplayID id) {
-      for (NSScreen *screen in NSScreen.screens) {
-        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
-        if (number.unsignedIntValue == id) {
-          if (NSString *loc = screen.localizedName; loc && loc.UTF8String) {
-            return loc.UTF8String;
-          }
-        }
-      }
-      return "Display "s + std::to_string(id);
-    }
-  }  // namespace
-
-  bool remote_create_or_reclaim(const std::string &client_uuid, const std::string &client_label, const remote_display_topology::mode_t &mode) {
-    std::lock_guard lock {remote_mutex};
-    auto &remote = remote_displays[client_uuid];
-    if (remote.display && is_active(remote.display->id) && remote.mode.width == mode.width && remote.mode.height == mode.height && remote.mode.refresh_hz == mode.refresh_hz && remote.mode.hdr == mode.hdr) {
-      return true;
-    }
-
-    // Until it's published, the exclusive layout leaves displays it hasn't seen before alone: the
-    // new display could be taken for a physical one. Once it is, the layout is enforced again.
-    {
-      std::lock_guard ids_lock {remote_ids_mutex};
-      ++remote_displays_pending;
-    }
-    const auto published = util::fail_guard([]() {
-      {
-        std::lock_guard ids_lock {remote_ids_mutex};
-        --remote_displays_pending;
-      }
-      request_exclusive_enforcement();
-    });
-
-    // A new mode gets a new display: two at once with the same serial would confuse macOS.
-    remote.display.reset();
-    publish_remote_ids();
-    NSString *name = client_label.empty() ? @PROJECT_NAME " Remote Monitor" : @(client_label.c_str());
-    remote.display = make_display(name, remote_serial(client_uuid), mode.width, mode.height, mode.refresh_hz, mode.hdr);
-    if (!remote.display) {
-      remote_displays.erase(client_uuid);
-      return false;
-    }
-    remote.mode = mode;
-    publish_remote_ids();
-    return true;
-  }
-
-  std::optional<std::pair<int, int>> remote_layout_size(const std::string &, const remote_display_topology::mode_t &mode) {
-    // Desktop coordinates are in points; match the exact scale geometry make_display() applies.
-    const unsigned int base_w = std::max(2u, static_cast<unsigned int>(std::max(2, mode.width)) & ~1u);
-    const unsigned int base_h = std::max(2u, static_cast<unsigned int>(std::max(2, mode.height)) & ~1u);
-    const double headroom_factor = std::min({1.6, 7680.0 / base_w, 4320.0 / base_h});
-    const unsigned int max_pixel_width = std::max(base_w, round_even(base_w * std::max(1.0, headroom_factor)));
-    const unsigned int max_pixel_height = std::max(base_h, round_even(base_h * std::max(1.0, headroom_factor)));
-    const auto geom = compute_scale_geometry(
-      mode.width,
-      mode.height,
-      max_pixel_width,
-      max_pixel_height,
-      config::video.dd.virtual_display_scale_percent
-    );
-    return std::pair {static_cast<int>(geom.mode_width), static_cast<int>(geom.mode_height)};
-  }
-
-  void remote_resolve_mode(const std::string &, remote_display_topology::mode_t &mode) {
-    mode.hdr = mode.hdr && can_make_hdr();
-  }
-
-  bool remote_apply_composed_topology(const std::vector<remote_display_topology::node_t> &composed) {
-    std::lock_guard lock {remote_mutex};
-    CGDisplayConfigRef config;
-    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
-      return false;
-    }
-    for (const auto &node : composed) {
-      CGDirectDisplayID id = kCGNullDirectDisplay;
-      if (node.preexisting) {
-        id = static_cast<CGDirectDisplayID>(std::strtoul(node.device_id.c_str(), nullptr, 10));
-      } else if (const auto remote = remote_displays.find(node.id); remote != remote_displays.end() && remote->second.display) {
-        id = remote->second.display->id;
-      }
-      if (node.active && id != kCGNullDirectDisplay && is_active(id)) {
-        CGConfigureDisplayOrigin(config, id, node.x, node.y);
-      }
-    }
-    // Like the game's virtual display, the arrangement lasts only while Vibepollo runs.
-    return CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
-  }
-
-  std::optional<std::string> remote_exact_capture_output(const std::string &client_uuid, const remote_display_topology::mode_t &) {
-    std::lock_guard lock {remote_mutex};
-    const auto remote = remote_displays.find(client_uuid);
-    if (remote == remote_displays.end() || !remote->second.display || !is_active(remote->second.display->id)) {
-      return std::nullopt;
-    }
-    // Ready once the display is online in the mode it was created with; macOS offers no other.
-    const auto id = remote->second.display->id;
-    if (current_pixels(id) != std::pair {remote->second.display->pixel_width, remote->second.display->pixel_height}) {
-      return std::nullopt;
-    }
-    // platf::display_names() names displays by their ID.
-    return std::to_string(id);
-  }
-
-  bool remote_remove_owned_display(const std::string &client_uuid) {
-    std::lock_guard lock {remote_mutex};
-    remote_displays.erase(client_uuid);
-    publish_remote_ids();
-    return true;
-  }
-
-  std::vector<remote_display_topology::node_t> remote_baseline() {
-    std::vector<remote_display_topology::node_t> baseline;
-    for (const auto id : display_list(CGGetActiveDisplayList)) {
-      if (is_remote_display(id)) {
-        continue;
-      }
-      const CGRect bounds = CGDisplayBounds(id);
-      const auto [pixel_width, pixel_height] = current_pixels(id);
-      remote_display_topology::node_t node;
-      node.id = node.device_id = std::to_string(id);
-      node.label = display_label(id);
-      node.preexisting = true;
-      node.physical = id != current_id.load();
-      node.active = true;
-      node.primary = CGDisplayIsMain(id);
-      // Desktop coordinates are in points, while modes are in pixels.
-      node.x = static_cast<int>(bounds.origin.x);
-      node.y = static_cast<int>(bounds.origin.y);
-      node.configured_mode = {
-        .width = static_cast<int>(pixel_width),
-        .height = static_cast<int>(pixel_height),
-        .refresh_hz = current_refresh_hz(id),
-      };
-      node.layout_width = static_cast<int>(bounds.size.width);
-      node.layout_height = static_cast<int>(bounds.size.height);
-      baseline.push_back(std::move(node));
-    }
-    return baseline;
-  }
-
-  bool is_remote_display(const std::uint32_t display_id) {
-    if (!has_remote_displays_flag.load(std::memory_order_acquire)) {
-      return false;
-    }
-    std::lock_guard lock {remote_ids_mutex};
-    return std::find(remote_ids.begin(), remote_ids.end(), display_id) != remote_ids.end();
-  }
-
-  bool has_remote_displays() {
-    return has_remote_displays_flag.load(std::memory_order_acquire);
-  }
-
   bool is_hdr_display(const std::uint32_t display_id) {
     if (display_id == current_id.load()) {
       return current_hdr.load();
     }
-    std::lock_guard lock {remote_ids_mutex};
-    return std::find(remote_hdr_ids.begin(), remote_hdr_ids.end(), display_id) != remote_hdr_ids.end();
+    return detail::is_remote_hdr_display(display_id);
   }
-
-  namespace {
-    // Changes arrive in bursts (a reopened lid adds a display, then macOS rearranges and picks modes),
-    // so wait for them to stop before acting.
-    constexpr auto settle_delay = 750ms;
-
-    std::atomic<std::uint64_t> change_generation {0};
-    std::atomic<std::uint64_t> settled_generation {0};
-    std::atomic<std::uint32_t> pending_flags {0};
-
-    // Off the main thread: the callback arrives there, and the work below can wait seconds for
-    // displays, during which the event loop the display configuration depends on must keep running.
-    dispatch_queue_t reconcile_queue() {
-      static dispatch_queue_t queue = dispatch_queue_create("dev.vibepollo.display-changes", DISPATCH_QUEUE_SERIAL);
-      return queue;
-    }
-
-    /// Put a display of Vibepollo's back in the mode it was made with, if macOS picked another.
-    void keep_created_mode(const virtual_display_t &display) {
-      if (display.pixel_width == 0 || !is_active(display.id)) {
-        return;
-      }
-      const CGDisplayModeRef cur = CGDisplayCopyDisplayMode(display.id);
-      const double cur_hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0.0;
-      const bool refresh_ok = display.refresh <= 0.0 || cur_hz <= 0.0 || std::abs(cur_hz - display.refresh) < 0.5;
-      const bool matches = cur &&
-                           CGDisplayModeGetWidth(cur) == display.mode_width &&
-                           CGDisplayModeGetHeight(cur) == display.mode_height &&
-                           CGDisplayModeGetPixelWidth(cur) == display.pixel_width &&
-                           CGDisplayModeGetPixelHeight(cur) == display.pixel_height &&
-                           refresh_ok;
-      if (cur) {
-        CGDisplayModeRelease(cur);
-      }
-      if (matches) {
-        return;
-      }
-      BOOST_LOG(info) << "Virtual display: macOS changed display "sv << display.id << "'s mode; putting back "sv << display.mode_width << 'x' << display.mode_height << " ("sv << display.pixel_width << 'x' << display.pixel_height << ')';
-      select_mode(display.id, display.mode_width, display.mode_height, display.pixel_width, display.pixel_height, display.refresh);
-    }
-
-    std::pair<std::vector<CGDirectDisplayID>, bool> exclusive_keep_on(const CGDirectDisplayID stream_display, const std::vector<CGDirectDisplayID> &candidates) {
-      std::vector<CGDirectDisplayID> keep_on {stream_display};
-      for (const auto id : candidates) {
-        if (is_own_display(id)) {
-          keep_on.push_back(id);
-        }
-      }
-      std::lock_guard lock {remote_ids_mutex};
-      keep_on.insert(keep_on.end(), remote_ids.begin(), remote_ids.end());
-      return {std::move(keep_on), remote_displays_pending > 0};
-    }
-
-    /**
-     * @brief Turn off displays that came back on while the exclusive layout is in effect.
-     * @details Call with state_mutex held. Safeguards are updated before anything is turned off.
-     */
-    void enforce_exclusive_layout(virtual_display_t &display, const std::chrono::steady_clock::time_point noticed) {
-      const auto active = display_list(CGGetActiveDisplayList);
-      const auto [keep_on, pending] = exclusive_keep_on(display.id, active);
-      const auto plan = macos_display_policy::plan_exclusive_layout(active, keep_on, display.turned_off, pending);
-      if (plan.turn_off.empty() || display.gave_up_enforcing) {
-        return;
-      }
-      if (!display.enforce_budget.try_spend(std::chrono::steady_clock::now())) {
-        display.gave_up_enforcing = true;
-        BOOST_LOG(error) << "Virtual display: display(s) "sv << format_ids(plan.turn_off)
-                         << " keep turning back on, so they'll stay on for the rest of this session. Start a new stream to try the Exclusive layout again"sv;
-        return;
-      }
-
-      // Safeguards first, and only for displays they don't cover yet. Turning displays back off
-      // that are already covered needs a running helper too: one that couldn't start, or the
-      // helper's own failure, would leave nothing to turn them back on.
-      using macos_display_policy::cover_result_e;
-      auto covered = display.turned_off;
-      covered.insert(covered.end(), plan.newly_tracked.begin(), plan.newly_tracked.end());
-      auto result = cover_result_e::turned_off;
-      if (!plan.newly_tracked.empty() || !display.watchdog.running()) {
-        if (!display.turned_off_modes) {
-          display.turned_off_modes = std::make_unique<saved_modes_t>();
-        }
-        for (const auto id : plan.newly_tracked) {
-          display.turned_off_modes->add(id);
-        }
-        result = macos_display_policy::cover_and_turn_off(safeguard_ops(), display.watchdog, display.turned_off, covered, plan.turn_off);
-      } else if (!set_displays_enabled(plan.turn_off, false)) {
-        result = cover_result_e::turn_off_failed;
-      }
-      if (result == cover_result_e::safeguards_failed) {
-        BOOST_LOG(warning) << "Virtual display: couldn't prepare to turn display(s) "sv << format_ids(plan.turn_off) << " back on, so they stay on"sv;
-        return;
-      }
-      if (result != cover_result_e::turned_off) {
-        BOOST_LOG(warning) << "Virtual display: couldn't turn off display(s) "sv << format_ids(plan.turn_off);
-        return;
-      }
-      display.turned_off = std::move(covered);
-      wait_until([&display, &plan]() {
-        return CGDisplayIsMain(display.id) && std::none_of(plan.turn_off.begin(), plan.turn_off.end(), is_active);
-      },
-                 3s);
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - noticed);
-      BOOST_LOG(info) << "Virtual display: display(s) "sv << format_ids(plan.turn_off) << " came on during the session; turned them off for the Exclusive layout "sv
-                      << elapsed.count() << " ms after macOS reported it"sv;
-    }
-
-    /// Call with state_mutex held.
-    bool exclusive_in_effect() {
-      return current && current->exclusive && config::video.virtual_display_layout == config::video_t::virtual_display_layout_e::exclusive;
-    }
-
-    void reconcile_after_display_change(const std::uint32_t flags) {
-      // Only a display arriving or leaving makes macOS pick new modes; a mode change on its own may
-      // be the user's choice, so leave it alone.
-      const bool displays_changed = (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag | kCGDisplayEnabledFlag | kCGDisplayDisabledFlag)) != 0;
-      {
-        std::lock_guard lock {state_mutex};
-        if (exclusive_in_effect()) {
-          enforce_exclusive_layout(*current, std::chrono::steady_clock::now());
-        }
-        if (current) {
-          ensure_not_mirrored(current->id);
-          if (displays_changed) {
-            keep_created_mode(*current);
-          } else if (is_active(current->id)) {
-            sync_recorded_mode(*current);
-          }
-        }
-      }
-      {
-        std::lock_guard lock {remote_mutex};
-        for (auto &[_, remote] : remote_displays) {
-          if (remote.display) {
-            ensure_not_mirrored(remote.display->id);
-            if (displays_changed) {
-              keep_created_mode(*remote.display);
-            } else if (is_active(remote.display->id)) {
-              sync_recorded_mode(*remote.display);
-            }
-          }
-        }
-      }
-    }
-
-    /// Enforce the exclusive layout again soon, as once a Remote Monitor it waited for is published.
-    void request_exclusive_enforcement() {
-      const auto noticed = std::chrono::steady_clock::now();
-      dispatch_async(reconcile_queue(), ^{
-        std::lock_guard lock {state_mutex};
-        if (exclusive_in_effect()) {
-          enforce_exclusive_layout(*current, noticed);
-        }
-      });
-    }
-
-    void display_reconfigured(CGDirectDisplayID, const CGDisplayChangeSummaryFlags flags, void *) {
-      if (flags & kCGDisplayBeginConfigurationFlag) {
-        return;
-      }
-      // A display coming on, as when the lid opens, shows on screen until it's turned off again, so
-      // don't wait for the changes to settle for that: macOS has already made it the main display.
-      // The settled pass below catches anything this misses while macOS is still rearranging.
-      if (flags & (kCGDisplayAddFlag | kCGDisplayEnabledFlag)) {
-        request_exclusive_enforcement();
-      }
-      pending_flags.fetch_or(static_cast<std::uint32_t>(flags));
-      const auto generation = ++change_generation;
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::chrono::nanoseconds {settle_delay}.count()), reconcile_queue(), ^{
-        if (change_generation.load() != generation) {
-          return;  // a later change restarted the wait
-        }
-        reconcile_after_display_change(pending_flags.exchange(0));
-        // Changes made while reconciling start another wait; until it ends, nothing has settled.
-        if (change_generation.load() == generation) {
-          settled_generation = generation;
-        }
-      });
-    }
-  }  // namespace
 
   void watch_display_changes() {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1734,75 +1126,6 @@ namespace platf::macos_virtual_display {
     return settled_generation.load() == change_generation.load();
   }
 
-  namespace {
-    std::atomic<std::uint64_t> scale_reinit_counter {0};
-
-    bool reapply_scale_to_display(virtual_display_t &vd, const int configured_scale) {
-      if (!vd.display || vd.id == kCGNullDirectDisplay || !is_active(vd.id) || vd.width <= 0 || vd.height <= 0) {
-        return false;
-      }
-      if (configured_scale == 0) {
-        sync_recorded_mode(vd);
-        return false;
-      }
-
-      const unsigned int max_w = vd.max_pixels_wide > 0 ? vd.max_pixels_wide : static_cast<unsigned int>(vd.width);
-      const unsigned int max_h = vd.max_pixels_high > 0 ? vd.max_pixels_high : static_cast<unsigned int>(vd.height);
-      const auto geom = compute_scale_geometry(vd.width, vd.height, max_w, max_h, configured_scale);
-
-      sync_recorded_mode(vd);
-      if (vd.mode_width == geom.mode_width &&
-          vd.mode_height == geom.mode_height &&
-          vd.pixel_width == geom.pixel_width &&
-          vd.pixel_height == geom.pixel_height) {
-        vd.hidpi = geom.hidpi;
-        vd.explicit_scale = geom.explicit_scale;
-        vd.default_mode_width = geom.mode_width;
-        vd.default_mode_height = geom.mode_height;
-        vd.default_pixel_width = geom.pixel_width;
-        vd.default_pixel_height = geom.pixel_height;
-        return false;
-      }
-
-      const std::size_t prev_pixel_w = vd.pixel_width;
-      const std::size_t prev_pixel_h = vd.pixel_height;
-
-      // Record the intended target mode before reconfiguring so concurrent display callbacks keep it.
-      vd.hidpi = geom.hidpi;
-      vd.explicit_scale = geom.explicit_scale;
-      vd.default_mode_width = geom.mode_width;
-      vd.default_mode_height = geom.mode_height;
-      vd.default_pixel_width = geom.pixel_width;
-      vd.default_pixel_height = geom.pixel_height;
-      vd.mode_width = geom.mode_width;
-      vd.mode_height = geom.mode_height;
-      vd.pixel_width = geom.pixel_width;
-      vd.pixel_height = geom.pixel_height;
-
-      if (!apply_virtual_display_settings(vd.display, vd.width, vd.height, max_w, max_h, vd.refresh, vd.hdr, geom)) {
-        BOOST_LOG(warning) << "Virtual display: couldn't apply live scale "sv << configured_scale << '%' << " on display "sv << vd.id;
-        sync_recorded_mode(vd);
-        return false;
-      }
-
-      select_mode(vd.id, geom.mode_width, geom.mode_height, geom.pixel_width, geom.pixel_height, vd.refresh);
-      using layout_e = config::video_t::virtual_display_layout_e;
-      const auto layout = config::video.virtual_display_layout;
-      if (!vd.exclusive && (layout == layout_e::extended_primary || layout == layout_e::extended_primary_isolated)) {
-        make_main(vd.id);
-      }
-      sync_recorded_mode(vd);
-
-      pending_flags.store(0, std::memory_order_relaxed);
-      const auto gen = ++change_generation;
-      settled_generation.store(gen, std::memory_order_release);
-      BOOST_LOG(info) << "Virtual display: applied live scale ("sv << configured_scale << "%) on display "sv << vd.id
-                      << " -> looks like "sv << vd.mode_width << 'x' << vd.mode_height
-                      << " (pixels "sv << vd.pixel_width << 'x' << vd.pixel_height << ')';
-      return vd.pixel_width != prev_pixel_w || vd.pixel_height != prev_pixel_h;
-    }
-  }  // namespace
-
   void reapply_scale() {
     dispatch_async(reconcile_queue(), ^{
       @autoreleasepool {
@@ -1811,17 +1134,10 @@ namespace platf::macos_virtual_display {
         {
           std::lock_guard lock {state_mutex};
           if (current) {
-            backing_pixels_changed |= reapply_scale_to_display(*current, configured_scale);
+            backing_pixels_changed |= detail::reapply_scale_to_display(*current, configured_scale);
           }
         }
-        {
-          std::lock_guard lock {remote_mutex};
-          for (auto &[_, remote] : remote_displays) {
-            if (remote.display) {
-              backing_pixels_changed |= reapply_scale_to_display(*remote.display, configured_scale);
-            }
-          }
-        }
+        backing_pixels_changed |= detail::reapply_scale_to_remote_displays(configured_scale);
         if (backing_pixels_changed) {
           scale_reinit_counter.fetch_add(1, std::memory_order_release);
         }
@@ -1835,59 +1151,5 @@ namespace platf::macos_virtual_display {
 
   std::uint64_t display_state_generation() {
     return change_generation.load(std::memory_order_acquire);
-  }
-
-  void recover_disabled_displays() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      // Not under state_mutex, which removing a display holds for seconds.
-      if (current_id.load() != kCGNullDirectDisplay) {
-        return;
-      }
-      const auto ids = read_marker();
-      if (ids.empty()) {
-        return;
-      }
-      const auto [online, offline] = split_offline(ids);
-      if (online.empty()) {
-        return;  // still offline; checked again when the lid opens or at the next launch
-      }
-      BOOST_LOG(warning) << "Virtual display: turning back on displays that were left off"sv;
-      if (turn_on(online)) {
-        settle_marker(offline);
-      } else {
-        BOOST_LOG(error) << "Virtual display: couldn't turn them back on; logging out and back in will"sv;
-      }
-    });
-  }
-
-  int run_restore_watchdog(int argc, char *argv[]) {
-    // Survive "killall Vibepollo" and hangups: the main process's exit is what this waits for.
-    std::signal(SIGINT, SIG_IGN);
-    std::signal(SIGTERM, SIG_IGN);
-    std::signal(SIGHUP, SIG_IGN);
-
-    std::vector<CGDirectDisplayID> ids;
-    for (int i = 2; i < argc; ++i) {
-      ids.push_back(static_cast<CGDirectDisplayID>(std::strtoul(argv[i], nullptr, 10)));
-    }
-
-    char message = 0;
-    ssize_t count;
-    do {
-      count = read(STDIN_FILENO, &message, 1);
-    } while (count < 0 && errno == EINTR);
-    if (count == 1 && message == 'd') {
-      return 0;  // Vibepollo turned them back on itself
-    }
-
-    // Vibepollo exited without restoring them. Display configuration needs an AppKit session.
-    ensure_appkit_session();
-    pump_events(500ms);
-    const bool restored = turn_on(ids);
-    pump_events(1s);
-    if (restored) {
-      remove_marker();
-    }
-    return restored ? 0 : 1;
   }
 }  // namespace platf::macos_virtual_display

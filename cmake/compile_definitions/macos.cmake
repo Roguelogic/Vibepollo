@@ -52,6 +52,8 @@ set_source_files_properties(
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display_remote.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display_watchdog.mm"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 set(APPLE_PLIST_TEMPLATE "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
@@ -75,6 +77,9 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display_policy.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display_policy.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/input_internal.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/input_pencil.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/input_scroll.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/keymap.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/keymap.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/microphone.mm"
@@ -89,6 +94,9 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_video.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display_internal.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display_remote.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display_watchdog.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/vt_encoder.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/wheel_scroll.h"

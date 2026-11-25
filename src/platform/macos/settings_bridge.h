@@ -21,15 +21,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Dashboard & Live Sessions
 - (NSString *)fetchDashboardSnapshotJSON;
-- (NSString *)fetchDashboardSnapshotJSONIncludingHostStats:(BOOL)includeHostStats
-  NS_SWIFT_NAME(fetchDashboardSnapshotJSON(includeHostStats:));
 - (void)openScreenCapturePrivacySettings;
 - (void)openAccessibilityPrivacySettings;
 - (BOOL)pairWithPIN:(NSString *)pin deviceName:(NSString *)deviceName;
 
 // Paired Clients
 - (NSString *)fetchClientsJSON;
-- (BOOL)setClientEnabled:(NSString *)uuid enabled:(BOOL)enabled;
 - (BOOL)disconnectClient:(NSString *)uuid;
 - (BOOL)unpairClient:(NSString *)uuid;
 - (BOOL)updateClientWithJSON:(NSString *)payloadJSON;
@@ -53,7 +50,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Diagnostics, Session History & Integrations
 - (NSString *)fetchLogsTail:(NSInteger)maxLines;
-- (NSString *)currentLogFilePath;
 - (void)revealLogFileInFinder;
 - (NSString *)fetchSessionHistoryJSON:(NSInteger)limit;
 - (BOOL)deleteSessionHistoryWithUUID:(NSString *)uuid;
@@ -64,7 +60,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)fetchSoftwareUpdateStatusJSON;
 - (void)checkForUpdates;
 - (void)startSoftwareUpdateNow;
-- (void)downloadSoftwareUpdateOnly;
 - (void)cancelSoftwareUpdateDownload;
 - (void)setSoftwareUpdateScheduledOnIdle:(BOOL)scheduled;
 - (void)openExternalURL:(NSString *)urlString;

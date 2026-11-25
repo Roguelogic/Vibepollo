@@ -31,52 +31,6 @@ struct ActiveStreamSession: Codable, Identifiable, Equatable {
   var id: String { uuid.isEmpty ? deviceName : uuid }
 }
 
-struct HostStatsSnapshot: Codable, Equatable {
-  var cpuPercent: Double
-  var cpuUserPercent: Double?
-  var cpuSystemPercent: Double?
-  var cpuLogicalCores: Int?
-  var cpuPerfCores: Int?
-  var cpuEffCores: Int?
-  var gpuPercent: Double
-  var gpuRendererPercent: Double?
-  var gpuTilerPercent: Double?
-  var gpuCoreCount: Int?
-  var gpuMemInUseMB: Double?
-  var ramUsedGB: Double
-  var ramTotalGB: Double
-  var processFootprintMB: Double?
-  var netInterface: String?
-  var netLinkSpeedMbps: UInt64?
-  var netTxMbps: Double?
-  var netRxMbps: Double?
-  var cpuModel: String
-  var gpuModel: String
-
-  static let empty = HostStatsSnapshot(
-    cpuPercent: -1,
-    cpuUserPercent: nil,
-    cpuSystemPercent: nil,
-    cpuLogicalCores: nil,
-    cpuPerfCores: nil,
-    cpuEffCores: nil,
-    gpuPercent: -1,
-    gpuRendererPercent: nil,
-    gpuTilerPercent: nil,
-    gpuCoreCount: nil,
-    gpuMemInUseMB: nil,
-    ramUsedGB: -1,
-    ramTotalGB: -1,
-    processFootprintMB: nil,
-    netInterface: nil,
-    netLinkSpeedMbps: nil,
-    netTxMbps: nil,
-    netRxMbps: nil,
-    cpuModel: "",
-    gpuModel: ""
-  )
-}
-
 struct EncoderRuntimePipeline: Codable, Equatable {
   var active: Bool
   var codec: String
@@ -138,7 +92,6 @@ struct DashboardSnapshot: Codable, Equatable {
   var appRunning: Bool
   var runningAppName: String
   var sessions: [ActiveStreamSession]
-  var hostStats: HostStatsSnapshot
   var encoderSpec: EncoderSpecSnapshot?
   var screenCaptureAllowed: Bool
   var accessibilityAllowed: Bool
@@ -155,7 +108,6 @@ struct DashboardSnapshot: Codable, Equatable {
     appRunning: false,
     runningAppName: "",
     sessions: [],
-    hostStats: .empty,
     encoderSpec: nil,
     screenCaptureAllowed: true,
     accessibilityAllowed: true,

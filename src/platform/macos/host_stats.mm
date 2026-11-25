@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <string>
 
@@ -207,15 +206,6 @@ namespace {
     return std::min(bits_per_second, max_bits_per_second);
   }
 
-  std::uint64_t read_process_footprint() {
-    task_vm_info_data_t vm_info {};
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info), &count) == KERN_SUCCESS) {
-      return static_cast<std::uint64_t>(vm_info.phys_footprint);
-    }
-    return 0;
-  }
-
   std::string cf_to_utf8(CFTypeRef ref) {
     if (!ref) return {};
     if (CFGetTypeID(ref) == CFStringGetTypeID()) {
@@ -239,53 +229,24 @@ namespace {
     return {};
   }
 
-  int cf_to_int(CFTypeRef ref) {
-    if (!ref) return 0;
-    if (CFGetTypeID(ref) == CFNumberGetTypeID()) {
-      int v = 0;
-      if (CFNumberGetValue(static_cast<CFNumberRef>(ref), kCFNumberIntType, &v)) return v;
-    } else if (CFGetTypeID(ref) == CFDataGetTypeID()) {
-      auto data = static_cast<CFDataRef>(ref);
-      if (CFDataGetLength(data) >= static_cast<CFIndex>(sizeof(std::uint32_t))) {
-        std::uint32_t v = 0;
-        std::memcpy(&v, CFDataGetBytePtr(data), sizeof(v));
-        return static_cast<int>(v);
-      }
-    }
-    return 0;
-  }
-
-  struct gpu_static_info_t {
+  std::string read_gpu_model() {
     std::string model;
-    int core_count = 0;
-  };
-
-  gpu_static_info_t read_gpu_static_info() {
-    gpu_static_info_t out;
     io_iterator_t services;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &services) != KERN_SUCCESS) {
-      return out;
+      return model;
     }
     for (io_object_t service; (service = IOIteratorNext(services)) != IO_OBJECT_NULL; IOObjectRelease(service)) {
-      if (out.model.empty()) {
-        if (CFTypeRef ref = IORegistryEntryCreateCFProperty(service, CFSTR("model"), kCFAllocatorDefault, 0)) {
-          out.model = cf_to_utf8(ref);
-          CFRelease(ref);
-        }
+      if (CFTypeRef ref = IORegistryEntryCreateCFProperty(service, CFSTR("model"), kCFAllocatorDefault, 0)) {
+        model = cf_to_utf8(ref);
+        CFRelease(ref);
       }
-      if (out.core_count == 0) {
-        if (CFTypeRef ref = IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0)) {
-          out.core_count = cf_to_int(ref);
-          CFRelease(ref);
-        }
-      }
-      if (!out.model.empty() && out.core_count > 0) {
+      if (!model.empty()) {
         IOObjectRelease(service);
         break;
       }
     }
     IOObjectRelease(services);
-    return out;
+    return model;
   }
 
   class macos_host_stats_t: public platf::host_stats_provider_t {
@@ -306,12 +267,9 @@ namespace {
       out.cpu_model = sysctl_string("machdep.cpu.brand_string");
       if (out.cpu_model.empty()) out.cpu_model = sysctl_string("hw.model");
       out.cpu_logical_cores = sysctl_int("hw.logicalcpu");
-      out.cpu_perf_cores = sysctl_int("hw.perflevel0.physicalcpu");
-      out.cpu_eff_cores = sysctl_int("hw.perflevel1.physicalcpu");
       out.ram_total_bytes = sysctl_u64("hw.memsize");
-      const auto gpu_info = read_gpu_static_info();
-      out.gpu_model = !gpu_info.model.empty() ? gpu_info.model : out.cpu_model;
-      out.gpu_core_count = gpu_info.core_count;
+      const auto gpu_model = read_gpu_model();
+      out.gpu_model = !gpu_model.empty() ? gpu_model : out.cpu_model;
       auto iface = pick_iface();
       out.net_interface = iface;
       out.net_link_speed_mbps = read_iface_link_speed_mbps(iface);
@@ -325,12 +283,8 @@ namespace {
       if (_have_cpu_baseline) {
         auto dt = t->total() - _last_cpu.total();
         auto db = t->busy() - _last_cpu.busy();
-        auto duser = (t->user - _last_cpu.user) + (t->nice - _last_cpu.nice);
-        auto dsys = t->system - _last_cpu.system;
         if (dt > 0) {
           out.cpu_percent = std::clamp(static_cast<float>(db) * 100.f / static_cast<float>(dt), 0.f, 100.f);
-          out.cpu_user_percent = std::clamp(static_cast<float>(duser) * 100.f / static_cast<float>(dt), 0.f, 100.f);
-          out.cpu_system_percent = std::clamp(static_cast<float>(dsys) * 100.f / static_cast<float>(dt), 0.f, 100.f);
         }
       }
       _last_cpu = *t;
@@ -350,21 +304,10 @@ namespace {
           continue;
         }
         if (CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
-          const auto read_pct = [&](CFStringRef key, float &dst) {
-            auto value = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, key));
-            int percent = 0;
-            if (value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberIntType, &percent)) {
-              dst = std::max(dst, std::clamp(static_cast<float>(percent), 0.f, 100.f));
-            }
-          };
-          read_pct(CFSTR("Device Utilization %"), out.gpu_percent);
-          read_pct(CFSTR("Renderer Utilization %"), out.gpu_renderer_percent);
-          read_pct(CFSTR("Tiler Utilization %"), out.gpu_tiler_percent);
-
-          auto mem_val = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, CFSTR("In use system memory")));
-          std::int64_t mem_bytes = 0;
-          if (mem_val && CFGetTypeID(mem_val) == CFNumberGetTypeID() && CFNumberGetValue(mem_val, kCFNumberSInt64Type, &mem_bytes) && mem_bytes > 0) {
-            out.gpu_mem_in_use_bytes = std::max(out.gpu_mem_in_use_bytes, static_cast<std::uint64_t>(mem_bytes));
+          auto value = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, CFSTR("Device Utilization %")));
+          int percent = 0;
+          if (value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberIntType, &percent)) {
+            out.gpu_percent = std::max(out.gpu_percent, std::clamp(static_cast<float>(percent), 0.f, 100.f));
           }
         }
         CFRelease(stats);
@@ -378,7 +321,6 @@ namespace {
         out.ram_total_bytes = m->total_bytes;
         out.ram_used_bytes = m->used_bytes;
       }
-      out.process_footprint_bytes = read_process_footprint();
     }
 
     std::string pick_iface() {

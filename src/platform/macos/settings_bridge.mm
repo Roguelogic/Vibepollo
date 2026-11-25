@@ -30,7 +30,6 @@
 #include "src/crypto.h"
 #include "src/entry_handler.h"
 #include "src/file_handler.h"
-#include "src/host_stats.h"
 #include "src/httpcommon.h"
 #include "src/logging.h"
 #include "src/managed_app_focus.h"
@@ -330,10 +329,6 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 }
 
 - (NSString *)fetchDashboardSnapshotJSON {
-  return [self fetchDashboardSnapshotJSONIncludingHostStats:YES];
-}
-
-- (NSString *)fetchDashboardSnapshotJSONIncludingHostStats:(BOOL)includeHostStats {
   nlohmann::json out;
   out["version"] = PROJECT_VERSION;
 
@@ -413,53 +408,6 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   }
   live_rate_tracker().prune_except(live_uuids);
   out["sessions"] = std::move(sessions_json);
-
-  const auto &info = host_stats::info();
-  nlohmann::json hs;
-  if (includeHostStats) {
-    const auto stats = host_stats::latest_for_consumer();
-    hs["cpuPercent"] = stats.cpu_percent;
-    hs["cpuUserPercent"] = stats.cpu_user_percent;
-    hs["cpuSystemPercent"] = stats.cpu_system_percent;
-    hs["gpuPercent"] = stats.gpu_percent;
-    hs["gpuRendererPercent"] = stats.gpu_renderer_percent;
-    hs["gpuTilerPercent"] = stats.gpu_tiler_percent;
-    hs["gpuMemInUseMB"] = stats.gpu_mem_in_use_bytes > 0
-                            ? static_cast<double>(stats.gpu_mem_in_use_bytes) / (1024.0 * 1024.0)
-                            : -1.0;
-    hs["ramUsedGB"] = stats.ram_used_bytes > 0
-                        ? static_cast<double>(stats.ram_used_bytes) / (1024.0 * 1024.0 * 1024.0)
-                        : -1.0;
-    hs["processFootprintMB"] = stats.process_footprint_bytes > 0
-                                 ? static_cast<double>(stats.process_footprint_bytes) / (1024.0 * 1024.0)
-                                 : -1.0;
-    hs["netTxMbps"] = stats.net_tx_bps >= 0.0 ? stats.net_tx_bps / 1'000'000.0 : -1.0;
-    hs["netRxMbps"] = stats.net_rx_bps >= 0.0 ? stats.net_rx_bps / 1'000'000.0 : -1.0;
-  } else {
-    hs["cpuPercent"] = -1.0;
-    hs["cpuUserPercent"] = -1.0;
-    hs["cpuSystemPercent"] = -1.0;
-    hs["gpuPercent"] = -1.0;
-    hs["gpuRendererPercent"] = -1.0;
-    hs["gpuTilerPercent"] = -1.0;
-    hs["gpuMemInUseMB"] = -1.0;
-    hs["ramUsedGB"] = -1.0;
-    hs["processFootprintMB"] = -1.0;
-    hs["netTxMbps"] = -1.0;
-    hs["netRxMbps"] = -1.0;
-  }
-  hs["ramTotalGB"] = info.ram_total_bytes > 0
-                       ? static_cast<double>(info.ram_total_bytes) / (1024.0 * 1024.0 * 1024.0)
-                       : -1.0;
-  hs["cpuModel"] = info.cpu_model;
-  hs["cpuLogicalCores"] = info.cpu_logical_cores;
-  hs["cpuPerfCores"] = info.cpu_perf_cores;
-  hs["cpuEffCores"] = info.cpu_eff_cores;
-  hs["gpuModel"] = info.gpu_model;
-  hs["gpuCoreCount"] = info.gpu_core_count;
-  hs["netInterface"] = info.net_interface;
-  hs["netLinkSpeedMbps"] = info.net_link_speed_mbps;
-  out["hostStats"] = std::move(hs);
   out["encoderSpec"] = build_encoder_spec_json();
   out["screenCaptureAllowed"] = is_screen_capture_allowed();
   out["accessibilityAllowed"] = is_accessibility_allowed();
@@ -502,10 +450,6 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 - (NSString *)fetchClientsJSON {
   const auto clients = nvhttp::get_all_clients();
   return to_nsstring(clients.is_array() ? clients.dump() : "[]");
-}
-
-- (BOOL)setClientEnabled:(NSString *)uuid enabled:(BOOL)enabled {
-  return nvhttp::set_client_enabled(uuid.UTF8String ?: "", enabled == YES) ? YES : NO;
 }
 
 - (BOOL)disconnectClient:(NSString *)uuid {
@@ -1147,10 +1091,6 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   return to_nsstring(content);
 }
 
-- (NSString *)currentLogFilePath {
-  return to_nsstring(logging::current_log_file().string());
-}
-
 - (void)revealLogFileInFinder {
   const auto log_path = logging::current_log_file();
   if (log_path.empty()) {
@@ -1308,10 +1248,6 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
 
 - (void)startSoftwareUpdateNow {
   update::start_install_now(true);
-}
-
-- (void)downloadSoftwareUpdateOnly {
-  update::start_download(false);
 }
 
 - (void)cancelSoftwareUpdateDownload {

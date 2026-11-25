@@ -19,16 +19,10 @@ using namespace std::chrono_literals;
 TEST(HostStatsTypes, DefaultSentinels) {
   const platf::host_stats_t stats {};
   EXPECT_FLOAT_EQ(stats.cpu_percent, -1.f);
-  EXPECT_FLOAT_EQ(stats.cpu_user_percent, -1.f);
-  EXPECT_FLOAT_EQ(stats.cpu_system_percent, -1.f);
   EXPECT_FLOAT_EQ(stats.cpu_temp_c, -1.f);
   EXPECT_EQ(stats.ram_used_bytes, 0u);
   EXPECT_EQ(stats.ram_total_bytes, 0u);
-  EXPECT_EQ(stats.process_footprint_bytes, 0u);
   EXPECT_FLOAT_EQ(stats.gpu_percent, -1.f);
-  EXPECT_FLOAT_EQ(stats.gpu_renderer_percent, -1.f);
-  EXPECT_FLOAT_EQ(stats.gpu_tiler_percent, -1.f);
-  EXPECT_EQ(stats.gpu_mem_in_use_bytes, 0u);
   EXPECT_FLOAT_EQ(stats.gpu_encoder_percent, -1.f);
   EXPECT_FLOAT_EQ(stats.gpu_temp_c, -1.f);
   EXPECT_EQ(stats.vram_used_bytes, 0u);
@@ -42,9 +36,6 @@ TEST(HostStatsTypes, HostInfoDefaults) {
   EXPECT_TRUE(info.cpu_model.empty());
   EXPECT_TRUE(info.gpu_model.empty());
   EXPECT_EQ(info.cpu_logical_cores, 0);
-  EXPECT_EQ(info.cpu_perf_cores, 0);
-  EXPECT_EQ(info.cpu_eff_cores, 0);
-  EXPECT_EQ(info.gpu_core_count, 0);
   EXPECT_EQ(info.ram_total_bytes, 0u);
   EXPECT_EQ(info.vram_total_bytes, 0u);
   EXPECT_TRUE(info.net_interface.empty());

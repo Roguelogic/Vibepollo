@@ -53,8 +53,14 @@ if(SUNSHINE_ENABLE_TRAY)
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/HostStore.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/MenuBarPopover.swift"
             "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/SettingsWindowController.swift"
-            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeSettingsViews.swift"
-            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NativeAdvancedSheets.swift")
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/SettingsShell.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/GeneralSettingsPane.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/SoftwareUpdateViews.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/DisplayVideoPanes.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/InputAudioPanes.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/NetworkLogsPanes.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/DevicesSettingsPanes.swift"
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/ui/AppsSettingsPanes.swift")
     set_target_properties(vibepollo_macos_ui PROPERTIES
             SWIFT_LANGUAGE_VERSION 5)
     target_compile_options(vibepollo_macos_ui PRIVATE

@@ -25,16 +25,10 @@ namespace platf {
 
   struct host_stats_t {
     float cpu_percent = -1.f;
-    float cpu_user_percent = -1.f;
-    float cpu_system_percent = -1.f;
     float cpu_temp_c = -1.f;
     std::uint64_t ram_used_bytes = 0;
     std::uint64_t ram_total_bytes = 0;
-    std::uint64_t process_footprint_bytes = 0;
     float gpu_percent = -1.f;
-    float gpu_renderer_percent = -1.f;
-    float gpu_tiler_percent = -1.f;
-    std::uint64_t gpu_mem_in_use_bytes = 0;
     float gpu_encoder_percent = -1.f;
     float gpu_temp_c = -1.f;
     std::uint64_t vram_used_bytes = 0;
@@ -48,9 +42,6 @@ namespace platf {
     std::string cpu_model;
     std::string gpu_model;
     int cpu_logical_cores = 0;
-    int cpu_perf_cores = 0;
-    int cpu_eff_cores = 0;
-    int gpu_core_count = 0;
     std::uint64_t ram_total_bytes = 0;
     std::uint64_t vram_total_bytes = 0;
     std::string net_interface;
