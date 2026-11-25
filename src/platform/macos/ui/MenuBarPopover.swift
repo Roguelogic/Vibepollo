@@ -28,15 +28,12 @@ public func vibepollo_macos_close_menubar_popover() {
   }
 }
 
-// MARK: - Visible-Only Telemetry Store (Zero Polling When Popover Is Closed)
+// MARK: - Visible-Only Store (Zero Polling When Popover Is Closed, Zero Host Telemetry Overhead)
 
 @MainActor
 final class MenuBarPopoverStore: ObservableObject {
   @Published var dashboard: DashboardSnapshot = .empty
-  @Published var cpuHistory: [Double] = []
-  @Published var gpuHistory: [Double] = []
 
-  private static let maxSamples = 40
   private var pollTimer: Timer?
 
   var l10n: L10n {
@@ -59,12 +56,10 @@ final class MenuBarPopoverStore: ObservableObject {
   func stop() {
     pollTimer?.invalidate()
     pollTimer = nil
-    cpuHistory.removeAll()
-    gpuHistory.removeAll()
   }
 
   func refresh() {
-    let raw = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON(includeHostStats: true)
+    let raw = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON(includeHostStats: false)
     guard let data = raw.data(using: .utf8),
           let decoded = try? JSONDecoder().decode(DashboardSnapshot.self, from: data)
     else { return }
@@ -72,25 +67,10 @@ final class MenuBarPopoverStore: ObservableObject {
     if dashboard != decoded {
       dashboard = decoded
     }
-
-    let hs = decoded.hostStats
-    if hs.cpuPercent >= 0 {
-      Self.append(min(max(hs.cpuPercent, 0), 100), to: &cpuHistory)
-    }
-    if hs.gpuPercent >= 0 {
-      Self.append(min(max(hs.gpuPercent, 0), 100), to: &gpuHistory)
-    }
-  }
-
-  private static func append(_ value: Double, to buffer: inout [Double]) {
-    buffer.append(value)
-    if buffer.count > maxSamples {
-      buffer.removeFirst(buffer.count - maxSamples)
-    }
   }
 }
 
-// MARK: - Native AppKit NSPopover Manager (Native macOS Tahoe Liquid Glass, Zero Custom Window Chrome)
+// MARK: - Native AppKit NSPopover Manager (Native macOS Tahoe Liquid Glass)
 
 @MainActor
 final class MenuBarPopoverManager: NSObject, NSPopoverDelegate {
@@ -179,7 +159,6 @@ final class MenuBarPopoverManager: NSObject, NSPopoverDelegate {
 
   private func installGlobalDismissMonitor() {
     removeGlobalDismissMonitor()
-    // Ensure clicking in another app always dismisses the popover even while Vibepollo is an accessory app.
     globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
       let clickPoint = NSEvent.mouseLocation
       Task { @MainActor [weak self] in
@@ -203,84 +182,12 @@ final class MenuBarPopoverManager: NSObject, NSPopoverDelegate {
   }
 }
 
-// MARK: - RunCat-Inspired Minimalist Monochrome Graphs (Single System Accent)
+// MARK: - Minimalist Monochrome Row (RunCat Neo Anatomy)
 
-private struct MinimalAreaGraph: View {
-  let values: [Double]
-  let maxValue: Double
-
-  var body: some View {
-    Path { path in
-      let w: CGFloat = 156
-      let h: CGFloat = 16
-      guard !values.isEmpty else { return }
-      let ceiling = max(maxValue, 1.0)
-      path.move(to: CGPoint(x: 0, y: h))
-      if values.count == 1 {
-        let norm = min(1.0, max(0.08, values[0] / ceiling))
-        let y = h - h * CGFloat(norm)
-        path.addLine(to: CGPoint(x: 0, y: y))
-        path.addLine(to: CGPoint(x: w, y: y))
-        path.addLine(to: CGPoint(x: w, y: h))
-        path.closeSubpath()
-        return
-      }
-      let step = w / CGFloat(values.count - 1)
-      for (idx, raw) in values.enumerated() {
-        let norm = min(1.0, max(0.06, raw / ceiling))
-        let x = CGFloat(idx) * step
-        let y = h - h * CGFloat(norm)
-        path.addLine(to: CGPoint(x: x, y: y))
-      }
-      path.addLine(to: CGPoint(x: w, y: h))
-      path.closeSubpath()
-    }
-    .fill(Color.accentColor.opacity(0.88))
-    .frame(width: 156, height: 16)
-    .padding(.top, 2)
-  }
-}
-
-private struct MinimalBarGraph: View {
-  let fraction: Double
-
-  var body: some View {
-    let clamped = min(max(fraction, 0), 1)
-    Rectangle()
-      .fill(Color.clear)
-      .frame(width: 156, height: 7)
-      .overlay(alignment: .leading) {
-        Rectangle()
-          .fill(Color.accentColor.opacity(0.88))
-          .frame(width: 156 * CGFloat(clamped), height: 7)
-      }
-      .overlay(
-        Rectangle()
-          .strokeBorder(Color.accentColor.opacity(0.65), lineWidth: 0.6)
-      )
-      .padding(.top, 3)
-  }
-}
-
-// MARK: - Minimalist Metric Row (RunCat Neo Anatomy)
-
-private struct MinimalMetricRow<Accessory: View>: View {
+private struct MinimalMetricRow: View {
   let symbol: String
   let summary: String
   let details: [String]
-  @ViewBuilder let accessory: () -> Accessory
-
-  init(
-    symbol: String,
-    summary: String,
-    details: [String],
-    @ViewBuilder accessory: @escaping () -> Accessory = { EmptyView() }
-  ) {
-    self.symbol = symbol
-    self.summary = summary
-    self.details = details
-    self.accessory = accessory
-  }
 
   var body: some View {
     HStack(alignment: .center, spacing: 14) {
@@ -304,7 +211,6 @@ private struct MinimalMetricRow<Accessory: View>: View {
               .foregroundStyle(.secondary)
               .lineLimit(1)
           }
-          accessory()
         }
         .padding(.leading, 8)
       }
@@ -314,7 +220,7 @@ private struct MinimalMetricRow<Accessory: View>: View {
   }
 }
 
-// MARK: - Main Minimalist Popover View
+// MARK: - Main Minimalist Popover View (Streaming & Encoder Only)
 
 struct MenuBarMinimalPopoverView: View {
   @ObservedObject var store: MenuBarPopoverStore
@@ -322,30 +228,23 @@ struct MenuBarMinimalPopoverView: View {
   let onDismiss: () -> Void
 
   private var l10n: L10n { store.l10n }
-  private var hs: HostStatsSnapshot { store.dashboard.hostStats }
   private var activeSession: ActiveStreamSession? { store.dashboard.sessions.first }
 
   var body: some View {
     VStack(spacing: 8) {
       headerRow
 
-      VStack(alignment: .leading, spacing: 8) {
+      VStack(alignment: .leading, spacing: 9) {
         streamRow
         Divider()
-        cpuRow
-        Divider()
-        gpuRow
-        Divider()
-        memoryRow
-        Divider()
-        networkRow
+        encoderRow
       }
       .frame(maxWidth: .infinity, alignment: .leading)
       .padding(10)
       .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
     .padding(8)
-    .frame(width: 256)
+    .frame(width: 248)
   }
 
   // MARK: Header (App Name + Native Action Menu)
@@ -409,7 +308,7 @@ struct MenuBarMinimalPopoverView: View {
     }
   }
 
-  // MARK: 5 Minimalist Rows
+  // MARK: 2 Essential Rows (Stream + Encoder)
 
   private var streamRow: some View {
     if let s = activeSession {
@@ -418,12 +317,16 @@ struct MenuBarMinimalPopoverView: View {
         ? ((s.actualBitrateKbps ?? 0) / 1000.0)
         : (Double(s.bitrateKbps) / 1000.0)
       let encMs = s.encodeP95Ms ?? s.encodeLatencyMs
-      let codecLine: String = {
-        let base = "\(s.codec) \(s.bitDepth)-bit\(s.yuv444 ? " 4:4:4" : "")"
+      let secondLine: String = {
+        let res = String(format: "%d×%d", s.width, s.height)
+        var parts = [res]
         if encMs > 0 {
-          return String(format: "%@ · %.1f ms", base, encMs)
+          parts.append(String(format: "%.1f ms", encMs))
         }
-        return base
+        if s.directUsb {
+          parts.append("USB")
+        }
+        return parts.joined(separator: " · ")
       }()
       return MinimalMetricRow(
         symbol: "airplayvideo",
@@ -433,99 +336,63 @@ struct MenuBarMinimalPopoverView: View {
         ),
         details: [
           String(format: "%@ · %.1f Mbps", s.deviceName, liveMbps),
-          codecLine,
+          secondLine,
         ]
       )
     } else {
-      let chip = hs.cpuModel.isEmpty ? "Apple Silicon" : hs.cpuModel
-      let detail: String = {
-        if let mpx = store.dashboard.encoderSpec?.hevcMaxMpxPerSec, mpx > 0 {
-          return String(format: "%@ · HEVC %.0f Mpx/s", chip, mpx)
-        }
-        return "\(chip) · VideoToolbox"
-      }()
+      let host = store.dashboard.hostName.isEmpty ? "Mac" : store.dashboard.hostName
+      let detail = store.dashboard.pairedCount > 0
+        ? l10n.pick("\(host) · 기기 \(store.dashboard.pairedCount)대", "\(host) · \(store.dashboard.pairedCount) paired")
+        : host
       return MinimalMetricRow(
         symbol: "airplayvideo",
-        summary: l10n.pick("스트리밍: 대기 중", "Stream: Ready"),
+        summary: l10n.pick("대기 중", "Ready"),
         details: [detail]
       )
     }
   }
 
-  private var cpuRow: some View {
-    let summary = hs.cpuPercent >= 0
-      ? String(format: "CPU: %.1f%%", hs.cpuPercent)
-      : "CPU: —"
-    var details: [String] = []
-    if let u = hs.cpuUserPercent, let s = hs.cpuSystemPercent, u >= 0, s >= 0 {
-      details.append(String(format: "User: %.1f%% · System: %.1f%%", u, s))
-    } else if !hs.cpuModel.isEmpty {
-      details.append(hs.cpuModel)
-    }
-    let ceiling = min(100.0, max(50.0, (store.cpuHistory.max() ?? 0) * 1.25))
-    return MinimalMetricRow(symbol: "cpu", summary: summary, details: details) {
-      MinimalAreaGraph(values: store.cpuHistory, maxValue: ceiling)
-    }
-  }
-
-  private var gpuRow: some View {
-    let summary = hs.gpuPercent >= 0
-      ? String(format: "GPU: %.0f%%", hs.gpuPercent)
-      : "GPU: —"
-    var parts: [String] = []
-    if !hs.gpuModel.isEmpty {
-      if let cores = hs.gpuCoreCount, cores > 0 {
-        parts.append(l10n.pick("\(hs.gpuModel) (\(cores)코어)", "\(hs.gpuModel) (\(cores)-core)"))
-      } else {
-        parts.append(hs.gpuModel)
+  private var encoderRow: some View {
+    let spec = store.dashboard.encoderSpec ?? .empty
+    if let s = activeSession {
+      let summary = l10n.pick(
+        "인코더: \(s.codec) \(s.bitDepth)-bit",
+        "Encoder: \(s.codec) \(s.bitDepth)-bit"
+      )
+      var tags: [String] = []
+      if let pipe = spec.activePipeline, pipe.active {
+        tags.append(pipe.zeroCopy ? "Zero-Copy" : "\(pipe.captureFormat)→\(pipe.encoderFormat)")
       }
-    }
-    if let mb = hs.gpuMemInUseMB, mb > 0 {
-      parts.append(mb >= 1024 ? String(format: "%.1f GB", mb / 1024.0) : String(format: "%.0f MB", mb))
-    }
-    let ceiling = min(100.0, max(50.0, (store.gpuHistory.max() ?? 0) * 1.25))
-    return MinimalMetricRow(
-      symbol: "square.3.layers.3d",
-      summary: summary,
-      details: parts.isEmpty ? [] : [parts.joined(separator: " · ")]
-    ) {
-      MinimalAreaGraph(values: store.gpuHistory, maxValue: ceiling)
-    }
-  }
-
-  private var memoryRow: some View {
-    let frac: Double = (hs.ramUsedGB > 0 && hs.ramTotalGB > 0)
-      ? min(max(hs.ramUsedGB / hs.ramTotalGB, 0), 1)
-      : 0
-    let summary = (hs.ramUsedGB > 0 && hs.ramTotalGB > 0)
-      ? l10n.pick(String(format: "메모리: %.1f%%", frac * 100), String(format: "Memory: %.1f%%", frac * 100))
-      : l10n.pick("메모리: —", "Memory: —")
-    var details: [String] = []
-    if hs.ramUsedGB > 0 && hs.ramTotalGB > 0 {
-      var line = String(format: "%.1f / %.0f GB", hs.ramUsedGB, hs.ramTotalGB)
-      if let appMB = hs.processFootprintMB, appMB > 0 {
-        line += String(format: " · %@ %.0f MB", l10n.pick("앱", "App"), appMB)
+      tags.append(s.yuv444 ? "4:4:4" : "4:2:0")
+      if s.hdr {
+        tags.append("HDR")
       }
-      details.append(line)
+      return MinimalMetricRow(
+        symbol: "film",
+        summary: summary,
+        details: [tags.joined(separator: " · ")]
+      )
+    } else {
+      let backend = spec.backend == "videotoolbox"
+        ? "VideoToolbox"
+        : (spec.backend == "software" ? l10n.pick("소프트웨어", "Software") : spec.backend)
+      var codecs: [String] = []
+      if spec.hevc10BitHdr {
+        codecs.append("HEVC 10-bit")
+      } else if spec.hevc8Bit {
+        codecs.append("HEVC")
+      }
+      if spec.hevc444_10Bit || spec.hevc444_8Bit {
+        codecs.append("4:4:4")
+      }
+      if codecs.isEmpty {
+        codecs.append("H.264")
+      }
+      return MinimalMetricRow(
+        symbol: "film",
+        summary: l10n.pick("인코더: \(backend)", "Encoder: \(backend)"),
+        details: [codecs.joined(separator: " · ")]
+      )
     }
-    return MinimalMetricRow(symbol: "memorychip", summary: summary, details: details) {
-      MinimalBarGraph(fraction: frac)
-    }
-  }
-
-  private var networkRow: some View {
-    let iface = (hs.netInterface ?? "").isEmpty ? "—" : (hs.netInterface ?? "—")
-    let summary = l10n.pick("네트워크: \(iface)", "Network: \(iface)")
-    var details: [String] = []
-    if let tx = hs.netTxMbps, tx >= 0 {
-      details.append(l10n.pick(String(format: "송신: %.1f Mbps", tx), String(format: "Upload: %.1f Mbps", tx)))
-    }
-    if let rx = hs.netRxMbps, rx >= 0 {
-      details.append(l10n.pick(String(format: "수신: %.1f Mbps", rx), String(format: "Download: %.1f Mbps", rx)))
-    }
-    if details.isEmpty {
-      details.append("—")
-    }
-    return MinimalMetricRow(symbol: "globe", summary: summary, details: details)
   }
 }

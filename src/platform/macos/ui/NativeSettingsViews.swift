@@ -716,8 +716,11 @@ private struct VideoSettingsPane: View {
             }
           }
           if let pipe = store.dashboard.encoderSpec?.activePipeline, pipe.active {
-            ActivePipelineTagStrip(pipeline: pipe, l10n: l10n)
-              .padding(.vertical, 2)
+            LabeledContent(l10n.pick("인코딩 경로", "Encoding Pipeline")) {
+              Text(activePipelineSummary(pipe))
+                .font(.system(size: 12).monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
           }
         }
       }
@@ -823,19 +826,22 @@ private struct VideoSettingsPane: View {
   }
 
   private func currentStreamMetricsSubtitle(_ s: ActiveStreamSession) -> String {
-    let targetMbps = Double(s.bitrateKbps) / 1000.0
-    if let liveFps = s.actualFps, liveFps > 0, let liveKbps = s.actualBitrateKbps {
-      return String(
-        format: "%d×%d · %.1f/%d fps · %.1f/%.1f Mbps",
-        s.width,
-        s.height,
-        liveFps,
-        s.fps,
-        liveKbps / 1000.0,
-        targetMbps
-      )
+    let liveFps = (s.actualFps ?? 0) > 0 ? (s.actualFps ?? 0) : Double(s.fps)
+    let liveMbps = (s.actualBitrateKbps ?? 0) > 0
+      ? ((s.actualBitrateKbps ?? 0) / 1000.0)
+      : (Double(s.bitrateKbps) / 1000.0)
+    return String(format: "%d×%d · %.1f fps · %.1f Mbps", s.width, s.height, liveFps, liveMbps)
+  }
+
+  private func activePipelineSummary(_ pipe: EncoderRuntimePipeline) -> String {
+    var parts: [String] = []
+    if !pipe.captureFormat.isEmpty {
+      parts.append(pipe.zeroCopy ? "Zero-Copy (\(pipe.captureFormat))" : "\(pipe.captureFormat) → \(pipe.encoderFormat)")
     }
-    return String(format: "%d×%d @ %dHz · %.1f Mbps", s.width, s.height, s.fps, targetMbps)
+    if !pipe.throughputTier.isEmpty {
+      parts.append("AppleAVE \(pipe.throughputTier.capitalized)")
+    }
+    return parts.isEmpty ? "\(pipe.codec) \(pipe.profile)" : parts.joined(separator: " · ")
   }
 }
 
@@ -2576,194 +2582,55 @@ private struct LogViewerSubView: View {
 
 // MARK: - Hardware Encoder Spec & Session History Components
 
-private struct SpecChip: View {
-  let text: String
-  var tint: Color = .secondary
-  var emphasized: Bool = false
-
-  var body: some View {
-    Text(text)
-      .font(.system(size: 10.5, weight: emphasized ? .semibold : .medium))
-      .monospacedDigit()
-      .foregroundStyle(emphasized ? tint : .primary.opacity(0.85))
-      .padding(.horizontal, 7)
-      .padding(.vertical, 3)
-      .background(
-        Capsule(style: .continuous)
-          .fill(emphasized ? tint.opacity(0.14) : Color.primary.opacity(0.06))
-      )
-  }
-}
-
-private struct ActivePipelineTagStrip: View {
-  let pipeline: EncoderRuntimePipeline
-  let l10n: L10n
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      HStack(spacing: 6) {
-        SpecChip(
-          text: "\(pipeline.codec) \(pipeline.profile)",
-          tint: .blue,
-          emphasized: true
-        )
-        if !pipeline.throughputTier.isEmpty {
-          let tierLabel = pipeline.throughputTier.capitalized
-          let tpText = pipeline.maxMpxPerSec > 0
-            ? String(format: "AppleAVE %@ · %.0f Mpx/s", tierLabel, pipeline.maxMpxPerSec)
-            : "AppleAVE \(tierLabel)"
-          SpecChip(text: tpText, tint: .purple, emphasized: true)
-        }
-        if !pipeline.captureFormat.isEmpty {
-          let fmtText = pipeline.zeroCopy
-            ? "Zero-Copy (\(pipeline.captureFormat))"
-            : "\(pipeline.captureFormat) → \(pipeline.encoderFormat)"
-          SpecChip(
-            text: fmtText,
-            tint: pipeline.zeroCopy ? .green : .orange,
-            emphasized: true
-          )
-        }
-        Spacer(minLength: 0)
-      }
-
-      HStack(spacing: 6) {
-        SpecChip(text: "\(pipeline.maxInFlight)-Stage")
-        if pipeline.slicesPerFrame > 1 {
-          SpecChip(text: "\(pipeline.slicesPerFrame) Slices")
-        }
-        if !pipeline.motionSearch.isEmpty && pipeline.motionSearch != "Auto" {
-          SpecChip(text: "ME \(pipeline.motionSearch)")
-        }
-        if !pipeline.rateControl.isEmpty {
-          SpecChip(text: pipeline.rateControl)
-        }
-        if pipeline.hdrSeiInband {
-          SpecChip(text: "HDR10 SEI", tint: .orange, emphasized: true)
-        }
-        Spacer(minLength: 0)
-      }
-    }
-  }
-}
-
-private struct CodecSupportTile: View {
-  let name: String
-  let supported: Bool
-  let note: String
-
-  var body: some View {
-    HStack(spacing: 6) {
-      Image(systemName: supported ? "checkmark.circle.fill" : "minus.circle.fill")
-        .font(.system(size: 11.5))
-        .foregroundStyle(supported ? Color.green : Color.secondary.opacity(0.6))
-      VStack(alignment: .leading, spacing: 1) {
-        Text(name)
-          .font(.system(size: 11.5, weight: .medium))
-          .foregroundStyle(supported ? .primary : .secondary)
-          .lineLimit(1)
-        Text(note)
-          .font(.system(size: 10))
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-      }
-      Spacer(minLength: 0)
-    }
-    .padding(.horizontal, 8)
-    .padding(.vertical, 6)
-    .background(
-      RoundedRectangle(cornerRadius: 7, style: .continuous)
-        .fill(Color.primary.opacity(supported ? 0.04 : 0.02))
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 7, style: .continuous)
-        .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.6)
-    )
-  }
-}
-
 private struct HardwareEncoderSpecsSection: View {
   let spec: EncoderSpecSnapshot
   let l10n: L10n
 
-  private var backendDisplayName: String {
+  private var backendSummary: String {
+    let base: String
     if spec.backend == "videotoolbox" {
-      return l10n.pick("Apple VideoToolbox (하드웨어)", "Apple VideoToolbox (Hardware)")
+      base = "Apple VideoToolbox"
     } else if spec.backend == "software" {
-      return l10n.pick("소프트웨어 (CPU 인코딩)", "Software (CPU)")
+      base = l10n.pick("소프트웨어 (CPU)", "Software (CPU)")
+    } else {
+      base = spec.backend
     }
-    return spec.backend
+    if spec.hevcMaxMpxPerSec > 0 {
+      return String(format: "%@ · HEVC %.0f Mpx/s", base, spec.hevcMaxMpxPerSec)
+    }
+    return base
   }
 
-  private var throughputSummary: String {
-    var parts: [String] = []
-    if spec.hevcMaxMpxPerSec > 0 {
-      let tier = spec.hevcMaxTier.isEmpty ? "" : " \(spec.hevcMaxTier.capitalized)"
-      parts.append(String(format: "HEVC%@ %.1f Mpx/s", tier, spec.hevcMaxMpxPerSec))
+  private var supportedCodecsSummary: String {
+    var items: [String] = []
+    if spec.h264 { items.append("H.264") }
+    if spec.hevc10BitHdr {
+      items.append("HEVC 10-bit")
+    } else if spec.hevc8Bit {
+      items.append("HEVC")
     }
-    if spec.h264MaxMpxPerSec > 0 {
-      let tier = spec.h264MaxTier.isEmpty ? "" : " \(spec.h264MaxTier.capitalized)"
-      parts.append(String(format: "H.264%@ %.1f Mpx/s", tier, spec.h264MaxMpxPerSec))
+    if spec.hevc444_10Bit || spec.hevc444_8Bit {
+      items.append("4:4:4")
     }
-    return parts.isEmpty ? l10n.pick("프로브 대기 중", "Pending probe") : parts.joined(separator: " · ")
+    if spec.av1Hw {
+      items.append("AV1")
+    }
+    return items.isEmpty ? "—" : items.joined(separator: " · ")
   }
 
   var body: some View {
-    Section(l10n.pick("하드웨어 인코딩 스펙", "Hardware Encoder Specs")) {
-      LabeledContent(l10n.pick("활성 인코더 백엔드", "Active Backend")) {
-        Text(backendDisplayName)
-          .font(.system(size: 12.5, weight: .medium))
+    Section(l10n.pick("하드웨어 인코더", "Hardware Encoder")) {
+      LabeledContent(l10n.pick("인코더", "Encoder")) {
+        Text(backendSummary)
+          .font(.system(size: 12.5).monospacedDigit())
           .foregroundStyle(.secondary)
       }
 
-      if spec.hevcMaxMpxPerSec > 0 || spec.h264MaxMpxPerSec > 0 {
-        LabeledContent(l10n.pick("미디어 엔진 최대 처리량", "Media Engine Peak Throughput")) {
-          Text(throughputSummary)
-            .font(.system(size: 12).monospacedDigit())
-            .foregroundStyle(.secondary)
-        }
+      LabeledContent(l10n.pick("지원 코덱", "Supported Codecs")) {
+        Text(supportedCodecsSummary)
+          .font(.system(size: 12.5))
+          .foregroundStyle(.secondary)
       }
-
-      LazyVGrid(
-        columns: [
-          GridItem(.flexible(), spacing: 8),
-          GridItem(.flexible(), spacing: 8),
-          GridItem(.flexible(), spacing: 8),
-        ],
-        spacing: 8
-      ) {
-        CodecSupportTile(
-          name: "H.264",
-          supported: spec.h264,
-          note: spec.h264 ? l10n.pick("8-bit 4:2:0", "8-bit 4:2:0") : l10n.pick("미지원", "Unavailable")
-        )
-        CodecSupportTile(
-          name: "HEVC 8-bit",
-          supported: spec.hevc8Bit,
-          note: spec.hevc8Bit ? l10n.pick("SDR 4:2:0", "SDR 4:2:0") : l10n.pick("미지원", "Unavailable")
-        )
-        CodecSupportTile(
-          name: "HEVC 10-bit",
-          supported: spec.hevc10BitHdr,
-          note: spec.hevc10BitHdr ? "HDR10 PQ" : l10n.pick("미지원", "Unavailable")
-        )
-        CodecSupportTile(
-          name: "HEVC 4:4:4",
-          supported: spec.hevc444_8Bit,
-          note: spec.hevc444_8Bit ? l10n.pick("8-bit 고선명", "8-bit Chroma") : l10n.pick("미지원", "Unavailable")
-        )
-        CodecSupportTile(
-          name: "HEVC 4:4:4 10",
-          supported: spec.hevc444_10Bit,
-          note: spec.hevc444_10Bit ? "10-bit HDR" : l10n.pick("미지원", "Unavailable")
-        )
-        CodecSupportTile(
-          name: "AV1 HW",
-          supported: spec.av1Hw,
-          note: spec.av1Hw ? l10n.pick("하드웨어 지원", "Hardware") : l10n.pick("미지원 · 디코드 전용", "Decode Only")
-        )
-      }
-      .padding(.vertical, 3)
     }
   }
 }
