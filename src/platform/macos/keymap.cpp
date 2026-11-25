@@ -411,4 +411,39 @@ namespace platf {
     }
   }
 
+  bool is_system_auth_executable_path(const std::string_view executable_path) noexcept {
+    constexpr std::string_view kSystemLibraryPrefix = "/System/Library/";
+    if (!executable_path.starts_with(kSystemLibraryPrefix) ||
+        executable_path.find("/../") != std::string_view::npos) {
+      return false;
+    }
+    const std::size_t slash = executable_path.rfind('/');
+    if (slash == std::string_view::npos || slash + 1 >= executable_path.size()) {
+      return false;
+    }
+    const std::string_view name = executable_path.substr(slash + 1);
+    return name == "SecurityAgent" ||
+           name == "coreautha" ||
+           name == "loginwindow" ||
+           name == "ScreenSaverEngine" ||
+           name == "LockScreen" ||
+           name == "CoreServicesUIAgent" ||
+           name == "LocalAuthenticationUIAgent";
+  }
+
+  bool should_use_system_password_input(
+    const bool loginwindow_session,
+    const bool secure_event_input_enabled,
+    const bool screen_locked,
+    const std::string_view secure_input_owner_path
+  ) noexcept {
+    if (loginwindow_session || screen_locked) {
+      return true;
+    }
+    if (!secure_event_input_enabled) {
+      return false;
+    }
+    return is_system_auth_executable_path(secure_input_owner_path);
+  }
+
 }  // namespace platf

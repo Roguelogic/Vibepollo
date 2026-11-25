@@ -76,4 +76,71 @@ namespace {
     EXPECT_EQ(platf::fallback_us_ansi_ascii(kVK_Return, false), 0);
   }
 
+  TEST(MacosKeymap, ClassifiesSystemAuthProcessesForSecurePasswordInputMode) {
+    EXPECT_TRUE(platf::is_system_auth_executable_path(
+      "/System/Library/Frameworks/Security.framework/Versions/A/MachServices/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"
+    ));
+    EXPECT_TRUE(platf::is_system_auth_executable_path(
+      "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreautha.bundle/Contents/MacOS/coreautha"
+    ));
+    EXPECT_TRUE(platf::is_system_auth_executable_path(
+      "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+    ));
+    EXPECT_TRUE(platf::is_system_auth_executable_path(
+      "/System/Library/CoreServices/ScreenSaverEngine.app/Contents/MacOS/ScreenSaverEngine"
+    ));
+    EXPECT_TRUE(platf::is_system_auth_executable_path(
+      "/System/Library/CoreServices/CoreServicesUIAgent.app/Contents/MacOS/CoreServicesUIAgent"
+    ));
+
+    // Normal Aqua apps (including Chromium/Electron apps that frequently keep Secure Event Input
+    // enabled in the background) must NOT trigger LoginWindow-style IME blocking or ASCII stamping.
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/Applications/Discord.app/Contents/MacOS/Discord"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/System/Applications/App Store.app/Contents/MacOS/App Store"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/Applications/SecurityAgent.app/Contents/MacOS/SecurityAgent"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(
+      "/System/Library/../../Applications/SecurityAgent"
+    ));
+    EXPECT_FALSE(platf::is_system_auth_executable_path(""));
+
+    // LoginWindow and Lock Screen always enable system password input mode.
+    EXPECT_TRUE(platf::should_use_system_password_input(true, false, false, ""));
+    EXPECT_TRUE(platf::should_use_system_password_input(false, false, true, ""));
+    EXPECT_TRUE(platf::should_use_system_password_input(false, true, true, "/Applications/Discord.app/Contents/MacOS/Discord"));
+
+    // Unlocked Aqua session: only system auth agents enable system password input mode.
+    EXPECT_FALSE(platf::should_use_system_password_input(false, false, false, ""));
+    EXPECT_FALSE(platf::should_use_system_password_input(false, true, false, ""));
+    EXPECT_FALSE(platf::should_use_system_password_input(
+      false, true, false, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    ));
+    EXPECT_FALSE(platf::should_use_system_password_input(
+      false, true, false, "/Applications/Discord.app/Contents/MacOS/Discord"
+    ));
+    EXPECT_TRUE(platf::should_use_system_password_input(
+      false,
+      true,
+      false,
+      "/System/Library/Frameworks/Security.framework/Versions/A/MachServices/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"
+    ));
+    EXPECT_TRUE(platf::should_use_system_password_input(
+      false,
+      true,
+      false,
+      "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreautha.bundle/Contents/MacOS/coreautha"
+    ));
+  }
+
 }  // namespace

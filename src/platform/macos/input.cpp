@@ -15,6 +15,7 @@
 #include <ctime>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/IOLLEvent.h>
+#include <libproc.h>
 
 #include "src/config.h"
 #include "src/display_device.h"
@@ -90,9 +92,57 @@ namespace platf {
       return streamed;
     }
 
+    bool is_system_password_input_active() noexcept {
+      if (is_loginwindow_session()) {
+        return true;
+      }
+      if (!IsSecureEventInputEnabled()) {
+        return false;
+      }
+
+      bool screen_locked = false;
+      pid_t secure_pid = 0;
+      if (const cf_ref_t<CFDictionaryRef> session {CGSessionCopyCurrentDictionary()}) {
+        if (const auto locked_val = CFDictionaryGetValue(session.get(), CFSTR("CGSSessionScreenIsLocked"))) {
+          if (CFGetTypeID(locked_val) == CFBooleanGetTypeID()) {
+            screen_locked = CFBooleanGetValue(static_cast<CFBooleanRef>(locked_val));
+          } else if (CFGetTypeID(locked_val) == CFNumberGetTypeID()) {
+            int locked_int = 0;
+            if (CFNumberGetValue(static_cast<CFNumberRef>(locked_val), kCFNumberIntType, &locked_int)) {
+              screen_locked = (locked_int != 0);
+            }
+          }
+        }
+        if (!screen_locked) {
+          if (const auto pid_val = CFDictionaryGetValue(session.get(), CFSTR("kCGSSessionSecureInputPID"));
+              pid_val && CFGetTypeID(pid_val) == CFNumberGetTypeID()) {
+            int32_t pid_num = 0;
+            if (CFNumberGetValue(static_cast<CFNumberRef>(pid_val), kCFNumberSInt32Type, &pid_num) && pid_num > 0) {
+              secure_pid = static_cast<pid_t>(pid_num);
+            }
+          }
+        }
+      }
+
+      if (screen_locked) {
+        return true;
+      }
+
+      std::string_view owner_path;
+      char path_buf[PROC_PIDPATHINFO_MAXSIZE] {};
+      if (secure_pid > 0) {
+        const int len = proc_pidpath(secure_pid, path_buf, sizeof(path_buf));
+        if (len > 0) {
+          owner_path = std::string_view(path_buf, static_cast<std::size_t>(len));
+        }
+      }
+
+      return should_use_system_password_input(false, true, false, owner_path);
+    }
+
     void toggle_input_source(macos_input_t *macos_input) {
       const CGEventFlags saved_flags = macos_input->kb_flags.load(std::memory_order_relaxed);
-      const CGEventFlags ctrl_flags = saved_flags | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
+      const CGEventFlags ctrl_flags = kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
       const auto post_key = [&](const CGKeyCode vk, const bool down, const CGEventFlags flags) noexcept {
         if (const CGEventRef ev = CGEventCreateKeyboardEvent(macos_input->keyboard_source, vk, down)) {
           CGEventSetFlags(ev, flags);
@@ -284,7 +334,7 @@ namespace platf {
     auto *macos_input = static_cast<macos_input_t *>(input.get());
     ensure_event_sources(macos_input);
     std::lock_guard kb_lock(macos_input->keyboard_mutex);
-    const bool secure_password_input = is_loginwindow_session() || IsSecureEventInputEnabled();
+    const bool secure_password_input = is_system_password_input_active();
 
     if (modcode == 0xFF || modcode == 0x15) {
       if (!release && !secure_password_input) {
@@ -394,7 +444,7 @@ namespace platf {
     }
     CFStringGetCharacters(cf_str.get(), CFRangeMake(0, utf16_len), out_chars);
 
-    const bool secure_password_input = is_loginwindow_session() || IsSecureEventInputEnabled();
+    const bool secure_password_input = is_system_password_input_active();
     const CGEventTapLocation tap = secure_password_input ? kCGHIDEventTap : kCGSessionEventTap;
     for (const bool down : {true, false}) {
       if (CGEventRef ev = CGEventCreateKeyboardEvent(macos_input->keyboard_source, 0, down)) {

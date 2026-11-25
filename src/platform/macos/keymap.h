@@ -6,6 +6,7 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <cstdint>
+#include <string_view>
 
 namespace platf {
 
@@ -50,5 +51,26 @@ namespace platf {
    * @brief Stamps the exact ASCII character onto secure/pre-login keyboard events without calling TIS* off-main.
    */
   void stamp_loginwindow_ascii_unicode(CGEventRef event, int mac_keycode, CGEventFlags kb_flags) noexcept;
+
+  /**
+   * @brief Returns true if `executable_path` belongs to a macOS system login, lock-screen,
+   *        or authentication prompt process under `/System/Library/`.
+   */
+  [[nodiscard]] bool is_system_auth_executable_path(std::string_view executable_path) noexcept;
+
+  /**
+   * @brief Determines whether keyboard events should enter system-password mode
+   *        (suppressing remote IME toggling and stamping ASCII Unicode characters).
+   *
+   * Regular Aqua apps (e.g. Chrome, Discord, Terminal, password managers) can keep session-global
+   * `IsSecureEventInputEnabled()` active even in the background; only LoginWindow, Lock Screen,
+   * and macOS system authentication agents should disable IME switching and force ASCII stamping.
+   */
+  [[nodiscard]] bool should_use_system_password_input(
+    bool loginwindow_session,
+    bool secure_event_input_enabled,
+    bool screen_locked,
+    std::string_view secure_input_owner_path
+  ) noexcept;
 
 }  // namespace platf
