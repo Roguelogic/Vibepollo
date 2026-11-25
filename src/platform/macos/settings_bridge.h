@@ -83,7 +83,7 @@ extern "C" {
 void vibepollo_register_macos_native_ui(void);
 void vibepollo_open_macos_native_ui(const char * _Nullable route);
 void vibepollo_set_macos_native_ui_visible(_Bool visible);
-void vibepollo_toggle_macos_menubar_popover(double x, double y, double width, double height);
+void vibepollo_toggle_macos_menubar_popover(void * _Nullable status_button);
 void vibepollo_close_macos_menubar_popover(void);
 
 #ifdef __cplusplus

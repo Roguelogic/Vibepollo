@@ -91,12 +91,7 @@ namespace {
     return;
   }
 
-  NSRect anchor = NSZeroRect;
-  if (sender != nil && sender.window != nil) {
-    const NSRect inWindow = [sender convertRect:sender.bounds toView:nil];
-    anchor = [sender.window convertRectToScreen:inWindow];
-  }
-  vibepollo_toggle_macos_menubar_popover(anchor.origin.x, anchor.origin.y, anchor.size.width, anchor.size.height);
+  vibepollo_toggle_macos_menubar_popover((__bridge void *)sender);
 }
 
 - (void)menuCallback:(NSMenuItem *)sender {

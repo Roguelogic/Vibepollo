@@ -51,7 +51,7 @@
 #include "src/video.h"
 
 extern "C" void vibepollo_macos_open_native_ui(const char *route);
-extern "C" void vibepollo_macos_toggle_menubar_popover(double x, double y, double width, double height);
+extern "C" void vibepollo_macos_toggle_menubar_popover(void *status_button);
 extern "C" void vibepollo_macos_close_menubar_popover(void);
 
 namespace {
@@ -277,8 +277,8 @@ extern "C" void vibepollo_open_macos_native_ui(const char *route) {
   vibepollo_macos_open_native_ui(route);
 }
 
-extern "C" void vibepollo_toggle_macos_menubar_popover(double x, double y, double width, double height) {
-  vibepollo_macos_toggle_menubar_popover(x, y, width, height);
+extern "C" void vibepollo_toggle_macos_menubar_popover(void *status_button) {
+  vibepollo_macos_toggle_menubar_popover(status_button);
 }
 
 extern "C" void vibepollo_close_macos_menubar_popover(void) {
