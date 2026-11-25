@@ -6,7 +6,10 @@ struct ActiveStreamSession: Codable, Identifiable, Equatable {
   var width: Int
   var height: Int
   var fps: Int
+  var actualFps: Double?
   var bitrateKbps: Int
+  var requestedBitrateKbps: Int?
+  var actualBitrateKbps: Double?
   var codec: String
   var hdr: Bool
   var bitDepth: Int
@@ -16,7 +19,12 @@ struct ActiveStreamSession: Codable, Identifiable, Equatable {
   var captureToSubmitP95Ms: Double?
   var encodeP95Ms: Double?
   var completeToSendP95Ms: Double?
+  var jitterMs: Double?
+  var capturedFrames: Int64?
+  var repeatedFrames: Int64?
   var framesSent: UInt64
+  var bytesSent: UInt64?
+  var idrRequests: UInt32?
   var losses: Int64
   var uptimeSeconds: Double
 
@@ -25,19 +33,99 @@ struct ActiveStreamSession: Codable, Identifiable, Equatable {
 
 struct HostStatsSnapshot: Codable, Equatable {
   var cpuPercent: Double
+  var cpuUserPercent: Double?
+  var cpuSystemPercent: Double?
+  var cpuLogicalCores: Int?
+  var cpuPerfCores: Int?
+  var cpuEffCores: Int?
   var gpuPercent: Double
+  var gpuRendererPercent: Double?
+  var gpuTilerPercent: Double?
+  var gpuCoreCount: Int?
+  var gpuMemInUseMB: Double?
   var ramUsedGB: Double
   var ramTotalGB: Double
+  var processFootprintMB: Double?
+  var netInterface: String?
+  var netLinkSpeedMbps: UInt64?
+  var netTxMbps: Double?
+  var netRxMbps: Double?
   var cpuModel: String
   var gpuModel: String
 
   static let empty = HostStatsSnapshot(
     cpuPercent: -1,
+    cpuUserPercent: nil,
+    cpuSystemPercent: nil,
+    cpuLogicalCores: nil,
+    cpuPerfCores: nil,
+    cpuEffCores: nil,
     gpuPercent: -1,
+    gpuRendererPercent: nil,
+    gpuTilerPercent: nil,
+    gpuCoreCount: nil,
+    gpuMemInUseMB: nil,
     ramUsedGB: -1,
     ramTotalGB: -1,
+    processFootprintMB: nil,
+    netInterface: nil,
+    netLinkSpeedMbps: nil,
+    netTxMbps: nil,
+    netRxMbps: nil,
     cpuModel: "",
     gpuModel: ""
+  )
+}
+
+struct EncoderRuntimePipeline: Codable, Equatable {
+  var active: Bool
+  var codec: String
+  var profile: String
+  var rateControl: String
+  var throughputTier: String
+  var throughputModeId: Int
+  var maxMpxPerSec: Double
+  var motionSearch: String
+  var slicesPerFrame: Int
+  var maxInFlight: Int
+  var captureFormat: String
+  var encoderFormat: String
+  var zeroCopy: Bool
+  var realtime: Bool
+  var hdrSeiInband: Bool
+}
+
+struct EncoderSpecSnapshot: Codable, Equatable {
+  var backend: String
+  var hardwareAccelerated: Bool
+  var probed: Bool
+  var h264: Bool
+  var hevc8Bit: Bool
+  var hevc10BitHdr: Bool
+  var hevc444_8Bit: Bool
+  var hevc444_10Bit: Bool
+  var av1Hw: Bool
+  var hevcMaxMpxPerSec: Double
+  var hevcMaxTier: String
+  var h264MaxMpxPerSec: Double
+  var h264MaxTier: String
+  var activePipeline: EncoderRuntimePipeline?
+
+  static let empty = EncoderSpecSnapshot(
+    backend: "videotoolbox",
+    hardwareAccelerated: true,
+    probed: false,
+    h264: false,
+    hevc8Bit: false,
+    hevc10BitHdr: false,
+    hevc444_8Bit: false,
+    hevc444_10Bit: false,
+    av1Hw: false,
+    hevcMaxMpxPerSec: 0,
+    hevcMaxTier: "",
+    h264MaxMpxPerSec: 0,
+    h264MaxTier: "",
+    activePipeline: nil
   )
 }
 
@@ -51,6 +139,7 @@ struct DashboardSnapshot: Codable, Equatable {
   var runningAppName: String
   var sessions: [ActiveStreamSession]
   var hostStats: HostStatsSnapshot
+  var encoderSpec: EncoderSpecSnapshot?
   var screenCaptureAllowed: Bool
   var accessibilityAllowed: Bool
   var deferredReloadPending: Bool
@@ -67,6 +156,7 @@ struct DashboardSnapshot: Codable, Equatable {
     runningAppName: "",
     sessions: [],
     hostStats: .empty,
+    encoderSpec: nil,
     screenCaptureAllowed: true,
     accessibilityAllowed: true,
     deferredReloadPending: false,

@@ -8,6 +8,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -21,6 +22,7 @@
 
 #include "misc.h"
 #include "virtual_display.h"
+#include "vt_encoder.h"
 #include "src/config.h"
 #include "src/config_steam.h"
 #include "src/confighttp.h"
@@ -45,6 +47,7 @@
 #include "src/system_tray.h"
 #include "src/update.h"
 #include "src/uuid.h"
+#include "src/video.h"
 
 extern "C" void vibepollo_macos_open_native_ui(const char *route);
 
@@ -163,6 +166,108 @@ namespace {
     return false;
   }
 
+  struct live_rate_sample_t {
+    std::uint64_t frames_sent = 0;
+    std::uint64_t bytes_sent = 0;
+    std::chrono::steady_clock::time_point sampled_at {};
+    double actual_fps = 0.0;
+    double actual_bitrate_kbps = 0.0;
+  };
+
+  struct live_rate_tracker_t {
+    std::mutex mutex;
+    std::unordered_map<std::string, live_rate_sample_t> entries;
+
+    std::pair<double, double> update(const std::string &uuid, std::uint64_t frames_sent, std::uint64_t bytes_sent) {
+      std::lock_guard lg {mutex};
+      const auto now = std::chrono::steady_clock::now();
+      auto &entry = entries[uuid];
+      if (entry.sampled_at != std::chrono::steady_clock::time_point {}) {
+        const double dt = std::chrono::duration<double>(now - entry.sampled_at).count();
+        if (dt >= 0.25) {
+          if (frames_sent >= entry.frames_sent) {
+            entry.actual_fps = static_cast<double>(frames_sent - entry.frames_sent) / dt;
+          }
+          if (bytes_sent >= entry.bytes_sent) {
+            entry.actual_bitrate_kbps = (static_cast<double>(bytes_sent - entry.bytes_sent) * 8.0) / (dt * 1000.0);
+          }
+          entry.frames_sent = frames_sent;
+          entry.bytes_sent = bytes_sent;
+          entry.sampled_at = now;
+        }
+      } else {
+        entry.frames_sent = frames_sent;
+        entry.bytes_sent = bytes_sent;
+        entry.sampled_at = now;
+      }
+      return {entry.actual_fps, entry.actual_bitrate_kbps};
+    }
+
+    void prune_except(const std::set<std::string> &active_uuids) {
+      std::lock_guard lg {mutex};
+      for (auto it = entries.begin(); it != entries.end();) {
+        if (!active_uuids.contains(it->first)) {
+          it = entries.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  };
+
+  live_rate_tracker_t &live_rate_tracker() {
+    static live_rate_tracker_t instance;
+    return instance;
+  }
+
+  nlohmann::json runtime_spec_to_json(const platf::vt::runtime_spec_t &spec) {
+    return {
+      {"active", spec.active},
+      {"codec", spec.codec},
+      {"profile", spec.profile},
+      {"rateControl", spec.rate_control},
+      {"throughputTier", spec.throughput_tier},
+      {"throughputModeId", spec.throughput_mode_id},
+      {"maxMpxPerSec", spec.max_mpx_per_sec},
+      {"motionSearch", spec.motion_search},
+      {"slicesPerFrame", spec.slices_per_frame},
+      {"maxInFlight", spec.max_in_flight},
+      {"captureFormat", spec.capture_format},
+      {"encoderFormat", spec.encoder_format},
+      {"zeroCopy", spec.zero_copy},
+      {"realtime", spec.realtime},
+      {"hdrSeiInband", spec.hdr_sei_inband},
+    };
+  }
+
+  nlohmann::json build_encoder_spec_json() {
+    bool probe_complete = false;
+    const auto caps = video::advertised_encoder_capabilities(false, &probe_complete);
+    const std::string backend = video::active_encoder_name();
+    const bool hw = (backend == "videotoolbox" || (backend.empty() && probe_complete));
+    const auto hw_spec = platf::vt::hardware_spec();
+    const auto runtime_spec = platf::vt::current_runtime_spec();
+
+    nlohmann::json out;
+    out["backend"] = backend.empty() ? "videotoolbox" : backend;
+    out["hardwareAccelerated"] = hw;
+    out["probed"] = probe_complete || video::has_successful_encoder_probe();
+    out["h264"] = probe_complete || video::has_successful_encoder_probe();
+    out["hevc8Bit"] = caps.hevc_mode >= 2;
+    out["hevc10BitHdr"] = caps.hevc_mode >= 3;
+    out["hevc444_8Bit"] = caps.hevc_mode >= 2 && caps.yuv444_for_codec[1];
+    out["hevc444_10Bit"] = caps.hevc_mode >= 3 && caps.yuv444_for_codec[1];
+    out["av1Hw"] = hw && caps.av1_mode >= 2;
+    out["hevcMaxMpxPerSec"] = hw_spec.hevc_max_mpx_per_sec;
+    out["hevcMaxTier"] = hw_spec.hevc_max_tier;
+    out["h264MaxMpxPerSec"] = hw_spec.h264_max_mpx_per_sec;
+    out["h264MaxTier"] = hw_spec.h264_max_tier;
+    if (runtime_spec.active) {
+      out["activePipeline"] = runtime_spec_to_json(runtime_spec);
+    }
+    return out;
+  }
+
 }  // namespace
 
 extern "C" void vibepollo_open_macos_native_ui(const char *route) {
@@ -239,15 +344,35 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   out["appRunning"] = app_running;
   out["runningAppName"] = app_running ? proc::proc.get_last_run_app_name() : "";
 
+  std::unordered_map<std::string, session_history::active_session_t> history_active_by_uuid;
+  for (const auto &as : session_history::get_active_sessions()) {
+    history_active_by_uuid[as.uuid] = as;
+  }
+
+  std::set<std::string> live_uuids;
   nlohmann::json sessions_json = nlohmann::json::array();
   for (const auto &s : stream::get_all_session_info()) {
+    live_uuids.insert(s.uuid);
+    const auto [delta_fps, delta_bitrate_kbps] = live_rate_tracker().update(s.uuid, s.frames_sent, s.bytes_sent);
+    double actual_fps = delta_fps;
+    double actual_bitrate_kbps = delta_bitrate_kbps;
+    if (const auto it = history_active_by_uuid.find(s.uuid); it != history_active_by_uuid.end()) {
+      if (it->second.actual_fps > 0.0 || it->second.actual_bitrate_kbps > 0.0) {
+        actual_fps = it->second.actual_fps;
+        actual_bitrate_kbps = it->second.actual_bitrate_kbps;
+      }
+    }
+
     nlohmann::json item;
     item["uuid"] = s.uuid;
     item["deviceName"] = s.device_name.empty() ? "Client" : s.device_name;
     item["width"] = s.width;
     item["height"] = s.height;
     item["fps"] = s.fps;
+    item["actualFps"] = actual_fps;
     item["bitrateKbps"] = s.encoder_bitrate_kbps;
+    item["requestedBitrateKbps"] = s.requested_bitrate_kbps > 0 ? s.requested_bitrate_kbps : s.encoder_bitrate_kbps;
+    item["actualBitrateKbps"] = actual_bitrate_kbps;
     item["codec"] = std::string(stream::video_format_name(s.video_format));
     item["hdr"] = s.hdr;
     item["bitDepth"] = s.dynamic_range != 0 ? 10 : 8;
@@ -259,11 +384,23 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
       item["encodeP95Ms"] = s.timing.encode_p95_ms;
       item["completeToSendP95Ms"] = s.timing.complete_to_send_p95_ms;
     }
+    if (s.timing.send_interval_jitter_ms >= 0) {
+      item["jitterMs"] = s.timing.send_interval_jitter_ms;
+    }
+    if (s.timing.captured_frames >= 0) {
+      item["capturedFrames"] = s.timing.captured_frames;
+    }
+    if (s.timing.repeated_frames >= 0) {
+      item["repeatedFrames"] = s.timing.repeated_frames;
+    }
     item["framesSent"] = s.frames_sent;
+    item["bytesSent"] = s.bytes_sent;
+    item["idrRequests"] = s.idr_requests;
     item["losses"] = s.client_reported_losses;
     item["uptimeSeconds"] = s.uptime_seconds;
     sessions_json.push_back(std::move(item));
   }
+  live_rate_tracker().prune_except(live_uuids);
   out["sessions"] = std::move(sessions_json);
 
   const auto &info = host_stats::info();
@@ -271,21 +408,48 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   if (includeHostStats) {
     const auto stats = host_stats::latest_for_consumer();
     hs["cpuPercent"] = stats.cpu_percent;
+    hs["cpuUserPercent"] = stats.cpu_user_percent;
+    hs["cpuSystemPercent"] = stats.cpu_system_percent;
     hs["gpuPercent"] = stats.gpu_percent;
+    hs["gpuRendererPercent"] = stats.gpu_renderer_percent;
+    hs["gpuTilerPercent"] = stats.gpu_tiler_percent;
+    hs["gpuMemInUseMB"] = stats.gpu_mem_in_use_bytes > 0
+                            ? static_cast<double>(stats.gpu_mem_in_use_bytes) / (1024.0 * 1024.0)
+                            : -1.0;
     hs["ramUsedGB"] = stats.ram_used_bytes > 0
                         ? static_cast<double>(stats.ram_used_bytes) / (1024.0 * 1024.0 * 1024.0)
                         : -1.0;
+    hs["processFootprintMB"] = stats.process_footprint_bytes > 0
+                                 ? static_cast<double>(stats.process_footprint_bytes) / (1024.0 * 1024.0)
+                                 : -1.0;
+    hs["netTxMbps"] = stats.net_tx_bps >= 0.0 ? stats.net_tx_bps / 1'000'000.0 : -1.0;
+    hs["netRxMbps"] = stats.net_rx_bps >= 0.0 ? stats.net_rx_bps / 1'000'000.0 : -1.0;
   } else {
     hs["cpuPercent"] = -1.0;
+    hs["cpuUserPercent"] = -1.0;
+    hs["cpuSystemPercent"] = -1.0;
     hs["gpuPercent"] = -1.0;
+    hs["gpuRendererPercent"] = -1.0;
+    hs["gpuTilerPercent"] = -1.0;
+    hs["gpuMemInUseMB"] = -1.0;
     hs["ramUsedGB"] = -1.0;
+    hs["processFootprintMB"] = -1.0;
+    hs["netTxMbps"] = -1.0;
+    hs["netRxMbps"] = -1.0;
   }
   hs["ramTotalGB"] = info.ram_total_bytes > 0
                        ? static_cast<double>(info.ram_total_bytes) / (1024.0 * 1024.0 * 1024.0)
                        : -1.0;
   hs["cpuModel"] = info.cpu_model;
+  hs["cpuLogicalCores"] = info.cpu_logical_cores;
+  hs["cpuPerfCores"] = info.cpu_perf_cores;
+  hs["cpuEffCores"] = info.cpu_eff_cores;
   hs["gpuModel"] = info.gpu_model;
+  hs["gpuCoreCount"] = info.gpu_core_count;
+  hs["netInterface"] = info.net_interface;
+  hs["netLinkSpeedMbps"] = info.net_link_speed_mbps;
   out["hostStats"] = std::move(hs);
+  out["encoderSpec"] = build_encoder_spec_json();
   out["screenCaptureAllowed"] = is_screen_capture_allowed();
   out["accessibilityAllowed"] = is_accessibility_allowed();
   out["deferredReloadPending"] = config::has_deferred_reload();

@@ -35,12 +35,78 @@
 namespace {
   using namespace std::literals;
 
+  struct vt_telemetry_registry_t {
+    std::mutex mutex;
+    platf::vt::hardware_spec_t hw_spec;
+    const void *active_owner = nullptr;
+    platf::vt::runtime_spec_t active_spec;
+
+    void record_hw_spec(CMVideoCodecType codec, std::string_view tier, double mpx_per_sec) {
+      if (mpx_per_sec <= 0.0) {
+        return;
+      }
+      std::lock_guard lg {mutex};
+      if (codec == kCMVideoCodecType_HEVC && mpx_per_sec > hw_spec.hevc_max_mpx_per_sec) {
+        hw_spec.hevc_max_mpx_per_sec = mpx_per_sec;
+        hw_spec.hevc_max_tier = std::string(tier);
+      } else if (codec == kCMVideoCodecType_H264 && mpx_per_sec > hw_spec.h264_max_mpx_per_sec) {
+        hw_spec.h264_max_mpx_per_sec = mpx_per_sec;
+        hw_spec.h264_max_tier = std::string(tier);
+      }
+    }
+
+    void publish(const void *owner, const platf::vt::runtime_spec_t &spec) {
+      std::lock_guard lg {mutex};
+      active_owner = owner;
+      active_spec = spec;
+    }
+
+    void update_capture_format(const void *owner, std::string cap_fmt, std::string enc_fmt, bool zero_copy) {
+      std::lock_guard lg {mutex};
+      if (active_owner == owner && active_spec.active) {
+        active_spec.capture_format = std::move(cap_fmt);
+        active_spec.encoder_format = std::move(enc_fmt);
+        active_spec.zero_copy = zero_copy;
+      }
+    }
+
+    void update_hdr_sei(const void *owner, bool enabled) {
+      std::lock_guard lg {mutex};
+      if (active_owner == owner && active_spec.active) {
+        active_spec.hdr_sei_inband = enabled;
+      }
+    }
+
+    void clear_if_owner(const void *owner) {
+      std::lock_guard lg {mutex};
+      if (active_owner == owner) {
+        active_owner = nullptr;
+        active_spec = {};
+      }
+    }
+  };
+
+  vt_telemetry_registry_t &vt_telemetry() {
+    static vt_telemetry_registry_t instance;
+    return instance;
+  }
+
+  std::string fourcc_string(OSType f) {
+    return std::string {
+      static_cast<char>((f >> 24) & 0xFF),
+      static_cast<char>((f >> 16) & 0xFF),
+      static_cast<char>((f >> 8) & 0xFF),
+      static_cast<char>(f & 0xFF)
+    };
+  }
+
   /**
    * @brief Blocking one-frame-in-flight wrapper around a VTCompressionSession.
    */
   class vt_compression_session_t {
   public:
     ~vt_compression_session_t() {
+      vt_telemetry().clear_if_owner(this);
       if (session) {
         VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
         // Guarantees no output callbacks after return
@@ -131,15 +197,19 @@ namespace {
       }
 
       CFStringRef profile;
+      std::string profile_label;
       const bool yuv444 = (config.chromaSamplingType == 1);
       if (codec == kCMVideoCodecType_HEVC) {
         if (yuv444) {
           profile = colorspace.bit_depth == 10 ? CFSTR("HEVC_Main44410_AutoLevel") : CFSTR("HEVC_Main444_AutoLevel");
+          profile_label = colorspace.bit_depth == 10 ? "Main 4:4:4 10" : "Main 4:4:4";
         } else {
           profile = colorspace.bit_depth == 10 ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel;
+          profile_label = colorspace.bit_depth == 10 ? "Main10" : "Main";
         }
       } else {
         profile = kVTProfileLevel_H264_High_AutoLevel;
+        profile_label = "High";
       }
       if (!set_property(kVTCompressionPropertyKey_ProfileLevel, profile, "ProfileLevel"sv) &&
           (colorspace.bit_depth == 10 || yuv444)) {
@@ -152,6 +222,7 @@ namespace {
       // so H.264 never drops to half-rate 124.4 Mpx/s "full" mode). Must be applied after ProfileLevel.
       int selected_tp_mode_id = 0;
       std::string_view selected_tp_tier;
+      double selected_tp_mpx = 0.0;
       CFTypeRef tp_modes_ref = nullptr;
       if (VTSessionCopyProperty(session, CFSTR("SupportedThroughputModes"), kCFAllocatorDefault, &tp_modes_ref) == noErr && tp_modes_ref) {
         if (CFGetTypeID(tp_modes_ref) == CFDictionaryGetTypeID()) {
@@ -169,6 +240,13 @@ namespace {
                   CFNumberGetValue(id_num, kCFNumberIntType, &selected_tp_mode_id);
                   if (selected_tp_mode_id > 0) {
                     selected_tp_tier = tier_name;
+                    if (auto perf_num = static_cast<CFNumberRef>(CFDictionaryGetValue(first, CFSTR("ThroughputModePerformance")));
+                        perf_num && CFGetTypeID(perf_num) == CFNumberGetTypeID()) {
+                      std::int64_t perf_px_s = 0;
+                      if (CFNumberGetValue(perf_num, kCFNumberSInt64Type, &perf_px_s) && perf_px_s > 0) {
+                        selected_tp_mpx = static_cast<double>(perf_px_s) / 1'000'000.0;
+                      }
+                    }
                   }
                 }
               }
@@ -176,31 +254,42 @@ namespace {
           };
           pick_tier(CFSTR("turbo"), "turbo"sv);
           pick_tier(CFSTR("normal"), "normal"sv);
+          pick_tier(CFSTR("full"), "full"sv);
         }
         CFRelease(tp_modes_ref);
       }
+      if (selected_tp_mpx > 0.0) {
+        vt_telemetry().record_hw_spec(codec, selected_tp_tier, selected_tp_mpx);
+      }
+      bool tp_applied = false;
       if (selected_tp_mode_id > 0 && set_int_property(CFSTR("ThroughputMode"), selected_tp_mode_id, "ThroughputMode"sv)) {
+        tp_applied = true;
         BOOST_LOG(info) << "VideoToolbox: enabled hardware "sv << selected_tp_tier << " ThroughputMode="sv << selected_tp_mode_id;
       }
       set_property(CFSTR("EnableVUIBitstreamRestriction"), kCFBooleanTrue, "EnableVUIBitstreamRestriction"sv);
       set_property(CFSTR("ThrottleForBackground"), kCFBooleanFalse, "ThrottleForBackground"sv);
+      std::string motion_search_label = "Auto";
       if (codec == kCMVideoCodecType_HEVC) {
         set_property(CFSTR("PerceptualQualityOptimization"), kCFBooleanTrue, "PerceptualQualityOptimization"sv);
         // GFN NVENC-P1 equivalent on AppleAVE2: narrow hardware motion search window (Mode 6 = 96x64
         // vs default Mode 4 = 320x192), boosting M4 2752x2064 4:4:4 10-bit throughput by +37.7%.
         if (set_int_property(CFSTR("MotionEstimationSearchMode"), 6, "MotionEstimationSearchMode"sv)) {
+          motion_search_label = "96x64";
           BOOST_LOG(info) << "VideoToolbox: enabled ultra-low-latency MotionEstimationSearchMode=6 (96x64)"sv;
         }
       } else if (codec == kCMVideoCodecType_H264) {
         // Narrowest supported H.264 motion search window on AppleAVE2 (Mode 1 = 128x64 vs default Mode 0 = 192x96).
         if (set_int_property(CFSTR("MotionEstimationSearchMode"), 1, "MotionEstimationSearchMode"sv)) {
+          motion_search_label = "128x64";
           BOOST_LOG(info) << "VideoToolbox: enabled low-latency H.264 MotionEstimationSearchMode=1 (128x64)"sv;
         }
       }
       // GFN Multi-Slice parallel encoding: enforce >= 4 slices per frame on Retina streams even when
       // the client negotiates slicesPerFrame=1 so encoders and client decoders pipeline slices concurrently.
       const int target_slices = std::max(config.slicesPerFrame, 4);
+      int applied_slices = 1;
       if (set_int_property(CFSTR("NumberOfSlices"), target_slices, "NumberOfSlices"sv)) {
+        applied_slices = target_slices;
         BOOST_LOG(info) << "VideoToolbox: enabled hardware multi-slice encoding ("sv << target_slices << " slices/frame)"sv;
       }
 
@@ -238,6 +327,22 @@ namespace {
       if (prepare_status != noErr) {
         BOOST_LOG(warning) << "VTCompressionSessionPrepareToEncodeFrames failed: "sv << prepare_status;
       }
+
+      platf::vt::runtime_spec_t runtime_spec;
+      runtime_spec.active = true;
+      runtime_spec.codec = codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264";
+      runtime_spec.profile = profile_label;
+      runtime_spec.rate_control = low_latency ? "Low-Latency RC" : "Standard (50ms VBV)";
+      runtime_spec.throughput_tier = tp_applied ? std::string(selected_tp_tier) : "";
+      runtime_spec.throughput_mode_id = tp_applied ? selected_tp_mode_id : 0;
+      runtime_spec.max_mpx_per_sec = tp_applied ? selected_tp_mpx : 0.0;
+      runtime_spec.motion_search = motion_search_label;
+      runtime_spec.slices_per_frame = applied_slices;
+      runtime_spec.max_in_flight = static_cast<int>(max_in_flight_limit);
+      runtime_spec.encoder_format = fourcc_string(encoder_pixel_format);
+      runtime_spec.realtime = config::video.vt.vt_realtime;
+      runtime_spec.hdr_sei_inband = !cached_hdr_sei.empty();
+      vt_telemetry().publish(this, runtime_spec);
       return true;
     }
 
@@ -344,9 +449,11 @@ namespace {
         last_transfer_result.reset();
       }
       if (!logged_input_format) {
-        const auto fourcc = [](OSType f) { return std::string {char(f >> 24), char(f >> 16), char(f >> 8), char(f)}; };
-        BOOST_LOG(info) << "VideoToolbox capture=" << fourcc(input_format) << " encoder input=" << fourcc(encoder_pixel_format)
+        const auto cap_fourcc = fourcc_string(input_format);
+        const auto enc_fourcc = fourcc_string(encoder_pixel_format);
+        BOOST_LOG(info) << "VideoToolbox capture=" << cap_fourcc << " encoder input=" << enc_fourcc
                         << " requested range=" << (requested_full_range ? "full" : "video");
+        vt_telemetry().update_capture_format(this, cap_fourcc, enc_fourcc, input_format == encoder_pixel_format);
         logged_input_format = true;
       }
       uint64_t seq = 0;
@@ -786,6 +893,7 @@ namespace {
                           << ", MaxFALL "sv << hdr.maxFrameAverageLightLevel
                           << ", "sv << cached_hdr_sei.size() << "B on IDR)"sv;
         }
+        vt_telemetry().update_hdr_sei(this, !cached_hdr_sei.empty());
       }
     }
 
@@ -1225,6 +1333,18 @@ namespace platf::vt {
     const std::int64_t macroblocks_per_frame = static_cast<std::int64_t>((width + 15) / 16) * ((height + 15) / 16);
     const auto level_limit = static_cast<int>(std::max<std::int64_t>(1, max_macroblocks_per_second / macroblocks_per_frame));
     return std::min(framerate, level_limit);
+  }
+
+  hardware_spec_t hardware_spec() {
+    auto &reg = vt_telemetry();
+    std::lock_guard lg {reg.mutex};
+    return reg.hw_spec;
+  }
+
+  runtime_spec_t current_runtime_spec() {
+    auto &reg = vt_telemetry();
+    std::lock_guard lg {reg.mutex};
+    return reg.active_spec;
   }
 
   std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, bool full_range, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn) {

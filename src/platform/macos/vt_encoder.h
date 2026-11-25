@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 // platform includes
@@ -112,5 +113,46 @@ namespace platf::vt {
    * @param pixel_format_fn Callback that selects the capture pixel format; invoked before capture starts.
    * @return Constructed encode device object, or null on failure.
    */
+  /**
+   * @brief Hardware throughput capabilities observed from Apple VideoToolbox (AppleAVE).
+   */
+  struct hardware_spec_t {
+    double hevc_max_mpx_per_sec = 0.0;
+    std::string hevc_max_tier;
+    double h264_max_mpx_per_sec = 0.0;
+    std::string h264_max_tier;
+  };
+
+  /**
+   * @brief Runtime pipeline configuration of the active VideoToolbox compression session.
+   */
+  struct runtime_spec_t {
+    bool active = false;
+    std::string codec;
+    std::string profile;
+    std::string rate_control;
+    std::string throughput_tier;
+    int throughput_mode_id = 0;
+    double max_mpx_per_sec = 0.0;
+    std::string motion_search;
+    int slices_per_frame = 1;
+    int max_in_flight = 1;
+    std::string capture_format;
+    std::string encoder_format;
+    bool zero_copy = false;
+    bool realtime = true;
+    bool hdr_sei_inband = false;
+  };
+
+  /**
+   * @brief Return cached Apple VideoToolbox hardware throughput specs (populated during encoder probe).
+   */
+  hardware_spec_t hardware_spec();
+
+  /**
+   * @brief Return the active VideoToolbox session's runtime pipeline spec, or `active=false` when idle.
+   */
+  runtime_spec_t current_runtime_spec();
+
   std::unique_ptr<vt_encode_device_t> make_encode_device(pix_fmt_e pix_fmt, bool full_range, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn);
 }  // namespace platf::vt

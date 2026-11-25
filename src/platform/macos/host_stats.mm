@@ -207,6 +207,87 @@ namespace {
     return std::min(bits_per_second, max_bits_per_second);
   }
 
+  std::uint64_t read_process_footprint() {
+    task_vm_info_data_t vm_info {};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info), &count) == KERN_SUCCESS) {
+      return static_cast<std::uint64_t>(vm_info.phys_footprint);
+    }
+    return 0;
+  }
+
+  std::string cf_to_utf8(CFTypeRef ref) {
+    if (!ref) return {};
+    if (CFGetTypeID(ref) == CFStringGetTypeID()) {
+      auto str = static_cast<CFStringRef>(ref);
+      const char *ptr = CFStringGetCStringPtr(str, kCFStringEncodingUTF8);
+      if (ptr) return std::string(ptr);
+      char buf[256] = {};
+      if (CFStringGetCString(str, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+        return std::string(buf);
+      }
+    } else if (CFGetTypeID(ref) == CFDataGetTypeID()) {
+      auto data = static_cast<CFDataRef>(ref);
+      const auto len = CFDataGetLength(data);
+      const auto *bytes = reinterpret_cast<const char *>(CFDataGetBytePtr(data));
+      if (bytes && len > 0) {
+        std::size_t actual = static_cast<std::size_t>(len);
+        while (actual > 0 && bytes[actual - 1] == '\0') --actual;
+        return std::string(bytes, actual);
+      }
+    }
+    return {};
+  }
+
+  int cf_to_int(CFTypeRef ref) {
+    if (!ref) return 0;
+    if (CFGetTypeID(ref) == CFNumberGetTypeID()) {
+      int v = 0;
+      if (CFNumberGetValue(static_cast<CFNumberRef>(ref), kCFNumberIntType, &v)) return v;
+    } else if (CFGetTypeID(ref) == CFDataGetTypeID()) {
+      auto data = static_cast<CFDataRef>(ref);
+      if (CFDataGetLength(data) >= static_cast<CFIndex>(sizeof(std::uint32_t))) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, CFDataGetBytePtr(data), sizeof(v));
+        return static_cast<int>(v);
+      }
+    }
+    return 0;
+  }
+
+  struct gpu_static_info_t {
+    std::string model;
+    int core_count = 0;
+  };
+
+  gpu_static_info_t read_gpu_static_info() {
+    gpu_static_info_t out;
+    io_iterator_t services;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &services) != KERN_SUCCESS) {
+      return out;
+    }
+    for (io_object_t service; (service = IOIteratorNext(services)) != IO_OBJECT_NULL; IOObjectRelease(service)) {
+      if (out.model.empty()) {
+        if (CFTypeRef ref = IORegistryEntryCreateCFProperty(service, CFSTR("model"), kCFAllocatorDefault, 0)) {
+          out.model = cf_to_utf8(ref);
+          CFRelease(ref);
+        }
+      }
+      if (out.core_count == 0) {
+        if (CFTypeRef ref = IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0)) {
+          out.core_count = cf_to_int(ref);
+          CFRelease(ref);
+        }
+      }
+      if (!out.model.empty() && out.core_count > 0) {
+        IOObjectRelease(service);
+        break;
+      }
+    }
+    IOObjectRelease(services);
+    return out;
+  }
+
   class macos_host_stats_t: public platf::host_stats_provider_t {
   public:
     platf::host_stats_t sample() override {
@@ -225,10 +306,12 @@ namespace {
       out.cpu_model = sysctl_string("machdep.cpu.brand_string");
       if (out.cpu_model.empty()) out.cpu_model = sysctl_string("hw.model");
       out.cpu_logical_cores = sysctl_int("hw.logicalcpu");
+      out.cpu_perf_cores = sysctl_int("hw.perflevel0.physicalcpu");
+      out.cpu_eff_cores = sysctl_int("hw.perflevel1.physicalcpu");
       out.ram_total_bytes = sysctl_u64("hw.memsize");
-      // GPU model: best-effort via hw.model string (Apple Silicon collapses
-      // CPU + GPU under a single SoC name).
-      out.gpu_model = sysctl_string("hw.model");
+      const auto gpu_info = read_gpu_static_info();
+      out.gpu_model = !gpu_info.model.empty() ? gpu_info.model : out.cpu_model;
+      out.gpu_core_count = gpu_info.core_count;
       auto iface = pick_iface();
       out.net_interface = iface;
       out.net_link_speed_mbps = read_iface_link_speed_mbps(iface);
@@ -242,8 +325,12 @@ namespace {
       if (_have_cpu_baseline) {
         auto dt = t->total() - _last_cpu.total();
         auto db = t->busy() - _last_cpu.busy();
+        auto duser = (t->user - _last_cpu.user) + (t->nice - _last_cpu.nice);
+        auto dsys = t->system - _last_cpu.system;
         if (dt > 0) {
           out.cpu_percent = std::clamp(static_cast<float>(db) * 100.f / static_cast<float>(dt), 0.f, 100.f);
+          out.cpu_user_percent = std::clamp(static_cast<float>(duser) * 100.f / static_cast<float>(dt), 0.f, 100.f);
+          out.cpu_system_percent = std::clamp(static_cast<float>(dsys) * 100.f / static_cast<float>(dt), 0.f, 100.f);
         }
       }
       _last_cpu = *t;
@@ -263,10 +350,21 @@ namespace {
           continue;
         }
         if (CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
-          auto value = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, CFSTR("Device Utilization %")));
-          int percent = 0;
-          if (value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberIntType, &percent)) {
-            out.gpu_percent = std::max(out.gpu_percent, std::clamp(static_cast<float>(percent), 0.f, 100.f));
+          const auto read_pct = [&](CFStringRef key, float &dst) {
+            auto value = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, key));
+            int percent = 0;
+            if (value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberIntType, &percent)) {
+              dst = std::max(dst, std::clamp(static_cast<float>(percent), 0.f, 100.f));
+            }
+          };
+          read_pct(CFSTR("Device Utilization %"), out.gpu_percent);
+          read_pct(CFSTR("Renderer Utilization %"), out.gpu_renderer_percent);
+          read_pct(CFSTR("Tiler Utilization %"), out.gpu_tiler_percent);
+
+          auto mem_val = static_cast<CFNumberRef>(CFDictionaryGetValue(stats, CFSTR("In use system memory")));
+          std::int64_t mem_bytes = 0;
+          if (mem_val && CFGetTypeID(mem_val) == CFNumberGetTypeID() && CFNumberGetValue(mem_val, kCFNumberSInt64Type, &mem_bytes) && mem_bytes > 0) {
+            out.gpu_mem_in_use_bytes = std::max(out.gpu_mem_in_use_bytes, static_cast<std::uint64_t>(mem_bytes));
           }
         }
         CFRelease(stats);
@@ -276,9 +374,11 @@ namespace {
 
     void sample_memory(platf::host_stats_t &out) {
       auto m = read_memory();
-      if (!m) return;
-      out.ram_total_bytes = m->total_bytes;
-      out.ram_used_bytes = m->used_bytes;
+      if (m) {
+        out.ram_total_bytes = m->total_bytes;
+        out.ram_used_bytes = m->used_bytes;
+      }
+      out.process_footprint_bytes = read_process_footprint();
     }
 
     std::string pick_iface() {

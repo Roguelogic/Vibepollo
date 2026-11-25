@@ -22,10 +22,25 @@ final class HostStore: ObservableObject {
   @Published var logsText: String = ""
   @Published var steamInstalled: Bool = false
 
+  // Bounded 30-sample (~60s at 2s polling) live ring buffers for Monitor sparklines.
+  @Published var cpuHistory: [Double] = []
+  @Published var gpuHistory: [Double] = []
+  @Published var ramHistory: [Double] = []
+  @Published var netTxHistory: [Double] = []
+  @Published var streamFpsHistory: [Double] = []
+  @Published var streamEncodeMsHistory: [Double] = []
+
+  private static let maxHistorySamples = 30
+  private var lastTrackedSessionUUID: String?
+
   private var pollTimer: Timer?
   private var fastUpdateTimer: Timer?
   private var bannerDismissTask: Task<Void, Never>?
   private var settingsLoadedOnce = false
+
+  var isMonitorRoute: Bool {
+    currentRoute == .section(.monitor) || currentRoute == .telemetry
+  }
 
   var l10n: L10n {
     L10n(locale: settings.locale.isEmpty ? dashboard.locale : settings.locale)
@@ -51,23 +66,24 @@ final class HostStore: ObservableObject {
     case .logs:
       return l10n.pick("시스템 로그", "System Logs")
     case .telemetry:
-      return l10n.pick("리소스 및 세션 기록", "Resources & Session History")
+      return l10n.pick("모니터", "Monitor")
     }
   }
 
   private init() {}
 
   func navigate(to route: NavigationRoute) {
-    guard route != currentRoute else { return }
+    let normalized: NavigationRoute = (route == .telemetry) ? .section(.monitor) : route
+    guard normalized != currentRoute else { return }
     backStack.append(currentRoute)
     if backStack.count > 32 {
       backStack.removeFirst()
     }
     forwardStack.removeAll()
-    currentRoute = route
-    if route == .telemetry {
+    currentRoute = normalized
+    if isMonitorRoute {
       refreshLiveState()
-    } else if route == .softwareUpdate {
+    } else if normalized == .softwareUpdate {
       refreshSoftwareUpdate()
     } else {
       syncFastUpdatePolling()
@@ -82,7 +98,7 @@ final class HostStore: ObservableObject {
     guard let prev = backStack.popLast() else { return }
     forwardStack.append(currentRoute)
     currentRoute = prev
-    if prev == .telemetry {
+    if isMonitorRoute {
       refreshLiveState()
     } else if prev == .softwareUpdate {
       refreshSoftwareUpdate()
@@ -95,7 +111,7 @@ final class HostStore: ObservableObject {
     guard let next = forwardStack.popLast() else { return }
     backStack.append(currentRoute)
     currentRoute = next
-    if next == .telemetry {
+    if isMonitorRoute {
       refreshLiveState()
     } else if next == .softwareUpdate {
       refreshSoftwareUpdate()
@@ -146,6 +162,13 @@ final class HostStore: ObservableObject {
     apps.removeAll()
     backStack.removeAll()
     forwardStack.removeAll()
+    cpuHistory.removeAll()
+    gpuHistory.removeAll()
+    ramHistory.removeAll()
+    netTxHistory.removeAll()
+    streamFpsHistory.removeAll()
+    streamEncodeMsHistory.removeAll()
+    lastTrackedSessionUUID = nil
   }
 
   func handleRoute(_ route: String?) {
@@ -156,6 +179,8 @@ final class HostStore: ObservableObject {
     if lower.contains("pin") || lower.contains("pair") {
       navigate(to: .section(.devices))
       showPinSheet = true
+    } else if lower.contains("monitor") || lower.contains("telemetry") || lower.contains("stats") {
+      navigate(to: .section(.monitor))
     } else if lower.contains("update") {
       navigate(to: .softwareUpdate)
     } else if lower.contains("device") || lower.contains("client") {
@@ -180,14 +205,56 @@ final class HostStore: ObservableObject {
     steamInstalled = VibepolloHostBridge.shared().isSteamAvailable()
   }
 
+  private static func appendBounded(_ value: Double, to buffer: inout [Double]) {
+    buffer.append(value)
+    if buffer.count > maxHistorySamples {
+      buffer.removeFirst(buffer.count - maxHistorySamples)
+    }
+  }
+
   func refreshLiveState() {
+    let wantHostStats = isMonitorRoute
     let snapJSON = VibepolloHostBridge.shared().fetchDashboardSnapshotJSON(
-      includeHostStats: currentRoute == .telemetry
+      includeHostStats: wantHostStats
     )
     if let data = snapJSON.data(using: .utf8),
        let decoded = try? JSONDecoder().decode(DashboardSnapshot.self, from: data) {
       if self.dashboard != decoded {
         self.dashboard = decoded
+      }
+      if wantHostStats {
+        let hs = decoded.hostStats
+        if hs.cpuPercent >= 0 {
+          Self.appendBounded(min(max(hs.cpuPercent, 0), 100), to: &cpuHistory)
+        }
+        if hs.gpuPercent >= 0 {
+          Self.appendBounded(min(max(hs.gpuPercent, 0), 100), to: &gpuHistory)
+        }
+        if hs.ramUsedGB > 0 && hs.ramTotalGB > 0 {
+          let pct = min(max((hs.ramUsedGB / hs.ramTotalGB) * 100.0, 0), 100)
+          Self.appendBounded(pct, to: &ramHistory)
+        }
+        if let tx = hs.netTxMbps, tx >= 0 {
+          Self.appendBounded(tx, to: &netTxHistory)
+        }
+        if let first = decoded.sessions.first {
+          if lastTrackedSessionUUID != first.uuid {
+            streamFpsHistory.removeAll()
+            streamEncodeMsHistory.removeAll()
+            lastTrackedSessionUUID = first.uuid
+          }
+          if let fps = first.actualFps, fps >= 0 {
+            Self.appendBounded(fps, to: &streamFpsHistory)
+          }
+          let encMs = first.encodeP95Ms ?? first.encodeLatencyMs
+          if encMs > 0 {
+            Self.appendBounded(encMs, to: &streamEncodeMsHistory)
+          }
+        } else if lastTrackedSessionUUID != nil {
+          streamFpsHistory.removeAll()
+          streamEncodeMsHistory.removeAll()
+          lastTrackedSessionUUID = nil
+        }
       }
       if decoded.sessions.isEmpty || !decoded.deferredReloadPending {
         bannerDismissTask?.cancel()

@@ -2129,6 +2129,14 @@ namespace video {
     return state.failure_cache_key.has_value() && state.failure_count > 0;
   }
 
+  std::string active_encoder_name() {
+    const auto *enc = chosen_encoder;
+    if (enc && !enc->name.empty()) {
+      return std::string(enc->name);
+    }
+    return config::video.encoder;
+  }
+
 #ifdef _WIN32
   encoder_probe_adapter_hint_lease_t set_pending_virtual_display_adapter_hint(const LUID &adapter_luid) {
     auto &state = encoder_probe_cache_state();
