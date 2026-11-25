@@ -33,6 +33,36 @@ void macos_sc_set_cursor_visible(bool visible) {
   }
 }
 
+bool macos_sc_sample_screen_rect(CMSampleBufferRef sample_buffer, double *x, double *y, double *width, double *height) {
+  if (sample_buffer == NULL || x == NULL || y == NULL || width == NULL || height == NULL) {
+    return false;
+  }
+  if (@available(macOS 12.3, *)) {
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer, false);
+    if (attachments == NULL || CFArrayGetCount(attachments) == 0) {
+      return false;
+    }
+    CFDictionaryRef info = (CFDictionaryRef) CFArrayGetValueAtIndex(attachments, 0);
+    if (info == NULL) {
+      return false;
+    }
+    CFDictionaryRef rect_dict = (CFDictionaryRef) CFDictionaryGetValue(info, (__bridge const void *) SCStreamFrameInfoScreenRect);
+    if (rect_dict == NULL || CFGetTypeID(rect_dict) != CFDictionaryGetTypeID()) {
+      return false;
+    }
+    CGRect rect = CGRectZero;
+    if (!CGRectMakeWithDictionaryRepresentation(rect_dict, &rect)) {
+      return false;
+    }
+    *x = rect.origin.x;
+    *y = rect.origin.y;
+    *width = rect.size.width;
+    *height = rect.size.height;
+    return true;
+  }
+  return false;
+}
+
 /**
  * @brief One capture: a stream feeding a frame callback until the callback returns false.
  * @details ScreenCaptureKit delivers frames on sampleQueue, which stores the latest frame and

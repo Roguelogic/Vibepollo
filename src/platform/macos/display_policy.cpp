@@ -5,6 +5,7 @@
 // standard includes
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <system_error>
 #include <utility>
 
@@ -92,6 +93,102 @@ namespace platf::macos_display_policy {
     size.pixel_width = hidpi ? size.width * 2 : size.width;
     size.pixel_height = hidpi ? size.height * 2 : size.height;
     return size;
+  }
+
+  bool supports_hidpi_mode(const int pixel_width, const int pixel_height) {
+    if (pixel_width <= 0 || pixel_height <= 0) {
+      return false;
+    }
+    const int short_points = std::min(pixel_width / 2, pixel_height / 2);
+    return short_points >= minimum_hidpi_short_axis_points;
+  }
+
+  physical_size_mm_t virtual_display_physical_size_mm(const int width, const int height, const bool hidpi) {
+    const int base_w = std::max(2, width & ~1);
+    const int base_h = std::max(2, height & ~1);
+    const double ppi = hidpi ? 220.0 : 110.0;
+    double w_mm = (static_cast<double>(base_w) / ppi) * 25.4;
+    double h_mm = (static_cast<double>(base_h) / ppi) * 25.4;
+
+    const double min_w_mm = (base_w >= base_h) ? 208.0 : 175.0;
+    if (w_mm < min_w_mm && w_mm > 0.0) {
+      const double scale = min_w_mm / w_mm;
+      w_mm *= scale;
+      h_mm *= scale;
+    }
+
+    // macOS 26.1 refuses virtual displays whose declared area is under ~160 cm^2 (16,000 mm^2)
+    // when reserving > 2,000 px per axis. Keep a comfortable 180 cm^2 floor.
+    constexpr double min_area_mm2 = 18000.0;
+    const double area = w_mm * h_mm;
+    if (area < min_area_mm2 && area > 0.0) {
+      const double scale = std::sqrt(min_area_mm2 / area);
+      w_mm *= scale;
+      h_mm *= scale;
+    }
+
+    return {w_mm, h_mm};
+  }
+
+  std::optional<bootstrap_size_t> virtual_display_bootstrap_size(const int width, const int height) {
+    if (width <= 0 || height <= 0) {
+      return std::nullopt;
+    }
+    constexpr int max_long_edge = 3200;
+    constexpr int max_short_edge = 1800;
+    const bool landscape = width >= height;
+    const int limit_w = landscape ? max_long_edge : max_short_edge;
+    const int limit_h = landscape ? max_short_edge : max_long_edge;
+    if (width <= limit_w && height <= limit_h) {
+      return std::nullopt;
+    }
+    const double scale = std::min(
+      static_cast<double>(limit_w) / static_cast<double>(width),
+      static_cast<double>(limit_h) / static_cast<double>(height)
+    );
+    const int boot_w = std::max(2, static_cast<int>(std::floor(width * scale)) & ~1);
+    const int boot_h = std::max(2, static_cast<int>(std::floor(height * scale)) & ~1);
+    return bootstrap_size_t {boot_w, boot_h};
+  }
+
+  display_identity_t offset_display_identity(const std::uint32_t base_product_id, const std::uint32_t base_serial, const std::uint32_t offset) {
+    const std::uint32_t next_product = base_product_id + offset;
+    std::uint32_t next_serial = base_serial + offset;
+    if (next_serial == 0) {
+      next_serial = 1;
+    }
+    return {next_product, next_serial};
+  }
+
+  bool display_rect_t::approximately_equal(const display_rect_t &other, const double tolerance) const {
+    return std::abs(x - other.x) <= tolerance &&
+           std::abs(y - other.y) <= tolerance &&
+           std::abs(width - other.width) <= tolerance &&
+           std::abs(height - other.height) <= tolerance;
+  }
+
+  capture_source_check_t::capture_source_check_t(const clock::duration tolerance):
+      tolerance {tolerance} {
+  }
+
+  bool capture_source_check_t::mismatched(const display_rect_t &screen_rect, const display_rect_t &expected, const clock::time_point now) {
+    if (screen_rect.empty() || expected.empty() || screen_rect.approximately_equal(expected)) {
+      mismatch_since.reset();
+      return false;
+    }
+    if (!mismatch_since) {
+      mismatch_since = now;
+      return false;
+    }
+    if (now - *mismatch_since < tolerance) {
+      return false;
+    }
+    mismatch_since.reset();
+    return true;
+  }
+
+  void capture_source_check_t::reset() {
+    mismatch_since.reset();
   }
 
   std::optional<display_id_t> parse_display_identity(const std::string_view output_name) {

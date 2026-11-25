@@ -110,6 +110,79 @@ namespace platf::macos_display_policy {
    */
   display_size_t virtual_display_size(int width, int height, bool hidpi);
 
+  /// Physical display dimensions declared to CGVirtualDisplayDescriptor, in millimeters.
+  struct physical_size_mm_t {
+    double width_mm = 0.0;
+    double height_mm = 0.0;
+  };
+
+  /// Smallest short-axis logical point count macOS 26+ accepts for a 2x HiDPI virtual display mode.
+  inline constexpr int minimum_hidpi_short_axis_points = 526;
+
+  /// Returns whether a pixel mode can legally run as a 2x HiDPI virtual display on macOS 26+.
+  bool supports_hidpi_mode(int pixel_width, int pixel_height);
+
+  /**
+   * @brief Physical size in millimeters safe for macOS 26/27 CGVirtualDisplay creation and HiDPI defaults.
+   * @details Ensures area >= 180 cm^2 (macOS 26.1 refuses virtual displays under ~160 cm^2 when reserving
+   *          > 2000 px/axis) and declared width >= 208 mm landscape / 175 mm portrait (macOS 27 falls back
+   *          to 72 dpi / 1x under ~166 mm) while preserving exact aspect ratio.
+   */
+  physical_size_mm_t virtual_display_physical_size_mm(int width, int height, bool hidpi);
+
+  /// Conservative bootstrap pixel dimensions used when WindowServer rejects a large mode at creation.
+  struct bootstrap_size_t {
+    int width = 0;
+    int height = 0;
+  };
+
+  /**
+   * @brief Returns an axis-symmetric <= 3200x1800 bootstrap pixel size when the target exceeds it, or nullopt.
+   */
+  std::optional<bootstrap_size_t> virtual_display_bootstrap_size(int width, int height);
+
+  /// Virtual display product/serial pair after applying a poisoned-identity recovery offset.
+  struct display_identity_t {
+    std::uint32_t product_id = 0;
+    std::uint32_t serial_number = 0;
+  };
+
+  display_identity_t offset_display_identity(std::uint32_t base_product_id, std::uint32_t base_serial, std::uint32_t offset);
+
+  /// Global desktop rectangle in points (matches CGDisplayBounds and SCStreamFrameInfoScreenRect).
+  struct display_rect_t {
+    double x = 0.0;
+    double y = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+
+    bool empty() const {
+      return width <= 0.0 || height <= 0.0;
+    }
+
+    bool approximately_equal(const display_rect_t &other, double tolerance = 2.0) const;
+  };
+
+  /**
+   * @brief Detects when a running ScreenCaptureKit stream silently delivers frames from another display.
+   * @details After display sleep or multi-display reconfiguration, macOS can bind a stream to the wrong
+   *          display without reporting an error. Brief mismatches during drags/resizes are ignored; only a
+   *          sustained mismatch lasting at least `tolerance` triggers reattachment.
+   */
+  class capture_source_check_t {
+  public:
+    explicit capture_source_check_t(clock::duration tolerance);
+
+    /// Returns true once when `screen_rect` disagrees with `expected` for at least `tolerance`.
+    bool mismatched(const display_rect_t &screen_rect, const display_rect_t &expected, clock::time_point now);
+
+    void reset();
+
+  private:
+    clock::duration tolerance;
+    std::optional<clock::time_point> mismatch_since;
+  };
+
   /// The display a stream's touch port names (its output name is the display ID), if it names one.
   std::optional<display_id_t> parse_display_identity(std::string_view output_name);
 

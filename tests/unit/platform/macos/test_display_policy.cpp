@@ -370,3 +370,91 @@ TEST(MacosPointerDisplay, TwoRemoteMonitorsStayApart) {
   EXPECT_EQ(pointer_display(display_id_t {7}, is_remote, 1), 7u);
   EXPECT_EQ(pointer_display(display_id_t {8}, is_remote, 1), 8u);
 }
+
+TEST(MacosVirtualDisplayPhysicalSize, KeepsLargeDisplaysAtNaturalDensity) {
+  // iPad Pro M5 2752x2064 @2x (220 ppi -> 317.7x238.3 mm) stays untouched.
+  const auto ipad = virtual_display_physical_size_mm(2752, 2064, true);
+  EXPECT_NEAR(ipad.width_mm, 317.7, 0.5);
+  EXPECT_NEAR(ipad.height_mm, 238.3, 0.5);
+  EXPECT_GE(ipad.width_mm * ipad.height_mm, 18000.0);
+}
+
+TEST(MacosVirtualDisplayPhysicalSize, RaisesSmallPortraitAndLandscapeAboveMacos26And27Floors) {
+  // Portrait iPhone 1179x2556 @2x would be 136 mm wide (< 166 mm macOS 27 floor); must scale to >= 175 mm.
+  const auto iphone = virtual_display_physical_size_mm(1179, 2556, true);
+  EXPECT_GE(iphone.width_mm, 175.0);
+  EXPECT_GE(iphone.width_mm * iphone.height_mm, 18000.0);
+  EXPECT_NEAR(iphone.width_mm / iphone.height_mm, 1178.0 / 2556.0, 0.01);
+
+  // Small landscape 1334x750 @2x would be ~133 cm^2 (< 160 cm^2 macOS 26.1 floor) and < 166 mm wide.
+  const auto small_land = virtual_display_physical_size_mm(1334, 750, true);
+  EXPECT_GE(small_land.width_mm, 208.0);
+  EXPECT_GE(small_land.width_mm * small_land.height_mm, 18000.0);
+  EXPECT_NEAR(small_land.width_mm / small_land.height_mm, 1334.0 / 750.0, 0.01);
+}
+
+TEST(MacosVirtualDisplayHiDPI, EnforcesMinimum526PointShortAxis) {
+  EXPECT_TRUE(supports_hidpi_mode(2752, 2064));
+  EXPECT_TRUE(supports_hidpi_mode(1179, 2556));  // 589pt short axis
+  EXPECT_TRUE(supports_hidpi_mode(1052, 1052));  // exact 526pt boundary
+  EXPECT_FALSE(supports_hidpi_mode(1050, 2000));  // 525pt short axis refused by macOS 26+
+  EXPECT_FALSE(supports_hidpi_mode(750, 1334));   // 375pt short axis
+}
+
+TEST(MacosVirtualDisplayBootstrap, OnlyTriggersAbove3200x1800Envelope) {
+  EXPECT_FALSE(virtual_display_bootstrap_size(2560, 1600).has_value());
+  EXPECT_FALSE(virtual_display_bootstrap_size(3200, 1800).has_value());
+  EXPECT_FALSE(virtual_display_bootstrap_size(1800, 3200).has_value());
+
+  const auto uhd = virtual_display_bootstrap_size(3840, 2160);
+  ASSERT_TRUE(uhd.has_value());
+  EXPECT_LE(uhd->width, 3200);
+  EXPECT_LE(uhd->height, 1800);
+  EXPECT_EQ(uhd->width % 2, 0);
+  EXPECT_EQ(uhd->height % 2, 0);
+
+  const auto portrait5k = virtual_display_bootstrap_size(2880, 5120);
+  ASSERT_TRUE(portrait5k.has_value());
+  EXPECT_LE(portrait5k->width, 1800);
+  EXPECT_LE(portrait5k->height, 3200);
+  EXPECT_EQ(portrait5k->width % 2, 0);
+  EXPECT_EQ(portrait5k->height % 2, 0);
+}
+
+TEST(MacosDisplayIdentityOffset, BumpsProductAndSerialWithoutHittingZero) {
+  const auto base = offset_display_identity(0x0001u, 0x0001u, 0u);
+  EXPECT_EQ(base.product_id, 0x0001u);
+  EXPECT_EQ(base.serial_number, 0x0001u);
+
+  const auto bumped = offset_display_identity(0x0001u, 0x0001u, 2u);
+  EXPECT_EQ(bumped.product_id, 0x0003u);
+  EXPECT_EQ(bumped.serial_number, 0x0003u);
+
+  const auto wrapped = offset_display_identity(0x0001u, 0xFFFFFFFFu, 1u);
+  EXPECT_EQ(wrapped.serial_number, 1u);
+}
+
+TEST(MacosCaptureSourceCheck, IgnoresBriefDisagreementAndTriggersAfterTolerance) {
+  capture_source_check_t check {1500ms};
+  const auto t0 = clock::time_point {};
+  const display_rect_t own {1440.0, 0.0, 1376.0, 1032.0};
+  const display_rect_t own_subpixel {1440.5, 0.0, 1375.5, 1032.0};
+  const display_rect_t other {0.0, 0.0, 1440.0, 900.0};
+
+  EXPECT_FALSE(check.mismatched(own, own, t0));
+  EXPECT_FALSE(check.mismatched(own_subpixel, own, t0 + 250ms));
+
+  // Brief mismatch during a drag/resize clears when own rect resumes.
+  EXPECT_FALSE(check.mismatched(other, own, t0 + 500ms));
+  EXPECT_FALSE(check.mismatched(other, own, t0 + 1500ms));
+  EXPECT_FALSE(check.mismatched(own, own, t0 + 1800ms));
+
+  // Sustained mismatch lasting >= 1500ms fires once and resets.
+  EXPECT_FALSE(check.mismatched(other, own, t0 + 2000ms));
+  EXPECT_FALSE(check.mismatched(other, own, t0 + 3400ms));
+  EXPECT_TRUE(check.mismatched(other, own, t0 + 3500ms));
+  EXPECT_FALSE(check.mismatched(other, own, t0 + 3600ms));
+
+  // Empty rects never falsely trigger.
+  EXPECT_FALSE(check.mismatched(display_rect_t {}, own, t0 + 6000ms));
+}

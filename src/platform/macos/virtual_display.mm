@@ -110,6 +110,11 @@ namespace platf::macos_virtual_display {
     constexpr unsigned int product_id = 0x0001;
     constexpr unsigned int serial_number = 0x0001;
 
+    // If macOS persists a hostile/unusable state for a (vendor, product, serial) identity (for
+    // example after system "Stop Extending"), remember the working offset so reconnects skip it.
+    std::mutex identity_offsets_mutex;
+    std::map<unsigned int, unsigned int> identity_offsets;
+
     // A mode's transfer function, on macOS versions that take one. 1 makes the display HDR: macOS
     // then gives it EDR headroom, as it does an HDR monitor. 0, the default, is SDR. The values are
     // undocumented; these were found by testing on macOS 27.
@@ -541,6 +546,48 @@ namespace platf::macos_virtual_display {
       return true;
     }
 
+    void ensure_not_mirrored(const CGDirectDisplayID id) {
+      if (id == kCGNullDirectDisplay) {
+        return;
+      }
+      // CGDisplayIsInMirrorSet returns 1 for mirrored, 0 for not mirrored, and -1 for unknown IDs.
+      // Compare explicitly against 1 so an unregistered ID is never treated as mirrored.
+      if (CGDisplayIsInMirrorSet(id) != 1) {
+        return;
+      }
+      CGDisplayConfigRef config = nullptr;
+      if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) {
+        return;
+      }
+      CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay);
+      for (const auto other : display_list(CGGetActiveDisplayList)) {
+        if (other != id && CGDisplayMirrorsDisplay(other) == id) {
+          CGConfigureDisplayMirrorOfDisplay(config, other, kCGNullDirectDisplay);
+        }
+      }
+      // Session scope (not permanent): permanent mirror reconfiguration of a private CGVirtualDisplay
+      // fails with kCGErrorIllegalArgument, whereas session scope reliably dissolves the mirror set.
+      const CGError err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+      BOOST_LOG(info) << "Virtual display: display "sv << id << " was in a mirror set; detached to extend (result "sv << err << ')';
+    }
+
+    void log_if_unit_number_clashes(const CGDirectDisplayID id) {
+      if (id == kCGNullDirectDisplay) {
+        return;
+      }
+      const std::uint32_t unit = CGDisplayUnitNumber(id);
+      if (unit == UINT32_MAX) {
+        return;
+      }
+      for (const auto other : display_list(CGGetOnlineDisplayList)) {
+        if (other != id && CGDisplayUnitNumber(other) == unit) {
+          BOOST_LOG(warning) << "Virtual display: display "sv << id << " shares CGDisplayUnitNumber "sv << unit
+                             << " with online display "sv << other << "; capture source verification will reattach if macOS cross-binds them"sv;
+          return;
+        }
+      }
+    }
+
     void make_main(const CGDirectDisplayID id) {
       // The display at (0, 0) is the main one; keep the others to its right in their current order.
       const auto others = display_list(CGGetActiveDisplayList);
@@ -734,6 +781,12 @@ namespace platf::macos_virtual_display {
 
       if (configured_scale <= 0 || configured_scale == 200) {
         const auto size = macos_display_policy::virtual_display_size(width, height, true);
+        if (!macos_display_policy::supports_hidpi_mode(size.pixel_width, size.pixel_height)) {
+          g.hidpi = false;
+          g.mode_width = g.pixel_width = base_w;
+          g.mode_height = g.pixel_height = base_h;
+          return g;
+        }
         g.mode_width = size.width;
         g.mode_height = size.height;
         g.pixel_width = size.pixel_width;
@@ -749,6 +802,12 @@ namespace platf::macos_virtual_display {
       if (lh * 2 > max_pixels_high) {
         lh = (max_pixels_high / 2) & ~1u;
         lw = std::clamp(round_even(static_cast<double>(lh) * base_w / base_h), 640u, cap_lw);
+      }
+      if (std::min(lw, lh) < static_cast<unsigned int>(macos_display_policy::minimum_hidpi_short_axis_points)) {
+        g.hidpi = false;
+        g.mode_width = g.pixel_width = base_w;
+        g.mode_height = g.pixel_height = base_h;
+        return g;
       }
       g.mode_width = lw;
       g.mode_height = lh;
@@ -858,43 +917,143 @@ namespace platf::macos_virtual_display {
 
       const int configured_scale = config::video.dd.virtual_display_scale_percent;
       const auto geom = compute_scale_geometry(width, height, max_pixel_width, max_pixel_height, configured_scale);
+      const auto phys_mm = macos_display_policy::virtual_display_physical_size_mm(width, height, geom.hidpi);
+      const auto bootstrap_size = macos_display_policy::virtual_display_bootstrap_size(width, height);
 
-      CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
-      descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
-      descriptor.name = name;
-      descriptor.maxPixelsWide = max_pixel_width;
-      descriptor.maxPixelsHigh = max_pixel_height;
-      // Only informs macOS's defaults: a Retina or a standard pixel density to match the mode.
-      const double ppi = geom.hidpi ? 220.0 : 110.0;
-      descriptor.sizeInMillimeters = CGSizeMake(base_w / ppi * 25.4, base_h / ppi * 25.4);
-      descriptor.vendorID = vendor_id;
-      descriptor.productID = product_id;
-      descriptor.serialNum = serial;
-      if (make_hdr) {
-        // A wide gamut, as on Apple's HDR displays: Display P3 primaries and a D65 white point.
-        descriptor.redPrimary = CGPointMake(0.680, 0.320);
-        descriptor.greenPrimary = CGPointMake(0.265, 0.690);
-        descriptor.bluePrimary = CGPointMake(0.150, 0.060);
-        descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
+      unsigned int base_offset = 0;
+      {
+        std::lock_guard lock {identity_offsets_mutex};
+        if (const auto it = identity_offsets.find(serial); it != identity_offsets.end()) {
+          base_offset = it->second;
+        }
       }
-      // VirtualDisplayClient invokes terminationHandler with scalar status arguments when
-      // WindowServer exits; __unsafe_unretained prevents ARC from calling objc_retain on them.
-      descriptor.terminationHandler = ^(__unsafe_unretained id, __unsafe_unretained id) {
-        BOOST_LOG(warning) << "Virtual display: macOS removed the virtual display"sv;
+
+      struct create_attempt_t {
+        std::unique_ptr<virtual_display_t> display;
+        bool poisoned_identity = false;
       };
 
-      auto result = std::make_unique<virtual_display_t>();
-      result->display = [[display_class alloc] initWithDescriptor:descriptor];
-      if (!result->display) {
-        BOOST_LOG(error) << "Virtual display: macOS refused to create it"sv;
+      const auto try_create_once = [&](const macos_display_policy::display_identity_t ident, const bool use_bootstrap, const std::chrono::milliseconds online_timeout) -> create_attempt_t {
+        create_attempt_t attempt;
+        CGVirtualDisplayDescriptor *descriptor = [[descriptor_class alloc] init];
+        descriptor.queue = dispatch_queue_create("dev.vibepollo.virtual-display", DISPATCH_QUEUE_SERIAL);
+        descriptor.name = name;
+        descriptor.maxPixelsWide = max_pixel_width;
+        descriptor.maxPixelsHigh = max_pixel_height;
+        descriptor.sizeInMillimeters = CGSizeMake(phys_mm.width_mm, phys_mm.height_mm);
+        descriptor.vendorID = vendor_id;
+        descriptor.productID = ident.product_id;
+        descriptor.serialNum = ident.serial_number;
+        if (make_hdr) {
+          // A wide gamut, as on Apple's HDR displays: Display P3 primaries and a D65 white point.
+          descriptor.redPrimary = CGPointMake(0.680, 0.320);
+          descriptor.greenPrimary = CGPointMake(0.265, 0.690);
+          descriptor.bluePrimary = CGPointMake(0.150, 0.060);
+          descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
+        }
+        // VirtualDisplayClient invokes terminationHandler with scalar status arguments when
+        // WindowServer exits; __unsafe_unretained prevents ARC from calling objc_retain on them.
+        descriptor.terminationHandler = ^(__unsafe_unretained id, __unsafe_unretained id) {
+          BOOST_LOG(warning) << "Virtual display: macOS removed the virtual display"sv;
+        };
+
+        auto candidate = std::make_unique<virtual_display_t>();
+        candidate->display = [[display_class alloc] initWithDescriptor:descriptor];
+        if (!candidate->display) {
+          BOOST_LOG(error) << "Virtual display: macOS refused to create it (serial "sv << ident.serial_number << ')';
+          return attempt;
+        }
+
+        if (use_bootstrap && bootstrap_size) {
+          const auto boot_geom = compute_scale_geometry(
+            bootstrap_size->width,
+            bootstrap_size->height,
+            max_pixel_width,
+            max_pixel_height,
+            configured_scale
+          );
+          if (!apply_virtual_display_settings(
+                candidate->display,
+                bootstrap_size->width,
+                bootstrap_size->height,
+                max_pixel_width,
+                max_pixel_height,
+                refresh,
+                make_hdr,
+                boot_geom
+              )) {
+            BOOST_LOG(warning) << "Virtual display: bootstrap mode "sv << bootstrap_size->width << 'x' << bootstrap_size->height << " rejected"sv;
+            return attempt;
+          }
+          candidate->id = candidate->display.displayID;
+          if (!wait_until([id = candidate->id]() {
+                return is_active(id);
+              },
+                          online_timeout)) {
+            attempt.poisoned_identity = true;
+            return attempt;
+          }
+          if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
+            BOOST_LOG(error) << "Virtual display: macOS rejected promoted mode "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
+            return attempt;
+          }
+        } else {
+          if (!apply_virtual_display_settings(candidate->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
+            BOOST_LOG(error) << "Virtual display: macOS rejected "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
+            return attempt;
+          }
+          candidate->id = candidate->display.displayID;
+          if (!wait_until([id = candidate->id]() {
+                return is_active(id);
+              },
+                          online_timeout)) {
+            attempt.poisoned_identity = true;
+            return attempt;
+          }
+        }
+
+        attempt.display = std::move(candidate);
+        return attempt;
+      };
+
+      std::unique_ptr<virtual_display_t> result;
+      constexpr unsigned int max_identity_probes = 3;
+      for (unsigned int probe = 0; probe < max_identity_probes; ++probe) {
+        const unsigned int total_offset = base_offset + probe;
+        const auto ident = macos_display_policy::offset_display_identity(product_id, serial, total_offset);
+        const auto timeout = (probe + 1 == max_identity_probes) ? 5000ms : 3000ms;
+
+        auto attempt = try_create_once(ident, false, timeout);
+        if (!attempt.display && bootstrap_size) {
+          BOOST_LOG(warning) << "Virtual display: direct creation for "sv << width << 'x' << height
+                             << " failed; retrying via conservative bootstrap "sv
+                             << bootstrap_size->width << 'x' << bootstrap_size->height;
+          attempt = try_create_once(ident, true, 3000ms);
+        }
+        if (attempt.display) {
+          result = std::move(attempt.display);
+          if (probe > 0) {
+            std::lock_guard lock {identity_offsets_mutex};
+            identity_offsets[serial] = total_offset;
+            BOOST_LOG(warning) << "Virtual display: recovered from poisoned macOS display identity for serial "sv
+                               << serial << " using offset +"sv << total_offset
+                               << " (product "sv << ident.product_id << ", serial "sv << ident.serial_number << ')';
+          }
+          break;
+        }
+        if (!attempt.poisoned_identity) {
+          break;
+        }
+        BOOST_LOG(warning) << "Virtual display: identity (product "sv << ident.product_id
+                           << ", serial "sv << ident.serial_number
+                           << ") never came online; probing fresh identity"sv;
+      }
+
+      if (!result) {
+        BOOST_LOG(error) << "Virtual display: it never came online"sv;
         return nullptr;
       }
 
-      if (!apply_virtual_display_settings(result->display, width, height, max_pixel_width, max_pixel_height, refresh, make_hdr, geom)) {
-        BOOST_LOG(error) << "Virtual display: macOS rejected "sv << geom.mode_width << 'x' << geom.mode_height << '@' << refresh << "Hz"sv;
-        return nullptr;
-      }
-      result->id = result->display.displayID;
       result->width = width;
       result->height = height;
       result->max_pixels_wide = max_pixel_width;
@@ -908,14 +1067,8 @@ namespace platf::macos_virtual_display {
       result->default_pixel_width = geom.pixel_width;
       result->default_pixel_height = geom.pixel_height;
 
-      if (!wait_until([id = result->id]() {
-            return is_active(id);
-          },
-                      5s)) {
-        BOOST_LOG(error) << "Virtual display: it never came online"sv;
-        return nullptr;
-      }
-
+      ensure_not_mirrored(result->id);
+      log_if_unit_number_clashes(result->id);
       ensure_retina_mode(*result);
       // In exclusive layout, apply_layout() immediately turns off all other displays right after
       // make_display() returns, so polling other_modes for 1000ms here only stalls connection startup.
@@ -943,6 +1096,7 @@ namespace platf::macos_virtual_display {
       result->height = config.height;
       result->refresh = refresh;
       apply_layout(*result);
+      ensure_not_mirrored(result->id);
       // Turning off physical displays activates macOS's single-display profile, which may default
       // back to 1x non-Retina; re-verify and enforce Retina HiDPI after layout settles.
       ensure_retina_mode(*result);
@@ -1509,6 +1663,7 @@ namespace platf::macos_virtual_display {
           enforce_exclusive_layout(*current, std::chrono::steady_clock::now());
         }
         if (current) {
+          ensure_not_mirrored(current->id);
           if (displays_changed) {
             keep_created_mode(*current);
           } else if (is_active(current->id)) {
@@ -1520,6 +1675,7 @@ namespace platf::macos_virtual_display {
         std::lock_guard lock {remote_mutex};
         for (auto &[_, remote] : remote_displays) {
           if (remote.display) {
+            ensure_not_mirrored(remote.display->id);
             if (displays_changed) {
               keep_created_mode(*remote.display);
             } else if (is_active(remote.display->id)) {

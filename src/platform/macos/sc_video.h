@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <CoreMedia/CoreMedia.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,9 @@ void macos_pen_hover_cursor_show(double cg_x, double cg_y, float distance_norm, 
 
 /// Hides the stylus hover reticle immediately.
 void macos_pen_hover_cursor_hide(void);
+
+/// Extracts SCStreamFrameInfoScreenRect (in global display points) from a ScreenCaptureKit sample buffer.
+bool macos_sc_sample_screen_rect(CMSampleBufferRef sample_buffer, double *x, double *y, double *width, double *height);
 #ifdef __cplusplus
 }
 #endif

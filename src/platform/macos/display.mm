@@ -508,6 +508,11 @@ namespace platf {
       bool stopped = false;
       bool delivered = false;
       bool scale_reinit = false;
+      bool source_mismatch = false;
+      macos_display_policy::display_rect_t mismatched_rect {};
+      macos_display_policy::display_rect_t expected_rect {};
+      macos_display_policy::capture_source_check_t source_check {1500ms};
+      std::chrono::steady_clock::time_point last_source_check {};
       std::chrono::steady_clock::time_point last_frame = std::chrono::steady_clock::now();
     };
 
@@ -567,6 +572,7 @@ namespace platf {
     std::pair<std::size_t, std::size_t> captured_pixels;  ///< The display's mode when capture was set up.
     std::atomic<bool> lock_cpu_pixels {false};
     std::atomic<bool> need_bootstrap_sample {true};
+    std::atomic<int> wrong_source_reattaches {0};
     std::mutex latest_sample_mutex;
     CMSampleBufferRef latest_sample = nullptr;
 
@@ -675,6 +681,38 @@ namespace platf {
           }
         }
 
+        // Verify at ~4 Hz that ScreenCaptureKit is still delivering this display's bounds rather
+        // than silently delivering another display after sleep or virtual display recreation.
+        constexpr int max_wrong_source_reattaches = 3;
+        const auto now = std::chrono::steady_clock::now();
+        if (wrong_source_reattaches.load(std::memory_order_relaxed) < max_wrong_source_reattaches &&
+            (state->last_source_check == std::chrono::steady_clock::time_point {} ||
+             now - state->last_source_check >= 250ms)) {
+          state->last_source_check = now;
+          if (!macos_virtual_display::display_changes_settled()) {
+            state->source_check.reset();
+          } else {
+            double rx = 0.0, ry = 0.0, rw = 0.0, rh = 0.0;
+            if (macos_sc_sample_screen_rect(sampleBuffer, &rx, &ry, &rw, &rh)) {
+              const CGRect bounds = CGDisplayBounds(display_id);
+              const macos_display_policy::display_rect_t frame_rect {rx, ry, rw, rh};
+              const macos_display_policy::display_rect_t expected_rect {
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height
+              };
+              if (state->source_check.mismatched(frame_rect, expected_rect, now)) {
+                state->stopped = true;
+                state->source_mismatch = true;
+                state->mismatched_rect = frame_rect;
+                state->expected_rect = expected_rect;
+                return false;
+              }
+            }
+          }
+        }
+
         if (need_bootstrap_sample.load(std::memory_order_relaxed) &&
             need_bootstrap_sample.exchange(false, std::memory_order_relaxed)) {
           std::lock_guard sample_lock {latest_sample_mutex};
@@ -767,6 +805,17 @@ namespace platf {
       if (state->scale_reinit) {
         BOOST_LOG(info) << "Display "sv << display_id << " backing scale changed; setting up capture again"sv;
         return capture_e::reinit;
+      }
+      if (state->source_mismatch) {
+        const int count = wrong_source_reattaches.fetch_add(1, std::memory_order_relaxed) + 1;
+        BOOST_LOG(warning) << "Capture of display "sv << display_id << " delivered frames from ("sv
+                           << state->mismatched_rect.x << ',' << state->mismatched_rect.y << ' '
+                           << state->mismatched_rect.width << 'x' << state->mismatched_rect.height
+                           << ") instead of expected ("sv
+                           << state->expected_rect.x << ',' << state->expected_rect.y << ' '
+                           << state->expected_rect.width << 'x' << state->expected_rect.height
+                           << "); reattaching capture ("sv << count << "/3)"sv;
+        return restart_status();
       }
       if (!state->stopped) {
         state->stopped = true;
