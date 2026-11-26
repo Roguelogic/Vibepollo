@@ -21,6 +21,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Dashboard & Live Sessions
 - (NSString *)fetchDashboardSnapshotJSON;
+- (NSDictionary<NSString *, id> *)fetchMenuBarPopoverSnapshot;
 - (void)openScreenCapturePrivacySettings;
 - (void)openAccessibilityPrivacySettings;
 - (BOOL)pairWithPIN:(NSString *)pin deviceName:(NSString *)deviceName;

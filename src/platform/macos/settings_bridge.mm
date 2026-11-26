@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <csignal>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -168,41 +170,85 @@ namespace {
     return false;
   }
 
-  struct live_rate_sample_t {
+  struct rate_point_t {
+    std::chrono::steady_clock::time_point at {};
     std::uint64_t frames_sent = 0;
     std::uint64_t bytes_sent = 0;
-    std::chrono::steady_clock::time_point sampled_at {};
+  };
+
+  struct live_rate_result_t {
     double actual_fps = 0.0;
     double actual_bitrate_kbps = 0.0;
+    double encode_latency_ms = 0.0;
+    bool has_rate = false;
+  };
+
+  struct live_rate_entry_t {
+    std::deque<rate_point_t> samples;
+    double actual_fps = 0.0;
+    double actual_bitrate_kbps = 0.0;
+    double smoothed_encode_ms = 0.0;
+    bool has_rate = false;
   };
 
   struct live_rate_tracker_t {
     std::mutex mutex;
-    std::unordered_map<std::string, live_rate_sample_t> entries;
+    std::unordered_map<std::string, live_rate_entry_t> entries;
 
-    std::pair<double, double> update(const std::string &uuid, std::uint64_t frames_sent, std::uint64_t bytes_sent) {
+    live_rate_result_t update(
+      const std::string &uuid,
+      std::uint64_t frames_sent,
+      std::uint64_t bytes_sent,
+      double raw_encode_ms
+    ) {
+      using namespace std::chrono_literals;
       std::lock_guard lg {mutex};
       const auto now = std::chrono::steady_clock::now();
       auto &entry = entries[uuid];
-      if (entry.sampled_at != std::chrono::steady_clock::time_point {}) {
-        const double dt = std::chrono::duration<double>(now - entry.sampled_at).count();
-        if (dt >= 0.25) {
-          if (frames_sent >= entry.frames_sent) {
-            entry.actual_fps = static_cast<double>(frames_sent - entry.frames_sent) / dt;
-          }
-          if (bytes_sent >= entry.bytes_sent) {
-            entry.actual_bitrate_kbps = (static_cast<double>(bytes_sent - entry.bytes_sent) * 8.0) / (dt * 1000.0);
-          }
-          entry.frames_sent = frames_sent;
-          entry.bytes_sent = bytes_sent;
-          entry.sampled_at = now;
+
+      if (!entry.samples.empty()) {
+        const auto &last = entry.samples.back();
+        if ((now - last.at) > 2500ms || frames_sent < last.frames_sent || bytes_sent < last.bytes_sent) {
+          entry.samples.clear();
+          entry.actual_fps = 0.0;
+          entry.actual_bitrate_kbps = 0.0;
+          entry.smoothed_encode_ms = 0.0;
+          entry.has_rate = false;
         }
-      } else {
-        entry.frames_sent = frames_sent;
-        entry.bytes_sent = bytes_sent;
-        entry.sampled_at = now;
       }
-      return {entry.actual_fps, entry.actual_bitrate_kbps};
+
+      const bool new_frames = entry.samples.empty() || frames_sent > entry.samples.back().frames_sent;
+      if (raw_encode_ms > 0.0) {
+        if (entry.smoothed_encode_ms <= 0.0) {
+          entry.smoothed_encode_ms = raw_encode_ms;
+        } else if (new_frames) {
+          entry.smoothed_encode_ms = entry.smoothed_encode_ms * 0.65 + raw_encode_ms * 0.35;
+        }
+      }
+
+      if (entry.samples.empty() || (now - entry.samples.back().at) >= 50ms) {
+        entry.samples.push_back({now, frames_sent, bytes_sent});
+        // Maintain a ~0.75s sliding window: fast 0.25s step responsiveness without +/-4 fps jitter.
+        while (entry.samples.size() > 2 && (now - entry.samples[1].at) >= 750ms) {
+          entry.samples.pop_front();
+        }
+        if (entry.samples.size() >= 2) {
+          const auto &oldest = entry.samples.front();
+          const double dt = std::chrono::duration<double>(now - oldest.at).count();
+          if (dt >= 0.15) {
+            entry.actual_fps = static_cast<double>(frames_sent - oldest.frames_sent) / dt;
+            entry.actual_bitrate_kbps = (static_cast<double>(bytes_sent - oldest.bytes_sent) * 8.0) / (dt * 1000.0);
+            entry.has_rate = true;
+          }
+        }
+      }
+
+      return {
+        entry.actual_fps,
+        entry.actual_bitrate_kbps,
+        entry.smoothed_encode_ms > 0.0 ? entry.smoothed_encode_ms : raw_encode_ms,
+        entry.has_rate,
+      };
     }
 
     void prune_except(const std::set<std::string> &active_uuids) {
@@ -220,6 +266,15 @@ namespace {
   live_rate_tracker_t &live_rate_tracker() {
     static live_rate_tracker_t instance;
     return instance;
+  }
+
+  const std::string &cached_fallback_hostname() {
+    static const std::string hostname = []() {
+      boost::system::error_code ec;
+      const std::string hn = boost::asio::ip::host_name(ec);
+      return (ec || hn.empty()) ? std::string("Mac") : hn;
+    }();
+    return hostname;
   }
 
   nlohmann::json runtime_spec_to_json(const platf::vt::runtime_spec_t &spec) {
@@ -350,22 +405,30 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   out["appRunning"] = app_running;
   out["runningAppName"] = app_running ? proc::proc.get_last_run_app_name() : "";
 
+  const auto sessions = stream::get_all_session_info();
   std::unordered_map<std::string, session_history::active_session_t> history_active_by_uuid;
-  for (const auto &as : session_history::get_active_sessions()) {
-    history_active_by_uuid[as.uuid] = as;
-  }
+  bool loaded_history = false;
 
   std::set<std::string> live_uuids;
   nlohmann::json sessions_json = nlohmann::json::array();
-  for (const auto &s : stream::get_all_session_info()) {
+  for (const auto &s : sessions) {
     live_uuids.insert(s.uuid);
-    const auto [delta_fps, delta_bitrate_kbps] = live_rate_tracker().update(s.uuid, s.frames_sent, s.bytes_sent);
-    double actual_fps = delta_fps;
-    double actual_bitrate_kbps = delta_bitrate_kbps;
-    if (const auto it = history_active_by_uuid.find(s.uuid); it != history_active_by_uuid.end()) {
-      if (it->second.actual_fps > 0.0 || it->second.actual_bitrate_kbps > 0.0) {
-        actual_fps = it->second.actual_fps;
-        actual_bitrate_kbps = it->second.actual_bitrate_kbps;
+    const double raw_encode_ms = s.frames_sent > 0 ? s.encode_latency_ms : 0.0;
+    const auto live = live_rate_tracker().update(s.uuid, s.frames_sent, s.bytes_sent, raw_encode_ms);
+    double actual_fps = live.actual_fps;
+    double actual_bitrate_kbps = live.actual_bitrate_kbps;
+    if (!live.has_rate) {
+      if (!loaded_history) {
+        for (const auto &as : session_history::get_active_sessions()) {
+          history_active_by_uuid[as.uuid] = as;
+        }
+        loaded_history = true;
+      }
+      if (const auto it = history_active_by_uuid.find(s.uuid); it != history_active_by_uuid.end()) {
+        if (it->second.actual_fps > 0.0 || it->second.actual_bitrate_kbps > 0.0) {
+          actual_fps = it->second.actual_fps;
+          actual_bitrate_kbps = it->second.actual_bitrate_kbps;
+        }
       }
     }
 
@@ -384,7 +447,7 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
     item["bitDepth"] = s.dynamic_range != 0 ? 10 : 8;
     item["yuv444"] = s.yuv444;
     item["directUsb"] = s.direct_usb;
-    item["encodeLatencyMs"] = s.timing.captured_frames == 0 ? 0.0 : s.encode_latency_ms;
+    item["encodeLatencyMs"] = live.encode_latency_ms;
     if (s.timing.encode_p95_ms >= 0) {
       item["captureToSubmitP95Ms"] = s.timing.capture_to_submit_p95_ms;
       item["encodeP95Ms"] = s.timing.encode_p95_ms;
@@ -426,6 +489,101 @@ extern "C" void vibepollo_register_macos_native_ui(void) {
   out["availableUpdateVersion"] = upd_available ? upd.available_release.version : "";
 
   return to_nsstring(out.dump());
+}
+
+- (NSDictionary<NSString *, id> *)fetchMenuBarPopoverSnapshot {
+  std::string locale;
+  std::string host_name;
+  {
+    auto read_gate = config::acquire_apply_read_gate();
+    locale = config::sunshine.locale;
+    host_name = !config::nvhttp.sunshine_name.empty()
+                  ? config::nvhttp.sunshine_name
+                  : cached_fallback_hostname();
+  }
+
+  const bool app_running = proc::proc.current_app_id() > 0;
+  const auto sessions = stream::get_all_session_info();
+
+  if (!sessions.empty()) {
+    const auto &s = sessions.front();
+    std::set<std::string> live_uuids;
+    for (const auto &item : sessions) {
+      live_uuids.insert(item.uuid);
+    }
+
+    const double raw_encode_ms = s.frames_sent > 0 ? s.encode_latency_ms : 0.0;
+    const auto live = live_rate_tracker().update(s.uuid, s.frames_sent, s.bytes_sent, raw_encode_ms);
+    live_rate_tracker().prune_except(live_uuids);
+
+    double actual_fps = live.actual_fps;
+    double actual_bitrate_kbps = live.actual_bitrate_kbps;
+    bool has_rate = live.has_rate;
+
+    // Cold-start seed on the very first 0ms frame when the popover opens mid-stream.
+    // Subsequent 4Hz ticks always use lock-free live deltas directly.
+    if (!has_rate) {
+      for (const auto &as : session_history::get_active_sessions()) {
+        if (as.uuid == s.uuid && (as.actual_fps > 0.0 || as.actual_bitrate_kbps > 0.0)) {
+          actual_fps = as.actual_fps;
+          actual_bitrate_kbps = as.actual_bitrate_kbps;
+          has_rate = true;
+          break;
+        }
+      }
+    }
+
+    const auto runtime_spec = platf::vt::current_runtime_spec();
+    const double encode_ms = live.encode_latency_ms > 0.0
+                               ? live.encode_latency_ms
+                               : (s.timing.encode_p95_ms > 0.0 ? s.timing.encode_p95_ms : 0.0);
+    const double display_fps = has_rate ? actual_fps : static_cast<double>(s.fps);
+    const double display_mbps = has_rate
+                                  ? (actual_bitrate_kbps / 1000.0)
+                                  : (static_cast<double>(s.encoder_bitrate_kbps) / 1000.0);
+
+    return @{
+      @"locale": to_nsstring(locale),
+      @"appRunning": @(app_running),
+      @"streaming": @YES,
+      @"deviceName": to_nsstring(s.device_name.empty() ? "Client" : s.device_name),
+      @"width": @(s.width),
+      @"height": @(s.height),
+      @"liveFpsTenths": @(static_cast<int>(std::llround(std::max(0.0, display_fps) * 10.0))),
+      @"liveBitrateTenthsMbps": @(static_cast<int>(std::llround(std::max(0.0, display_mbps) * 10.0))),
+      @"encodeMsTenths": @(static_cast<int>(std::llround(std::max(0.0, encode_ms) * 10.0))),
+      @"codec": to_nsstring(stream::video_format_name(s.video_format)),
+      @"bitDepth": @(s.dynamic_range != 0 ? 10 : 8),
+      @"yuv444": @(s.yuv444),
+      @"hdr": @(s.hdr),
+      @"directUsb": @(s.direct_usb),
+      @"pipelineActive": @(runtime_spec.active),
+      @"zeroCopy": @(runtime_spec.zero_copy),
+      @"captureFormat": to_nsstring(runtime_spec.capture_format),
+      @"encoderFormat": to_nsstring(runtime_spec.encoder_format),
+    };
+  }
+
+  live_rate_tracker().prune_except({});
+
+  const auto all_clients = nvhttp::get_all_clients();
+  const int paired_count = all_clients.is_array() ? static_cast<int>(all_clients.size()) : 0;
+
+  bool probe_complete = false;
+  const auto caps = video::advertised_encoder_capabilities(false, &probe_complete);
+  const std::string backend = video::active_encoder_name();
+
+  return @{
+    @"locale": to_nsstring(locale),
+    @"appRunning": @(app_running),
+    @"streaming": @NO,
+    @"hostName": to_nsstring(host_name),
+    @"pairedCount": @(paired_count),
+    @"backend": to_nsstring(backend.empty() ? "videotoolbox" : backend),
+    @"hevc10BitHdr": @(caps.hevc_mode >= 3),
+    @"hevc8Bit": @(caps.hevc_mode >= 2),
+    @"hevc444": @(caps.hevc_mode >= 2 && caps.yuv444_for_codec[1]),
+  };
 }
 
 - (void)openScreenCapturePrivacySettings {
