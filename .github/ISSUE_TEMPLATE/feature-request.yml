@@ -1,0 +1,28 @@
+name: Feature Request
+description: Suggest a new feature or improvement for Vibepollo on macOS.
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Feature Summary
+      description: Clearly describe the feature or improvement you would like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case / Motivation
+      description: What problem does this solve, or how would it improve your macOS streaming workflow?
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Proposed Behavior / Additional Context (Optional)
+      description: Include any examples, references, client details (e.g., VoidLink / Moonlight), or screenshots.
+    validations:
+      required: false

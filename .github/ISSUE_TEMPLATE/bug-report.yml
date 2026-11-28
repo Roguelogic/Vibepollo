@@ -1,119 +1,129 @@
 name: Bug Report
-description: Report a bug with symptoms, expected behavior, OS version, and logs.
+description: Report a bug on macOS (Apple Silicon) with symptoms, environment details, and logs.
+labels:
+  - bug
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in **Vibepollo (macOS)**!
+        Please note that this repository supports **Apple Silicon Macs (`arm64`)** only. For Windows/Linux issues, please use upstream [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo) or [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo).
+
+  - type: input
+    id: vibepollo-version
+    attributes:
+      label: Vibepollo Version
+      description: Check via the menu bar icon or Settings → General.
+      placeholder: e.g., 1.3.0 (or git commit hash if built from source)
+    validations:
+      required: true
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS Version
+      description: Check via Apple menu → About This Mac.
+      placeholder: e.g., macOS 15.4.1 (Sequoia) or macOS 26.0 (Tahoe)
+    validations:
+      required: true
+
+  - type: input
+    id: mac-model
+    attributes:
+      label: Mac Model & Apple Silicon Chip
+      description: Which Mac and Apple Silicon chip are you hosting on?
+      placeholder: e.g., Mac mini M4, MacBook Pro 14" M3 Pro, Mac Studio M2 Max
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation Method
+      description: How did you install Vibepollo?
+      options:
+        - GitHub Releases DMG (Vibepollo-macOS-arm64.dmg)
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: client-info
+    attributes:
+      label: Client App & Device
+      description: Which client app, device, and OS version are you connecting from?
+      placeholder: e.g., VoidLink on iPad Pro M4 (iPadOS 18), Moonlight on macOS/Windows
+    validations:
+      required: false
+
+  - type: dropdown
+    id: connection-type
+    attributes:
+      label: Connection Type
+      options:
+        - Wi-Fi / LAN
+        - USB Wired (usbmuxd)
+        - Remote / WAN
+        - N/A
+    validations:
+      required: false
+
+  - type: dropdown
+    id: display-mode
+    attributes:
+      label: Display Setup
+      options:
+        - Virtual Display (CGVirtualDisplay)
+        - Physical Display
+        - Headless Mac (no physical monitor attached)
+        - Login Screen (LoginWindow)
+        - N/A
+    validations:
+      required: false
+
   - type: textarea
     id: symptoms
     attributes:
       label: Bug Symptoms
-      description: Describe what happens (the symptoms of the bug).
+      description: Describe what happened.
     validations:
       required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: List the steps needed to reproduce the issue.
+      placeholder: |
+        1. Launch Vibepollo on Mac
+        2. Connect from client with ...
+        3. Observe ...
+    validations:
+      required: false
 
   - type: textarea
     id: expected
     attributes:
       label: Expected Behavior
-      description: What should have happened instead?
+      description: What did you expect to happen instead?
     validations:
       required: true
-
-  - type: dropdown
-    id: os-version
-    attributes:
-      label: Windows Version
-      description: Select the version of Windows you are using.
-      options:
-        - 22H2
-        - 23H2
-        - 24H2
-        - 25H2
-    validations:
-      required: true
-
-  - type: dropdown
-    id: package_type
-    attributes:
-      label: Package
-      description: The package you installed.
-      options:
-        - Windows - exe installer
-        - Windows - msi installer (recommended)
-        - Windows - portable (NOT recommended)
-        - Windows - Chocolatey (Third Party)
-        - Windows - Scoop (Third Party)
-        - Windows - Winget
-        - other (self built)
-        - other (fork of this repo)
-        - n/a
-    validations:
-      required: true
-
-  - type: dropdown
-    id: graphics_type
-    attributes:
-      label: GPU Type
-      description: The type of graphics card used for streaming.
-      options:
-        - AMD
-        - Intel
-        - NVIDIA
-        - Qualcomm (mediafoundation)
-        - none (software encoding)
-        - n/a
-    validations:
-      required: true
-
-  - type: input
-    id: graphics_model
-    attributes:
-      label: GPU Model
-      description: The model of the graphics card.
-    validations:
-      required: true
-
-  - type: input
-    id: graphics_driver
-    attributes:
-      label: GPU Driver Version
-      description: The driver version of the graphics card.
-    validations:
-      required: true
-
-  - type: dropdown
-    id: capture_method
-    attributes:
-      label: Capture Method
-      description: The capture method being used.
-      options:
-        - Desktop Duplication API (Windows)
-        - Windows.Graphics.Capture (Windows)
-        - SudoVDA virtual display
-        - Unknown
-    validations:
-      required: false
-
-  - type: textarea
-    id: apps
-    attributes:
-      label: Apps
-      description: If this is an issue with launching a game or app, paste the relevant `apps.json` entry.
-      render: json
-    validations:
-      required: false
 
   - type: textarea
     id: logs
     attributes:
       label: Logs (Optional but Recommended)
       description: |
-        If possible, attach your logs to help us diagnose the issue.  
-        Go to **Troubleshooting tab → Export Logs** and upload the **Vibeshine logs zip file** here.
+        To locate your log file in Vibepollo:
+        Open **Settings → Network & Logs → System Logs → Reveal in Finder** (설정 → 네트워크 및 로그 → 시스템 로그 → Finder에서 보기), then attach the log file or paste relevant excerpts below.
     validations:
       required: false
 
   - type: textarea
-    id: screenshot
+    id: screenshots
     attributes:
-      label: Screenshot (Optional)
-      description: Add a screenshot if it helps show the bug.
-      render: image
+      label: Screenshots / Screen Recording (Optional)
+      description: Drag and drop any screenshots or short recordings that help illustrate the problem.
+    validations:
+      required: false
